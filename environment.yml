@@ -1,0 +1,46 @@
+name: analysisgnn
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.8,<3.12
+  
+  # Core ML dependencies
+  - pytorch>=2.0.0
+  - pytorch-lightning>=2.0.0
+  - numpy>=1.21.0
+  - pandas>=1.5.0
+  - scikit-learn>=1.1.0
+  
+  # Music processing
+  - conda-forge::music21>=8.0.0
+  
+  # Visualization and utilities
+  - matplotlib>=3.5.0
+  - seaborn>=0.11.0
+  - tqdm>=4.64.0
+  
+  # Development tools
+  - pip
+  - git
+  
+  # Dependencies via pip (essential only)
+  - pip:
+    # Graph neural network dependencies
+    - torch-geometric>=2.3.0
+    - torch-scatter>=2.1.0
+    - torch-sparse>=0.6.0
+    
+    # Music processing
+    - partitura>=1.4.0
+    
+    # ML utilities
+    - torchmetrics>=0.11.0
+    - wandb>=0.13.0
+    - imbalanced-learn>=0.9.0
+    
+    # Development tools (optional)
+    - pytest>=7.0.0
+    - black>=22.0.0
+    - flake8>=5.0.0

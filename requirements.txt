@@ -1,0 +1,35 @@
+# Core dependencies
+torch>=2.0.0
+pytorch-lightning>=2.0.0
+torch-geometric>=2.3.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.0
+
+# Music processing
+partitura>=1.4.0
+music21>=8.0.0
+
+# Machine learning and data processing
+numpy>=1.21.0
+pandas>=1.5.0
+scikit-learn>=1.1.0
+torchmetrics>=0.11.0
+
+# Graph neural networks
+# graphmuse>=0.0.2  # Commented out due to dependency conflicts
+
+# Logging and experiment tracking
+wandb>=0.13.0
+
+# Utilities
+tqdm>=4.64.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Optional: For SMOTE and other advanced features
+imbalanced-learn>=0.9.0
+
+# Development and testing (optional)
+pytest>=7.0.0
+black>=22.0.0
+flake8>=5.0.0
