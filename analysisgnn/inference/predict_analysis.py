@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 
 # AnalysisGNN imports  
 from analysisgnn.models.analysis import ContinualAnalysisGNN
-from analysisgnn.utils.chord_representations_latest import available_representations
+from analysisgnn.utils.chord_representations import available_representations
 from analysisgnn.utils.chord_representations import formatRomanNumeral
 
 
@@ -48,7 +48,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tasks", 
         type=str, 
-        default="cadence,localkey,tonkey,quality,romanNumeral",
+        default="cadence,localkey,tonkey,quality,root,bass,inversion,degree1,degree2,romanNumeral",
         help="Comma-separated list of analysis tasks to perform"
     )
     parser.add_argument(

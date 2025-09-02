@@ -210,3 +210,5 @@ __marimo__/
 artifacts/
 outputs/
 wandb/
+
+.vscode/

@@ -41,6 +41,66 @@ def isin_pairwise(element,test_elements, assume_unique=True):
     return torch.isin(element_cantor_proj, test_elements_cantor_proj, assume_unique=assume_unique)
 
 
+def onsetwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["quality", "inversion", "degree1", "degree2"]):        
+    if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
+        batch_size = len(graph["note"].x) if batch_size is None else batch_size
+        edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
+        valid_label_mask = torch.ones(batch_size, dtype=torch.bool).to(graph["note"].x.device) if valid_label_mask is None else valid_label_mask
+        # NOTE: Aggregate per onset
+        onset_edges = edge_index_dict["note", "onset", "note"]
+        onset_edge_mask_src = onset_edges[0] < batch_size
+        onset_edge_mask_dst = onset_edges[1] < batch_size
+        onset_edges = onset_edges[:, torch.logical_and(onset_edge_mask_src, onset_edge_mask_dst)]
+        # remove self loops
+        onset_edges = onset_edges[:, onset_edges[0] != onset_edges[1]]
+        # If tpc_in_label is in logits_softmax_dict make a mask out of argmax
+        if "tpc_in_label" in logits_softmax_dict:
+            tpc_in_label_mask = logits_softmax_dict["tpc_in_label"].argmax(-1).bool()
+            onset_edges = onset_edges[:, tpc_in_label_mask[onset_edges[0]] & tpc_in_label_mask[onset_edges[1]]]
+        else:
+            tpc_in_label_mask = None
+        # aggregate the logit predictions based on the onset edges
+        aggregate_logit_dict = {}
+        for k, v in logits_softmax_dict.items():
+            if k in rna_keys:
+                aggregate_logit_dict[k] = torch_scatter.scatter_mean(v[onset_edges[0]], onset_edges[1], dim=0, out=v).softmax(-1)
+        # keep valid labels
+        aggregate_logit_dict = {k: v[valid_label_mask].softmax(-1) for k, v in aggregate_logit_dict.items()}
+        logits_softmax_dict.update(aggregate_logit_dict)
+        batch_id = graph["note"].batch[:batch_size][valid_label_mask]
+        if torch.all(batch_id == batch_id[0]):                            
+            onsets = graph["note"].onset_div[:batch_size][valid_label_mask]
+            onsets = onsets - onsets.min()
+            if tpc_in_label_mask is not None:
+                onsets_filtered = onsets[tpc_in_label_mask]
+                aggregate_logit_dict = {k: v[tpc_in_label_mask] for k, v in aggregate_logit_dict.items()}
+            else:
+                onsets_filtered = onsets
+            unique_onset_values, un_onset_indices = torch.unique(onsets_filtered, return_inverse=True)
+            unique_logit_map = (un_onset_indices[1:] != un_onset_indices[:-1]).nonzero(as_tuple=True)[0] + 1
+            unique_logit_map = torch.cat([torch.tensor([0], device=unique_logit_map.device), unique_logit_map])
+            onsetwise_logit_dict = {k: v[unique_logit_map] for k, v in aggregate_logit_dict.items()}
+            # RNA calculation
+            rna_preds = {k: onsetwise_logit_dict[k].argmax(-1) for k in rna_keys}            
+            # find unique onsets where the predictions change
+            for k in rna_preds.keys():
+                x = rna_preds[k]
+                # assume that x is in order. Find in which i+1 != i
+                change_points = (x[1:] != x[:-1]).nonzero(as_tuple=True)[0] + 1
+                # Add 0 as the first change point
+                change_points = torch.cat([torch.tensor([0], device=change_points.device), change_points])
+                # Update the logits_softmax_dict with the new logits
+                onsets_value_on_change = unique_onset_values[change_points]
+                x_on_change = x[change_points]
+                x_logits_on_change = onsetwise_logit_dict[k][change_points]
+                # find indices of onsets that are between change points and assign them to the same logits
+                for i in range(len(change_points) - 1):
+                    onset_mask = (onsets_value_on_change[i] <= onsets) & (onsets < onsets_value_on_change[i + 1])
+                    logits_softmax_dict[k][onset_mask] = x_logits_on_change[i]
+
+    return logits_softmax_dict
+
+
 class LinearWarmupCosineAnnealingLR(LRScheduler):
     """
     Sets the learning rate of each parameter group to follow a linear warmup schedule
@@ -1474,8 +1534,7 @@ class ContinualAnalysisGNN(LightningModule):
             note_array = np.sort(note_array, order=["onset_div", "pitch"])
             
             # Get measures and part
-            measures = score_obj[-1].measures
-            part = score_obj[-1]
+            measures = score_obj[-1].measures            
             
             # Select features (using default "voice" feature type)
             note_features = select_features(note_array, "voice")
@@ -1524,6 +1583,9 @@ class ContinualAnalysisGNN(LightningModule):
             
             # Convert logits to probabilities
             predictions = {k: torch.softmax(v, dim=-1) for k, v in logits_dict.items()}
+
+            # aggregate to onsetwise prediction
+            predictions = onsetwise_logit_aggregation(predictions, graph=data, batch_size=batch_size)
             
             return predictions
             
