@@ -15,12 +15,17 @@ from analysisgnn.utils import add_reverse_edges_from_edge_index
 
 class MultiTaskLoss(nn.Module):
     """
-    Multi-task loss function
+    Multi-task loss function with support for semi-supervised node masking.
 
     Learning weights for each task according to the paper:
         Liebel L, Körner M. Auxiliary tasks in multi-task learning[J]
+    
+    Supports three node types:
+        - T (Target): nodes to predict and evaluate (mask value = 1)
+        - C (Context): nodes with known labels, used for conditioning (mask value = 0 < x < 1)
+        - U (Unlabeled): nodes to ignore (mask value = 0)
     """
-    def __init__(self, tasks: list, loss_ft: nn.ModuleDict, loss_weights: dict = None, requires_grad=True):
+    def __init__(self, tasks: list, loss_ft: nn.ModuleDict, loss_weights: dict = None, requires_grad=True, context_weight=0.1):
         super(MultiTaskLoss, self).__init__()
         assert (set(tasks) == set(loss_ft.keys()))
         if loss_weights is not None:
@@ -31,13 +36,67 @@ class MultiTaskLoss(nn.Module):
         self.tasks = tasks
         self.loss_ft = loss_ft
         self.requires_grad = requires_grad
+        self.context_weight = context_weight
         if requires_grad:
             self.params = nn.Parameter(torch.ones(len(tasks), requires_grad=True))
         else:
             self.params = torch.ones(len(tasks), requires_grad=False)
 
-    def forward(self, pred, gt):
-        out = {task: self.loss_ft[task](pred[task], gt[task]) for task in gt.keys()}
+    def forward(self, pred, gt, node_mask=None):
+        """
+        Compute multi-task loss with optional node masking.
+        
+        Args:
+            pred: Dictionary of predictions per task
+            gt: Dictionary of ground truth labels per task
+            node_mask: Optional tensor of shape [num_nodes] with values:
+                      - 1.0 for target nodes (full loss)
+                      - 0.0 < x < 1.0 for context nodes (down-weighted loss)
+                      - 0.0 for unlabeled/ignored nodes (no loss)
+        
+        Returns:
+            Dictionary of losses per task plus "total" loss
+        """
+        out = {}
+        for task in gt.keys():
+            task_loss = self.loss_ft[task](pred[task], gt[task])
+            
+            # Apply node masking if provided
+            if node_mask is not None:
+                # Ensure loss is unreduced (per-sample)
+                if task_loss.dim() == 0:
+                    # Loss is already reduced to scalar - need unreduced version
+                    # Get the loss function attributes
+                    loss_fn = self.loss_ft[task]
+                    if isinstance(loss_fn, nn.CrossEntropyLoss):
+                        # Create unreduced version with same parameters
+                        weight = loss_fn.weight
+                        ignore_index = loss_fn.ignore_index if hasattr(loss_fn, 'ignore_index') else -100
+                        label_smoothing = loss_fn.label_smoothing if hasattr(loss_fn, 'label_smoothing') else 0.0
+                        unreduced_loss_fn = nn.CrossEntropyLoss(
+                            weight=weight, 
+                            ignore_index=ignore_index,
+                            label_smoothing=label_smoothing,
+                            reduction='none'
+                        )
+                        task_loss = unreduced_loss_fn(pred[task], gt[task])
+                    else:
+                        # For other loss types, just recreate with reduction='none'
+                        # This is a fallback and may not work for all loss types
+                        raise NotImplementedError(f"Node masking not yet supported for {type(loss_fn).__name__} with reduction='mean' or 'sum'")
+                
+                # Apply mask: target nodes (1.0), context nodes (context_weight), unlabeled (0.0)
+                mask_weights = torch.where(node_mask > 0.5, 
+                                          torch.ones_like(node_mask), 
+                                          node_mask * self.context_weight)
+                task_loss = (task_loss * mask_weights).sum() / (mask_weights.sum() + 1e-8)
+            else:
+                # If no mask and loss is unreduced, reduce it now
+                if task_loss.dim() > 0:
+                    task_loss = task_loss.mean()
+            
+            out[task] = task_loss
+        
         loss_sum = 0
         for i, loss in enumerate(out.values()):
             if self.requires_grad:
@@ -45,7 +104,6 @@ class MultiTaskLoss(nn.Module):
             else:
                 loss_sum += loss
         out["total"] = loss_sum
-        # out['total'] = torch.sum(torch.stack([self.loss_weights[t] * out[t] for t in self.tasks]))
         return out
 
 
@@ -1046,7 +1104,22 @@ class SingleTaskPrediction(LightningModule):
         batch_pred = self.module((batch_inputs, edges, edge_type, onset_edges, onset_idx, lengths))
         batch_pred = {k: v.reshape(-1, v.shape[-1]) for k, v in batch_pred.items()}
         batch_labels = {k: v.reshape(-1) for k, v in batch_labels.items()}
-        loss = self.train_loss(batch_pred, batch_labels)
+        
+        # Support optional node masking for semi-supervised learning
+        # Check if batch contains node_mask (as part of batch_labels or separate)
+        node_mask = batch_labels.get("node_mask", None)
+        if node_mask is not None:
+            node_mask = node_mask.reshape(-1)
+            # Remove node_mask from labels dict if it exists
+            batch_labels = {k: v for k, v in batch_labels.items() if k != "node_mask"}
+            
+            # Apply logit clamping for context nodes
+            from analysisgnn.utils.node_masking import clamp_logits_dict, split_nodes_by_mask
+            _, context_indices, _ = split_nodes_by_mask(node_mask)
+            if len(context_indices) > 0:
+                batch_pred = clamp_logits_dict(batch_pred, batch_labels, context_indices, self.tasks)
+        
+        loss = self.train_loss(batch_pred, batch_labels, node_mask=node_mask)
         task = list(self.tasks.keys())[0]
         acc = (batch_pred[task].argmax(1) == batch_labels[task]).float().mean()
         self.log('train_loss', loss["total"].item(), on_step=False, on_epoch=True, prog_bar=False, batch_size=1)
@@ -1553,7 +1626,18 @@ class ChordPredictionPLModel(LightningModule):
         num_sampled_edges_dict = graph.num_sampled_edges_dict
         batch_labels = {k: graph["note"][k][:batch_size] for k in self.tasks.keys()}
         batch_pred = self.module(pitch_spelling, x_dict, edge_index_dict, batch_dict, num_sampled_nodes_dict, num_sampled_edges_dict, batch_size)
-        loss = self.train_loss(batch_pred, batch_labels)
+        
+        # Support optional node masking for semi-supervised learning
+        node_mask = graph["note"].node_mask[:batch_size] if hasattr(graph["note"], "node_mask") and graph["note"].node_mask is not None else None
+        
+        # Apply logit clamping for context nodes if mask is provided
+        if node_mask is not None:
+            from analysisgnn.utils.node_masking import clamp_logits_dict, split_nodes_by_mask
+            _, context_indices, _ = split_nodes_by_mask(node_mask)
+            if len(context_indices) > 0:
+                batch_pred = clamp_logits_dict(batch_pred, batch_labels, context_indices, self.tasks)
+        
+        loss = self.train_loss(batch_pred, batch_labels, node_mask=node_mask)
         self.log('train/total_loss', loss["total"].item(), prog_bar=True, batch_size=batch_size)
         degree = torch.logical_and(
             batch_pred["degree1"].argmax(dim=1) == batch_labels["degree1"],
