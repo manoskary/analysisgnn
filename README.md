@@ -12,6 +12,7 @@ Computer Music Multidisciplinary Research 2025 (CMMR).
 - **State-of-the-art Models**: Implements HybridGNN, HGT, and MetricalGNN architectures
 - **Continual Learning**: Support for sequential learning of different analysis tasks
 - **Flexible Training**: Supports both single-task and multi-task training strategies
+- **Semi-Supervised Node Masking**: Selective prediction with context labels for improved efficiency
 - **Easy Inference**: Simple prediction interface for new musical scores
 
 ## Supported Analysis Tasks
@@ -159,6 +160,38 @@ analysisgnn-predict --input_score score.musicxml --tasks cadence,localkey,romanN
 - `--subgraph_size`: Maximum subgraph size for sampling (default: 500)
 
 ## Advanced Usage
+
+### Semi-Supervised Node Masking
+
+AnalysisGNN supports selective prediction where only a subset of nodes need predictions while others provide context:
+
+```python
+from analysisgnn.utils.node_masking import create_node_mask
+
+# Create mask: T (target), C (context), U (unlabeled)
+mask = create_node_mask(
+    num_nodes=100,
+    target_indices=torch.arange(0, 40),    # Predict these
+    context_indices=torch.arange(40, 70),  # Use as context
+    context_weight=0.1                      # Context contributes 10% loss
+)
+
+# Add to your graph data
+graph["note"].node_mask = mask
+
+# Training automatically uses the mask
+# - Context nodes: labels fixed during training, guide predictions
+# - Target nodes: full loss, primary prediction focus
+# - Unlabeled nodes: ignored, no loss contribution
+```
+
+**Use cases:**
+- Phrase boundary analysis with harmonic context
+- Transfer learning with pseudo-labels as context
+- Interactive annotation assistance
+- Semi-supervised learning with limited annotations
+
+See `examples/semi_supervised_masking_example.py` for detailed usage.
 
 ### Custom Training Configuration
 
