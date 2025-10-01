@@ -910,7 +910,9 @@ class ContinualAnalysisGNN(LightningModule):
         self.lambda_featl = hparams.get("lambda_featl", 0.1)
         self.previous_tasks = []
         
-        
+        # Semi-supervised node masking parameters
+        self.train_with_masking = hparams.get("train_with_masking", False)
+        self.mask_ratio = hparams.get("mask_ratio", 0.15)
         
         self.current_task = self.main_tasks[0] if self.cl_training else self.main_tasks
         self.current_val_tasks = [self.main_tasks[0]] if self.cl_training else self.main_tasks
@@ -944,6 +946,42 @@ class ContinualAnalysisGNN(LightningModule):
             mask_dict["section"] = batch["note"]["valid_section_start_label"][:batch_size].bool()
         return mask_dict
 
+    def create_random_node_mask(self, batch_size, device):
+        """
+        Create random node masks for semi-supervised training.
+        
+        This implements BERT-style random masking where:
+        - mask_ratio of nodes become context (C) nodes with down-weighted loss
+        - Remaining nodes are target (T) nodes with full loss
+        
+        Args:
+            batch_size: Number of nodes in the batch
+            device: Device to create the mask on
+            
+        Returns:
+            node_mask: Tensor of shape [batch_size] with values:
+                - 1.0 for target nodes
+                - 0.1 for context nodes (down-weighted)
+        """
+        from analysisgnn.utils.node_masking import create_node_mask
+        
+        # Random selection of context nodes
+        num_context = int(batch_size * self.mask_ratio)
+        all_indices = torch.randperm(batch_size, device=device)
+        context_indices = all_indices[:num_context]
+        target_indices = all_indices[num_context:]
+        
+        # Create mask
+        node_mask = create_node_mask(
+            num_nodes=batch_size,
+            target_indices=target_indices,
+            context_indices=context_indices,
+            context_weight=0.1,  # Context contributes 10% of target loss
+            device=device
+        )
+        
+        return node_mask
+
     def common_step(self, batch):
         x_dict = batch.x_dict
         batch_size = batch["note"].batch_size
@@ -963,7 +1001,16 @@ class ContinualAnalysisGNN(LightningModule):
         mask_dict = self.create_mask_dict(labels_dict, batch, batch_size)
 
         # Support optional node masking for semi-supervised learning
-        node_mask = batch["note"].node_mask[:batch_size] if hasattr(batch["note"], "node_mask") and batch["note"].node_mask is not None else None
+        # Check if node_mask is provided in the batch (explicit masks from data)
+        node_mask_from_batch = batch["note"].node_mask[:batch_size] if hasattr(batch["note"], "node_mask") and batch["note"].node_mask is not None else None
+        
+        # Apply random masking if train_with_masking is enabled (during training only)
+        if self.train_with_masking and self.training and node_mask_from_batch is None:
+            # Create random masks for BERT-style semi-supervised learning
+            node_mask = self.create_random_node_mask(batch_size, device=labels_dict[list(labels_dict.keys())[0]].device)
+        else:
+            # Use explicitly provided masks or no masking
+            node_mask = node_mask_from_batch
 
         # NOTE: mask to remove invalid labels
         if "valid_label" not in batch["note"].keys():
