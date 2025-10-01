@@ -105,6 +105,10 @@ def get_parser():
     parser.add_argument("--use_ewc", action="store_true", help="Use Elastic Weight Consolidation")
     parser.add_argument("--cl_training", action="store_true", help="Use Continual Learning Training")
     parser.add_argument("--use_smote", action="store_true", help="Use SMOTE")
+    parser.add_argument("--train_with_masking", action="store_true", 
+                        help="Enable semi-supervised node masking with random masking during training")
+    parser.add_argument("--mask_ratio", type=float, default=0.15,
+                        help="Ratio of nodes to mask as context during training (default: 0.15)")
     return parser
 
 

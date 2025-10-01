@@ -910,7 +910,9 @@ class ContinualAnalysisGNN(LightningModule):
         self.lambda_featl = hparams.get("lambda_featl", 0.1)
         self.previous_tasks = []
         
-        
+        # Semi-supervised node masking parameters
+        self.train_with_masking = hparams.get("train_with_masking", False)
+        self.mask_ratio = hparams.get("mask_ratio", 0.15)
         
         self.current_task = self.main_tasks[0] if self.cl_training else self.main_tasks
         self.current_val_tasks = [self.main_tasks[0]] if self.cl_training else self.main_tasks
@@ -944,6 +946,42 @@ class ContinualAnalysisGNN(LightningModule):
             mask_dict["section"] = batch["note"]["valid_section_start_label"][:batch_size].bool()
         return mask_dict
 
+    def create_random_node_mask(self, batch_size, device):
+        """
+        Create random node masks for semi-supervised training.
+        
+        This implements BERT-style random masking where:
+        - mask_ratio of nodes become context (C) nodes with down-weighted loss
+        - Remaining nodes are target (T) nodes with full loss
+        
+        Args:
+            batch_size: Number of nodes in the batch
+            device: Device to create the mask on
+            
+        Returns:
+            node_mask: Tensor of shape [batch_size] with values:
+                - 1.0 for target nodes
+                - 0.1 for context nodes (down-weighted)
+        """
+        from analysisgnn.utils.node_masking import create_node_mask
+        
+        # Random selection of context nodes
+        num_context = int(batch_size * self.mask_ratio)
+        all_indices = torch.randperm(batch_size, device=device)
+        context_indices = all_indices[:num_context]
+        target_indices = all_indices[num_context:]
+        
+        # Create mask
+        node_mask = create_node_mask(
+            num_nodes=batch_size,
+            target_indices=target_indices,
+            context_indices=context_indices,
+            context_weight=0.1,  # Context contributes 10% of target loss
+            device=device
+        )
+        
+        return node_mask
+
     def common_step(self, batch):
         x_dict = batch.x_dict
         batch_size = batch["note"].batch_size
@@ -962,6 +1000,18 @@ class ContinualAnalysisGNN(LightningModule):
 
         mask_dict = self.create_mask_dict(labels_dict, batch, batch_size)
 
+        # Support optional node masking for semi-supervised learning
+        # Check if node_mask is provided in the batch (explicit masks from data)
+        node_mask_from_batch = batch["note"].node_mask[:batch_size] if hasattr(batch["note"], "node_mask") and batch["note"].node_mask is not None else None
+        
+        # Apply random masking if train_with_masking is enabled (during training only)
+        if self.train_with_masking and self.training and node_mask_from_batch is None:
+            # Create random masks for BERT-style semi-supervised learning
+            node_mask = self.create_random_node_mask(batch_size, device=labels_dict[list(labels_dict.keys())[0]].device)
+        else:
+            # Use explicitly provided masks or no masking
+            node_mask = node_mask_from_batch
+
         # NOTE: mask to remove invalid labels
         if "valid_label" not in batch["note"].keys():
             valid_label_mask = torch.ones_like(batch["note"]["pitch_spelling"][:batch_size]).bool()
@@ -970,6 +1020,9 @@ class ContinualAnalysisGNN(LightningModule):
 
         labels_dict = {k: v[valid_label_mask] for k, v in labels_dict.items()}
         mask_dict = {k: v[valid_label_mask] for k, v in mask_dict.items()}
+        # Apply node_mask filtering if present
+        if node_mask is not None:
+            node_mask = node_mask[valid_label_mask]
         labels_dict = {k: v[mask_dict[k]] for k, v in labels_dict.items()}
 
         x = self.model.encode(
@@ -1027,12 +1080,29 @@ class ContinualAnalysisGNN(LightningModule):
             mask_dict["cadence"] = torch.ones_like(y_over).bool()
             feature_loss = self.update_feature_loss(feature_loss, x_over, y_over, x, y, batch_size)
             x = x_over
+            # Reset node_mask for SMOTE case (all nodes become targets)
+            if node_mask is not None:
+                node_mask = torch.ones_like(y_over, dtype=torch.float32)
 
         logits_dict = self.model.forward_clf(x)
         logits_dict = {k: logits_dict[k][mask_dict[k]] for k in labels_dict.keys()}
-        # TODO remove labels and logits based on has_cadence and has_phrase masks here
+        
+        # Apply node_mask filtering and logit clamping after mask_dict filtering
+        if node_mask is not None:
+            # Apply the same mask_dict filtering to node_mask
+            # Use the first task's mask (assuming consistent masking across tasks)
+            first_task_key = list(labels_dict.keys())[0]
+            filtered_node_mask = node_mask[mask_dict[first_task_key]]
+            
+            # Apply logit clamping for context nodes on the filtered data
+            from analysisgnn.utils.node_masking import clamp_logits_dict, split_nodes_by_mask
+            _, context_indices, _ = split_nodes_by_mask(filtered_node_mask)
+            if len(context_indices) > 0:
+                logits_dict = clamp_logits_dict(logits_dict, labels_dict, context_indices, self.task_dict)
+        else:
+            filtered_node_mask = None
 
-        loss_dict = self.clf_loss(logits_dict, labels_dict)
+        loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=filtered_node_mask)
         # pop the total loss and remove it from the dict
         total_loss = loss_dict.pop("total") / len(labels_dict.keys())
 
