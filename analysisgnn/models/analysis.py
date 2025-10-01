@@ -962,6 +962,9 @@ class ContinualAnalysisGNN(LightningModule):
 
         mask_dict = self.create_mask_dict(labels_dict, batch, batch_size)
 
+        # Support optional node masking for semi-supervised learning
+        node_mask = batch["note"].node_mask[:batch_size] if hasattr(batch["note"], "node_mask") and batch["note"].node_mask is not None else None
+
         # NOTE: mask to remove invalid labels
         if "valid_label" not in batch["note"].keys():
             valid_label_mask = torch.ones_like(batch["note"]["pitch_spelling"][:batch_size]).bool()
@@ -970,6 +973,9 @@ class ContinualAnalysisGNN(LightningModule):
 
         labels_dict = {k: v[valid_label_mask] for k, v in labels_dict.items()}
         mask_dict = {k: v[valid_label_mask] for k, v in mask_dict.items()}
+        # Apply node_mask filtering if present
+        if node_mask is not None:
+            node_mask = node_mask[valid_label_mask]
         labels_dict = {k: v[mask_dict[k]] for k, v in labels_dict.items()}
 
         x = self.model.encode(
@@ -1027,12 +1033,29 @@ class ContinualAnalysisGNN(LightningModule):
             mask_dict["cadence"] = torch.ones_like(y_over).bool()
             feature_loss = self.update_feature_loss(feature_loss, x_over, y_over, x, y, batch_size)
             x = x_over
+            # Reset node_mask for SMOTE case (all nodes become targets)
+            if node_mask is not None:
+                node_mask = torch.ones_like(y_over, dtype=torch.float32)
 
         logits_dict = self.model.forward_clf(x)
         logits_dict = {k: logits_dict[k][mask_dict[k]] for k in labels_dict.keys()}
-        # TODO remove labels and logits based on has_cadence and has_phrase masks here
+        
+        # Apply node_mask filtering and logit clamping after mask_dict filtering
+        if node_mask is not None:
+            # Apply the same mask_dict filtering to node_mask
+            # Use the first task's mask (assuming consistent masking across tasks)
+            first_task_key = list(labels_dict.keys())[0]
+            filtered_node_mask = node_mask[mask_dict[first_task_key]]
+            
+            # Apply logit clamping for context nodes on the filtered data
+            from analysisgnn.utils.node_masking import clamp_logits_dict, split_nodes_by_mask
+            _, context_indices, _ = split_nodes_by_mask(filtered_node_mask)
+            if len(context_indices) > 0:
+                logits_dict = clamp_logits_dict(logits_dict, labels_dict, context_indices, self.task_dict)
+        else:
+            filtered_node_mask = None
 
-        loss_dict = self.clf_loss(logits_dict, labels_dict)
+        loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=filtered_node_mask)
         # pop the total loss and remove it from the dict
         total_loss = loss_dict.pop("total") / len(labels_dict.keys())
 
