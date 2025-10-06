@@ -1557,6 +1557,10 @@ class ContinualAnalysisGNN(LightningModule):
             batch_size = data["note"].x.size(0)
             data["note"].batch = torch.zeros(batch_size, dtype=torch.long)
             
+            # Move data to the same device as the model
+            model_device = next(self.model.parameters()).device
+            data = data.to(str(model_device))
+            
             # Convert to the format expected by the model
             x_dict = data.x_dict
             edge_index_dict = data.edge_index_dict
