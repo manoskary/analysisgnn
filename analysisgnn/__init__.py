@@ -7,7 +7,6 @@ using Graph Neural Networks (GNNs).
 
 __version__ = "1.0.0"
 __author__ = "Emmanouil Karystinaios"
-__email__ = "manos.karyss@gmail.com"
 
 from . import data
 from . import train
