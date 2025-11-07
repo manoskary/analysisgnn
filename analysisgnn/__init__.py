@@ -7,7 +7,6 @@ using Graph Neural Networks (GNNs).
 
 __version__ = "1.0.0"
 __author__ = "Emmanouil Karystinaios"
-__email__ = "manos.karyss@gmail.com"
 
 from . import data
 from . import train
@@ -15,7 +14,19 @@ from . import models
 from . import descriptors
 from . import utils
 from . import metrics
-from . import inference
+
+# analysisgnn/__init__.py
+import importlib
+
+__all__ = ["inference"]  # optional
+
+def __getattr__(name):
+    if name == "inference":
+        mod = importlib.import_module(".inference", __name__)
+        globals()[name] = mod  # cache
+        return mod
+    raise AttributeError(f"module {__name__} has no attribute {name!r}")
+
 
 # Key imports for easy access
 from .models.analysis import ContinualAnalysisGNN
