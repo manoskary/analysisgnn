@@ -202,7 +202,7 @@ def main():
         note_encoder = MusicBertNoteEncoder(
             pretrained_name=config.get("musicbert_model_name", "manoskary/musicbert-large"),
             adapter_cfg=adapter_cfg,
-            freeze_backbone=config.get("musicbert_freeze_backbone", False),
+            freeze_backbone=config.get("musicbert_freeze_backbone", True),
         )
         config["in_channels"] = note_encoder.backbone.model.config.hidden_size
 
