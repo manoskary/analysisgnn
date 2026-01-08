@@ -6,6 +6,8 @@ from torch.backends.opt_einsum import strategy
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import StochasticWeightAveraging
 from analysisgnn.models.analysis import ContinualAnalysisGNN
+from analysisgnn.models.musicbert_backbone import MusicBertAdapterConfig
+from analysisgnn.models.musicbert_note_encoder import MusicBertNoteEncoder
 from analysisgnn.data.datamodules.analysis import AnalysisDataModule
 import torch
 import argparse
@@ -109,6 +111,19 @@ def get_parser():
                         help="Enable semi-supervised node masking with random masking during training")
     parser.add_argument("--mask_ratio", type=float, default=0.15,
                         help="Ratio of nodes to mask as context during training (default: 0.15)")
+    parser.add_argument("--use_musicbert", action="store_true", help="Use MusicBERT note encoder")
+    parser.add_argument("--musicbert_model_name", type=str, default="manoskary/musicbert-large", help="MusicBERT model name")
+    parser.add_argument(
+        "--musicbert_unfreeze_backbone",
+        action="store_false",
+        dest="musicbert_freeze_backbone",
+        default=True,
+        help="Unfreeze MusicBERT backbone parameters",
+    )
+    parser.add_argument("--musicbert_use_lora", action="store_true", help="Enable LoRA adapters for MusicBERT")
+    parser.add_argument("--musicbert_lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--musicbert_lora_alpha", type=int, default=16, help="LoRA alpha")
+    parser.add_argument("--musicbert_lora_dropout", type=float, default=0.1, help="LoRA dropout")
     return parser
 
 
@@ -174,6 +189,21 @@ def main():
     config["metadata"] = datamodule.metadata
     config["in_channels"] = datamodule.features
 
+    note_encoder = None
+    if config.get("use_musicbert", False):
+        adapter_cfg = MusicBertAdapterConfig(
+            use_lora=config.get("musicbert_use_lora", False),
+            lora_r=config.get("musicbert_lora_r", 8),
+            lora_alpha=config.get("musicbert_lora_alpha", 16),
+            lora_dropout=config.get("musicbert_lora_dropout", 0.1),
+        )
+        note_encoder = MusicBertNoteEncoder(
+            pretrained_name=config.get("musicbert_model_name", "manoskary/musicbert-large"),
+            adapter_cfg=adapter_cfg,
+            freeze_backbone=config.get("musicbert_freeze_backbone", False),
+        )
+        config["in_channels"] = note_encoder.backbone.model.config.hidden_size
+
     if config["load_from_checkpoint"] and config["checkpoint_path"] is not None:
         # if checkpoint_path is url from wandb, download it
         if not os.path.exists(config["checkpoint_path"]):
@@ -188,9 +218,10 @@ def main():
         # Load model from checkpoint
         print(f"Loading model from checkpoint {config['checkpoint_path']}")                    
         model = ContinualAnalysisGNN.load_from_checkpoint(config["checkpoint_path"])
+        model.note_encoder = note_encoder
         model.current_task = config["main_tasks"][0]
     else:
-        model = ContinualAnalysisGNN(config)
+        model = ContinualAnalysisGNN(config, note_encoder=note_encoder)
 
     if config["model"] == "MetricalGNN":
         if config["add_measures"] and config["add_beats"]:

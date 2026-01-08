@@ -837,7 +837,7 @@ class EdgeDecoder(nn.Module):
 
 
 class ContinualAnalysisGNN(LightningModule):
-    def __init__(self, hparams: Dict[str, Any]):
+    def __init__(self, hparams: Dict[str, Any], note_encoder: Optional[nn.Module] = None):
         super().__init__()
         encoder_type = hparams.get("model", "hybridgnn").lower()
         # save hparams as attributes
@@ -909,6 +909,7 @@ class ContinualAnalysisGNN(LightningModule):
         self.lambda_dctn = hparams.get("lambda_dctn", 0.5)
         self.lambda_featl = hparams.get("lambda_featl", 0.1)
         self.previous_tasks = []
+        self.note_encoder = note_encoder
         
         # Semi-supervised node masking parameters
         self.train_with_masking = hparams.get("train_with_masking", False)
@@ -982,8 +983,47 @@ class ContinualAnalysisGNN(LightningModule):
         
         return node_mask
 
+    def _encode_notes_with_musicbert(self, batch):
+        required_fields = ["input_ids", "attention_mask", "token2note", "num_notes"]
+        missing_fields = [field for field in required_fields if not hasattr(batch, field)]
+        if missing_fields:
+            raise ValueError(
+                "MusicBERT note encoder requires batch fields: "
+                f"{', '.join(missing_fields)}"
+            )
+
+        input_ids = batch.input_ids
+        attention_mask = batch.attention_mask
+        token2note = batch.token2note
+        num_notes = batch.num_notes
+
+        if isinstance(num_notes, torch.Tensor):
+            num_notes = num_notes.tolist()
+
+        note_embeddings, _ = self.note_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token2note=token2note,
+            num_notes=num_notes,
+        )
+
+        note_list = [note_embeddings[i, :num_notes[i]] for i in range(len(num_notes))]
+        note_embeddings = torch.cat(note_list, dim=0)
+
+        if note_embeddings.shape[0] != batch["note"].batch_size:
+            raise ValueError(
+                "MusicBERT note embeddings do not match batch note count: "
+                f"{note_embeddings.shape[0]} vs {batch['note'].batch_size}"
+            )
+
+        return note_embeddings
+
     def common_step(self, batch):
         x_dict = batch.x_dict
+        if self.note_encoder is not None:
+            note_embeddings = self._encode_notes_with_musicbert(batch)
+            x_dict = dict(x_dict)
+            x_dict["note"] = note_embeddings
         batch_size = batch["note"].batch_size
         labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
         pitch_spelling = batch["note"].pitch_spelling
