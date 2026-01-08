@@ -33,6 +33,41 @@ def build_alignment(
     note_meta: Optional[Dict[int, NoteInfo]] = None,
     num_notes: Optional[int] = None,
 ) -> BpeNoteAlignment:
+    """Build a BpeNoteAlignment object for a tokenized MIDI file.
+
+    Parameters
+    ----------
+    midi_path:
+        Path to the MIDI file to tokenize.
+    tokenizer:
+        Callable that takes ``midi_path`` and returns an object with an ``ids`` attribute
+        containing the token ids for the file.
+    token2note:
+        Optional NumPy array describing the alignment between BPE tokens and notes.
+        The expected shape is ``(N, 3)``, where each row has the form
+        ``[token_idx, note_idx, weight]``:
+
+        * ``token_idx``: integer index into ``input_ids`` (token position).
+        * ``note_idx``: integer note index in ``[0, num_notes)``.
+        * ``weight``: non-negative float weight indicating how strongly the token is
+          associated with the note (for example, alignment probability or a normalized
+          contribution; the exact semantics are defined by the caller).
+
+        Multiple rows may share the same ``token_idx`` and/or ``note_idx`` when a token
+        aligns to multiple notes or vice versa.
+    note_meta:
+        Optional mapping from ``note_idx`` to :class:`NoteInfo` instances containing
+        metadata for each note.
+    num_notes:
+        Optional total number of notes in the piece. This should be consistent with the
+        maximum ``note_idx`` referenced in ``token2note``.
+
+    Returns
+    -------
+    BpeNoteAlignment
+        The alignment information, including token ids, attention mask, token-to-note
+        alignment matrix, and per-note metadata.
+    """
     tok_seq = tokenizer(midi_path)
     input_ids = np.asarray(tok_seq.ids, dtype=np.int64)
     attention_mask = np.ones_like(input_ids, dtype=np.int64)
