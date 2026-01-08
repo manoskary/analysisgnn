@@ -51,3 +51,25 @@ def build_alignment(
         num_notes=num_notes,
         note_meta=note_meta,
     )
+
+
+def load_alignment_npz(path: str) -> BpeNoteAlignment:
+    payload = np.load(path, allow_pickle=True)
+    note_meta = {}
+    if "note_meta" in payload:
+        note_meta = payload["note_meta"].item()
+
+    return BpeNoteAlignment(
+        input_ids=payload["input_ids"],
+        attention_mask=payload["attention_mask"],
+        token2note=payload["token2note"],
+        num_notes=int(payload["num_notes"]),
+        note_meta=note_meta,
+    )
+
+
+def attach_alignment_to_graph(graph, alignment: BpeNoteAlignment) -> None:
+    graph.input_ids = alignment.input_ids.tolist()
+    graph.attention_mask = alignment.attention_mask.tolist()
+    graph.token2note = alignment.token2note.tolist()
+    graph.num_notes = alignment.num_notes

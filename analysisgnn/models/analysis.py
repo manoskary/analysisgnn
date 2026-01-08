@@ -992,13 +992,7 @@ class ContinualAnalysisGNN(LightningModule):
                 f"{', '.join(missing_fields)}"
             )
 
-        input_ids = batch.input_ids
-        attention_mask = batch.attention_mask
-        token2note = batch.token2note
-        num_notes = batch.num_notes
-
-        if isinstance(num_notes, torch.Tensor):
-            num_notes = num_notes.tolist()
+        input_ids, attention_mask, token2note, num_notes = self._normalize_musicbert_inputs(batch)
 
         note_embeddings, _ = self.note_encoder(
             input_ids=input_ids,
@@ -1017,6 +1011,44 @@ class ContinualAnalysisGNN(LightningModule):
             )
 
         return note_embeddings
+
+    def _normalize_musicbert_inputs(self, batch):
+        input_ids = batch.input_ids
+        attention_mask = batch.attention_mask
+        token2note = batch.token2note
+        num_notes = batch.num_notes
+
+        if isinstance(num_notes, torch.Tensor):
+            num_notes = num_notes.tolist()
+
+        if isinstance(input_ids, torch.Tensor):
+            input_ids_tensor = input_ids
+        else:
+            input_ids_list = [
+                torch.tensor(seq, dtype=torch.long, device=self.device) for seq in input_ids
+            ]
+            input_ids_tensor = torch.nn.utils.rnn.pad_sequence(
+                input_ids_list, batch_first=True, padding_value=0
+            )
+
+        if isinstance(attention_mask, torch.Tensor):
+            attention_mask_tensor = attention_mask
+        else:
+            attention_list = [
+                torch.tensor(seq, dtype=torch.long, device=self.device) for seq in attention_mask
+            ]
+            attention_mask_tensor = torch.nn.utils.rnn.pad_sequence(
+                attention_list, batch_first=True, padding_value=0
+            )
+
+        if isinstance(token2note, torch.Tensor):
+            token2note_list = [token2note]
+        else:
+            token2note_list = [
+                torch.tensor(edges, dtype=torch.float32, device=self.device) for edges in token2note
+            ]
+
+        return input_ids_tensor, attention_mask_tensor, token2note_list, num_notes
 
     def common_step(self, batch):
         x_dict = batch.x_dict

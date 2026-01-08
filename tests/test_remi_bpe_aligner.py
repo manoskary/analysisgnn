@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from analysisgnn.data.remi_bpe_aligner import build_alignment, NoteInfo
+from analysisgnn.data.remi_bpe_aligner import build_alignment, load_alignment_npz, NoteInfo
 
 
 class DummyTokSeq:
@@ -46,3 +46,18 @@ def test_build_alignment_with_mapping():
     assert alignment.input_ids.tolist() == [10, 20, 30]
     assert alignment.attention_mask.tolist() == [1, 1, 1]
     assert alignment.token2note.shape == (3, 3)
+
+
+def test_load_alignment_npz(tmp_path):
+    payload_path = tmp_path / "sample.npz"
+    np.savez(
+        payload_path,
+        input_ids=np.array([1, 2, 3]),
+        attention_mask=np.array([1, 1, 1]),
+        token2note=np.array([[0, 0, 1.0]]),
+        num_notes=np.array(1),
+    )
+
+    alignment = load_alignment_npz(str(payload_path))
+    assert alignment.num_notes == 1
+    assert alignment.input_ids.tolist() == [1, 2, 3]

@@ -124,6 +124,7 @@ def get_parser():
     parser.add_argument("--musicbert_lora_r", type=int, default=8, help="LoRA rank")
     parser.add_argument("--musicbert_lora_alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--musicbert_lora_dropout", type=float, default=0.1, help="LoRA dropout")
+    parser.add_argument("--musicbert_alignment_dir", type=str, default=None, help="Directory with MusicBERT alignment .npz files")
     return parser
 
 
@@ -183,6 +184,7 @@ def main():
         feature_type=config.get("feature_type", "cadence"),
         augment=config.get("use_transpositions", True),
         training_dataloader_type=config.get("training_dataloader_type", "sequential"),
+        alignment_dir=config.get("musicbert_alignment_dir"),
     )
     datamodule.setup()
 
