@@ -10,7 +10,7 @@ from graphmuse.nn.models.metrical_gnn import HybridGNN, HybridHGT, MetricalGNN
 from pytorch_lightning import LightningModule
 # Removed: from analysisgnn.models.vocsep.pl_models import isin_pairwise
 from analysisgnn.models.cadence import SMOTE
-from typing import List, Union, Dict, Any
+from typing import List, Union, Dict, Any, Optional
 from analysisgnn.models.chord import MultiTaskLoss
 import numpy as np
 from torch.optim import Optimizer
@@ -1564,14 +1564,16 @@ class ContinualAnalysisGNN(LightningModule):
 
         return ewc_penalty
 
-    def predict(self, score):
+    def predict(self, score, user_edits: Optional[Dict[str, Any]] = None, return_edit_info: bool = False):
         """Predict analysis for a musical score.
         
         Args:
             score: Path to score file or partitura Score object
+            user_edits: Optional user edit spec (see analysisgnn.utils.user_edits)
+            return_edit_info: If True, return (predictions, edit_info)
             
         Returns:
-            Dictionary of predictions for each task
+            Dictionary of predictions for each task, or (predictions, edit_info)
         """
         import tempfile
         import os
@@ -1626,6 +1628,17 @@ class ContinualAnalysisGNN(LightningModule):
             # Add batch information for single score (all nodes belong to batch 0)
             batch_size = data["note"].x.size(0)
             data["note"].batch = torch.zeros(batch_size, dtype=torch.long)
+
+            node_mask = None
+            overrides = {}
+            if user_edits:
+                from analysisgnn.utils.user_edits import normalize_user_edits
+                node_mask, overrides = normalize_user_edits(
+                    user_edits,
+                    num_nodes=batch_size,
+                    tasks_num_classes=self.task_dict,
+                    device=self.device,
+                )
             
             # Convert to the format expected by the model
             x_dict = data.x_dict
@@ -1650,6 +1663,22 @@ class ContinualAnalysisGNN(LightningModule):
                 neighbor_mask_node=num_sampled_nodes_dict,
                 neighbor_mask_edge=num_sampled_edges_dict
             )
+
+            if overrides:
+                from analysisgnn.utils.node_masking import clamp_logits_to_labels
+                for task, override in overrides.items():
+                    if task not in logits_dict:
+                        continue
+                    indices = override["indices"].to(logits_dict[task].device)
+                    if indices.numel() == 0:
+                        continue
+                    labels = override["labels"].to(logits_dict[task].device)
+                    logits_dict[task] = clamp_logits_to_labels(
+                        logits_dict[task],
+                        labels,
+                        indices,
+                        num_classes=self.task_dict.get(task),
+                    )
             
             # Convert logits to probabilities
             predictions = {k: torch.softmax(v, dim=-1) for k, v in logits_dict.items()}
@@ -1657,8 +1686,10 @@ class ContinualAnalysisGNN(LightningModule):
             # aggregate to onsetwise prediction
             predictions = onsetwise_logit_aggregation(predictions, graph=data, batch_size=batch_size)
             
+            if return_edit_info:
+                edit_info = {"node_mask": node_mask, "label_overrides": overrides}
+                return predictions, edit_info
             return predictions
             
         except Exception as e:
             raise ValueError(f"Failed to process score: {str(e)}")
-
