@@ -1,3 +1,5 @@
+import os
+
 from analysisgnn.data import RNAGraphDataset, RNAplusGraphDataset
 from analysisgnn.data.datasets.dlc import DLCGraphDataset, DLCplusGraphDataset
 # Removed imports for deleted datasets:
@@ -8,6 +10,7 @@ from analysisgnn.data.datasets.dlc import DLCGraphDataset, DLCplusGraphDataset
 # from analysisgnn.data.datasets.kern_datasets import ChopinPreludesGraphDataset, ScarlattiKeybordSonatasGraphDataset
 from torch.utils.data import Subset
 from analysisgnn.data.data_utils import process_score_pitch_spelling
+from analysisgnn.data.remi_bpe_aligner import attach_alignment_to_graph, load_alignment_npz
 from analysisgnn.data.data_utils import idx_tuple_to_dict, idx_dict_to_tuple, StandardGraphDataset, CummulativeDataset, struttura_to_inmemory_dataset
 from graphmuse.loader import MuseNeighborLoader, transform_to_pyg
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
@@ -155,6 +158,7 @@ class AnalysisDataModule(LightningDataModule):
                  raw_dir=None, force_reload=False, verbose=False, collection="all", random_split=False,
                  tasks= ["cadence", "rna", "phrase", "ks", "pedal", "staff", "metrical_strength", "is_in_label"],
                  max_samples=None, main_tasks=["cadence", "rna", "all"], feature_type="cadence", training_dataloader_type="combined",                 
+                 alignment_dir=None,
                  ):
         super(AnalysisDataModule, self).__init__()
         # only load the datasets that are needed
@@ -207,6 +211,7 @@ class AnalysisDataModule(LightningDataModule):
         self.num_neighbors = num_neighbors
         self.remove_beats = remove_beats
         self.remove_measures = remove_measures
+        self.alignment_dir = alignment_dir
         # assert that the features are the same
         key = list(self.datasets.keys())[0]
         self.features = self.datasets[key][0]["note"].x.shape[-1]
@@ -265,6 +270,7 @@ class AnalysisDataModule(LightningDataModule):
                 print(f"Datataset {k} | Train: {len(self.train_idx[k])}, Val: {len(self.val_idx[k])}, Test: {len(self.test_idx[k])}")
 
     def train_dataloader(self):
+        transform = self._build_transform()
         if self.training_dataloader_type == "sequential":
             train_graphs = Subset(self.datasets[self.trainer.model.current_task], self.train_idx[self.trainer.model.current_task])
             train_loader = MuseNeighborLoader(train_graphs,
@@ -274,7 +280,7 @@ class AnalysisDataModule(LightningDataModule):
                                               device=self.device,
                                               num_workers=self.num_workers,
                                               subgraph_sample_ratio=0.5,
-                                              transform=transform_to_pyg
+                                              transform=transform
                                               )
             return train_loader
         elif self.training_dataloader_type == "combined":
@@ -288,11 +294,12 @@ class AnalysisDataModule(LightningDataModule):
                                                 device=self.device,
                                                 num_workers=self.num_workers,
                                                 subgraph_sample_ratio=0.5,
-                                                transform=transform_to_pyg
+                                                transform=transform
                                                 )
             return CombinedLoader(train_loaders, "min_size")
 
     def val_dataloader(self):
+        transform = self._build_transform()
         val_loaders = {}
         for mt in self.main_tasks:
             val_graphs = Subset(self.datasets[mt], self.val_idx[mt])
@@ -303,11 +310,12 @@ class AnalysisDataModule(LightningDataModule):
                                             device=self.device,
                                             num_workers=self.num_workers,
                                             subgraph_sample_ratio=0.5,
-                                            transform=transform_to_pyg
+                                            transform=transform
                                             )
         return CombinedLoader(val_loaders, "max_size")
 
     def test_dataloader(self):
+        transform = self._build_transform()
         test_loaders = {}
         for mt in self.main_tasks:
             test_graphs = Subset(self.datasets[mt], self.test_idx[mt])
@@ -318,8 +326,33 @@ class AnalysisDataModule(LightningDataModule):
                                              device=self.device,
                                              num_workers=0,
                                              subgraph_sample_ratio=0.5,
-                                             transform=transform_to_pyg,
+                                             transform=transform,
                                              shuffle=False
                                              )
         return CombinedLoader(test_loaders, "max_size")
 
+    def _build_transform(self):
+        def transform(graph):
+            graph = transform_to_pyg(graph)
+            if self.alignment_dir is None:
+                return graph
+
+            graph_name = getattr(graph, "name", None)
+            if graph_name is None:
+                try:
+                    graph_name = graph["name"]
+                except Exception:
+                    graph_name = None
+
+            if graph_name is None:
+                return graph
+
+            alignment_path = os.path.join(self.alignment_dir, f"{graph_name}.npz")
+            if not os.path.exists(alignment_path):
+                return graph
+
+            alignment = load_alignment_npz(alignment_path)
+            attach_alignment_to_graph(graph, alignment)
+            return graph
+
+        return transform

@@ -14,6 +14,9 @@ numpy>=1.21.0
 pandas>=1.5.0
 scikit-learn>=1.1.0
 torchmetrics>=0.11.0
+transformers>=4.41.0
+peft>=0.10.0
+miditok>=3.0.0
 
 # Graph neural networks
 # graphmuse>=0.0.2  # Commented out due to dependency conflicts

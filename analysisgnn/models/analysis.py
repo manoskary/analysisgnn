@@ -837,7 +837,7 @@ class EdgeDecoder(nn.Module):
 
 
 class ContinualAnalysisGNN(LightningModule):
-    def __init__(self, hparams: Dict[str, Any]):
+    def __init__(self, hparams: Dict[str, Any], note_encoder: Optional[nn.Module] = None):
         super().__init__()
         encoder_type = hparams.get("model", "hybridgnn").lower()
         # save hparams as attributes
@@ -909,6 +909,7 @@ class ContinualAnalysisGNN(LightningModule):
         self.lambda_dctn = hparams.get("lambda_dctn", 0.5)
         self.lambda_featl = hparams.get("lambda_featl", 0.1)
         self.previous_tasks = []
+        self.note_encoder = note_encoder
         
         # Semi-supervised node masking parameters
         self.train_with_masking = hparams.get("train_with_masking", False)
@@ -982,8 +983,79 @@ class ContinualAnalysisGNN(LightningModule):
         
         return node_mask
 
+    def _encode_notes_with_musicbert(self, batch):
+        required_fields = ["input_ids", "attention_mask", "token2note", "num_notes"]
+        missing_fields = [field for field in required_fields if not hasattr(batch, field)]
+        if missing_fields:
+            raise ValueError(
+                "MusicBERT note encoder requires batch fields: "
+                f"{', '.join(missing_fields)}"
+            )
+
+        input_ids, attention_mask, token2note, num_notes = self._normalize_musicbert_inputs(batch)
+
+        note_embeddings, _ = self.note_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token2note=token2note,
+            num_notes=num_notes,
+        )
+
+        note_list = [note_embeddings[i, :num_notes[i]] for i in range(len(num_notes))]
+        note_embeddings = torch.cat(note_list, dim=0)
+
+        if note_embeddings.shape[0] != batch["note"].batch_size:
+            raise ValueError(
+                "MusicBERT note embeddings do not match batch note count: "
+                f"{note_embeddings.shape[0]} vs {batch['note'].batch_size}"
+            )
+
+        return note_embeddings
+
+    def _normalize_musicbert_inputs(self, batch):
+        input_ids = batch.input_ids
+        attention_mask = batch.attention_mask
+        token2note = batch.token2note
+        num_notes = batch.num_notes
+
+        if isinstance(num_notes, torch.Tensor):
+            num_notes = num_notes.tolist()
+
+        if isinstance(input_ids, torch.Tensor):
+            input_ids_tensor = input_ids
+        else:
+            input_ids_list = [
+                torch.tensor(seq, dtype=torch.long, device=self.device) for seq in input_ids
+            ]
+            input_ids_tensor = torch.nn.utils.rnn.pad_sequence(
+                input_ids_list, batch_first=True, padding_value=0
+            )
+
+        if isinstance(attention_mask, torch.Tensor):
+            attention_mask_tensor = attention_mask
+        else:
+            attention_list = [
+                torch.tensor(seq, dtype=torch.long, device=self.device) for seq in attention_mask
+            ]
+            attention_mask_tensor = torch.nn.utils.rnn.pad_sequence(
+                attention_list, batch_first=True, padding_value=0
+            )
+
+        if isinstance(token2note, torch.Tensor):
+            token2note_list = [token2note]
+        else:
+            token2note_list = [
+                torch.tensor(edges, dtype=torch.float32, device=self.device) for edges in token2note
+            ]
+
+        return input_ids_tensor, attention_mask_tensor, token2note_list, num_notes
+
     def common_step(self, batch):
         x_dict = batch.x_dict
+        if self.note_encoder is not None:
+            note_embeddings = self._encode_notes_with_musicbert(batch)
+            x_dict = dict(x_dict)
+            x_dict["note"] = note_embeddings
         batch_size = batch["note"].batch_size
         labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
         pitch_spelling = batch["note"].pitch_spelling
