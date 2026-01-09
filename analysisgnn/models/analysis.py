@@ -113,6 +113,7 @@ class LinearWarmupCosineAnnealingLR(LRScheduler):
         optimizer: Optimizer,
         warmup_steps: int,
         max_epochs: int,
+        steps_per_epoch: Optional[int] = None,
         warmup_start_lr: float = 0.0,
         eta_min: float = 0.0,
         last_epoch: int = -1,
@@ -128,6 +129,7 @@ class LinearWarmupCosineAnnealingLR(LRScheduler):
         """
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
+        self.steps_per_epoch = steps_per_epoch if steps_per_epoch is not None else 1
         self.warmup_start_lr = warmup_start_lr
         self.eta_min = eta_min
         self.current_step = 0
@@ -163,10 +165,6 @@ class LinearWarmupCosineAnnealingLR(LRScheduler):
     def step(self, epoch=None):
         # Increment step counter
         self.current_step += 1
-        
-        # Calculate steps_per_epoch if not already set
-        if not hasattr(self, 'steps_per_epoch') and self.last_epoch > 0:
-            self.steps_per_epoch = self.current_step / self.last_epoch
         
         return super().step(epoch)
 
@@ -1003,11 +1001,42 @@ class ContinualAnalysisGNN(LightningModule):
 
         note_list = [note_embeddings[i, :num_notes[i]] for i in range(len(num_notes))]
         note_embeddings = torch.cat(note_list, dim=0)
+        note_store = batch["note"]
+        if hasattr(note_store, "note_idx"):
+            note_idx = note_store.note_idx
+            if not isinstance(note_idx, torch.Tensor):
+                note_idx = torch.tensor(note_idx, device=note_embeddings.device)
+            note_idx = note_idx.to(device=note_embeddings.device, dtype=torch.long)
 
-        if note_embeddings.shape[0] != batch["note"].batch_size:
+            batch_ids = getattr(note_store, "batch", None)
+            if batch_ids is not None:
+                if not isinstance(batch_ids, torch.Tensor):
+                    batch_ids = torch.tensor(batch_ids, device=note_embeddings.device)
+                batch_ids = batch_ids.to(device=note_embeddings.device, dtype=torch.long)
+
+                offsets = torch.zeros(len(num_notes), dtype=torch.long, device=note_embeddings.device)
+                if len(num_notes) > 1:
+                    offsets[1:] = torch.cumsum(
+                        torch.tensor(num_notes[:-1], dtype=torch.long, device=note_embeddings.device),
+                        dim=0,
+                    )
+                global_idx = note_idx + offsets[batch_ids]
+            else:
+                global_idx = note_idx
+
+            if global_idx.numel() and global_idx.max().item() >= note_embeddings.shape[0]:
+                raise ValueError(
+                    "MusicBERT note indices exceed available embeddings: "
+                    f"{global_idx.max().item()} >= {note_embeddings.shape[0]}"
+                )
+            note_embeddings = note_embeddings[global_idx]
+
+        expected_nodes = int(note_store.num_nodes)
+        if note_embeddings.shape[0] != expected_nodes:
             raise ValueError(
-                "MusicBERT note embeddings do not match batch note count: "
-                f"{note_embeddings.shape[0]} vs {batch['note'].batch_size}"
+                "MusicBERT note embeddings do not match sampled node count: "
+                f"{note_embeddings.shape[0]} vs {expected_nodes}. "
+                "Ensure note_idx is attached before subgraph sampling."
             )
 
         return note_embeddings
@@ -1096,6 +1125,10 @@ class ContinualAnalysisGNN(LightningModule):
         if node_mask is not None:
             node_mask = node_mask[valid_label_mask]
         labels_dict = {k: v[mask_dict[k]] for k, v in labels_dict.items()}
+        labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
+        if not labels_dict:
+            return torch.tensor(0.0, device=batch["note"].x.device)
+        mask_dict = {k: mask_dict[k] for k in labels_dict.keys()}
 
         x = self.model.encode(
             pitch_spelling=pitch_spelling,
@@ -1221,6 +1254,14 @@ class ContinualAnalysisGNN(LightningModule):
 
         return total_loss
 
+    def _maybe_encode_x_dict(self, batch, x_dict):
+        if self.note_encoder is None:
+            return x_dict
+        note_embeddings = self._encode_notes_with_musicbert(batch)
+        x_dict = dict(x_dict)
+        x_dict["note"] = note_embeddings
+        return x_dict
+
     def training_step(self, batch, batch_idx):
         if isinstance(batch, dict):
             combined_batch = batch
@@ -1243,7 +1284,7 @@ class ContinualAnalysisGNN(LightningModule):
                 continue
             if batch is None:
                 continue
-            x_dict = batch.x_dict
+            x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
             batch_size = batch["note"].batch_size
             labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
             pitch_spelling = batch["note"].pitch_spelling
@@ -1268,6 +1309,10 @@ class ContinualAnalysisGNN(LightningModule):
             labels_dict = {k: v[valid_label_mask] for k, v in labels_dict.items()}
             mask_dict = {k: v[valid_label_mask] for k, v in mask_dict.items()}
             labels_dict = {k: v[mask_dict[k]] for k, v in labels_dict.items()}
+            labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
+            if not labels_dict:
+                continue
+            mask_dict = {k: mask_dict[k] for k in labels_dict.keys()}
 
             logits_dict = self.model(
                     pitch_spelling=pitch_spelling,
@@ -1295,6 +1340,8 @@ class ContinualAnalysisGNN(LightningModule):
             if "tpc_in_label" in logits_dict.keys():
                 rna_keys = ["quality", "inversion", "degree1", "degree2", "localkey"]
                 mask = logits_dict["tpc_in_label"].argmax(-1).bool()
+                if not mask.any():
+                    continue
                 rna_acc_total = {}
                 if all([k in labels_dict.keys() for k in rna_keys]):
                     for k in rna_keys:                        
@@ -1328,7 +1375,7 @@ class ContinualAnalysisGNN(LightningModule):
             if batch is None:
                 print("Batch is None")
                 continue
-            x_dict = batch.x_dict
+            x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
             labels_dict = {k: batch["note"][k] for k in self.task_dict.keys() if k in batch["note"].keys()}
             pitch_spelling = batch["note"].pitch_spelling
             key_signature = batch["note"].key_signature
@@ -1347,6 +1394,9 @@ class ContinualAnalysisGNN(LightningModule):
             else:
                 valid_label_mask = batch["note"]["valid_label"][:batch_size].bool()
             labels_dict = {k: v[:batch_size][valid_label_mask] for k, v in labels_dict.items()}
+            labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
+            if not labels_dict:
+                continue
             logits_dict = self.model(
                 pitch_spelling=pitch_spelling,
                 key_signature=key_signature,
@@ -1356,8 +1406,8 @@ class ContinualAnalysisGNN(LightningModule):
                 batch_size=batch_size,
                 neighbor_mask_node=num_sampled_nodes_dict, neighbor_mask_edge=num_sampled_edges_dict
             )
+            logits_dict = {k: v[valid_label_mask] for k, v in logits_dict.items() if k in labels_dict}
             logits_softmax_dict = {k: v.softmax(-1) for k, v in logits_dict.items()}
-            logits_dict = {k: v[valid_label_mask] for k, v in logits_dict.items()}
             loss_dict = self.clf_loss(logits_dict, labels_dict)
             total_loss = loss_dict.pop("total") / len(labels_dict.keys())
             accuracy_dict = {k: self.accuracy_dict[k](logits_dict[k], labels_dict[k]) for k in labels_dict.keys()}
@@ -1414,6 +1464,8 @@ class ContinualAnalysisGNN(LightningModule):
             if "tpc_in_label" in logits_dict.keys():
                 rna_keys = ["quality", "inversion", "degree1", "degree2", "localkey"]
                 mask = logits_dict["tpc_in_label"].argmax(-1).bool()
+                if not mask.any():
+                    continue
                 if all([k in labels_dict.keys() for k in rna_keys]):
                     for k in rna_keys:
                         rna_acc = self.accuracy_dict[k](logits_dict[k][mask], labels_dict[k][mask])
@@ -1424,7 +1476,7 @@ class ContinualAnalysisGNN(LightningModule):
                     self.log(f"test/RN(NCT)_{gtask_key}_accuracy", rna_accuracy.item(), add_dataloader_idx=True, batch_size=batch_size)
 
     def predict_step(self, batch, batch_idx):
-        x_dict = batch.x_dict
+        x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
         pitch_spelling = batch["note"].pitch_spelling
         key_signature = batch["note"].key_signature
         edge_index_dict = batch.edge_index_dict
@@ -1479,7 +1531,7 @@ class ContinualAnalysisGNN(LightningModule):
             self.model.zero_grad()
             self.zero_grad()
             batch = batch.to(self.device)
-            x_dict = batch.x_dict
+            x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
             labels_dict = {k: batch["note"][k] for k in self.task_dict.keys() if k in batch["note"].keys()}
             pitch_spelling = batch["note"].pitch_spelling
             key_signature = batch["note"].key_signature
@@ -1528,6 +1580,7 @@ class ContinualAnalysisGNN(LightningModule):
         else:
             # Fallback calculation
             total_steps = self.total_epochs * 5000  # Rough estimate, adjust based on your data
+        steps_per_epoch = max(1, math.ceil(total_steps / max(self.total_epochs, 1)))
         
         warmup_steps = min(500, total_steps // 20)  # 5% of total steps or 500, whichever is smaller
         
@@ -1536,6 +1589,7 @@ class ContinualAnalysisGNN(LightningModule):
             optimizer, 
             warmup_steps=warmup_steps, 
             max_epochs=self.total_epochs,
+            steps_per_epoch=steps_per_epoch,
             eta_min=self.lr * 0.01,  # Lower minimum for better convergence
             last_epoch=-1
         )

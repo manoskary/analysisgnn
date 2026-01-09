@@ -155,6 +155,9 @@ def main():
             if k not in config.keys():
                 config[k] = v
 
+    if config.get("use_musicbert", False) and not config.get("musicbert_alignment_dir"):
+        raise ValueError("MusicBERT training requires --musicbert_alignment_dir with .npz alignments.")
+
     if config["gpus"] == "-1":
         devices = 1
         accelerator = "cpu"
@@ -185,8 +188,14 @@ def main():
         augment=config.get("use_transpositions", True),
         training_dataloader_type=config.get("training_dataloader_type", "sequential"),
         alignment_dir=config.get("musicbert_alignment_dir"),
+        require_alignment=config.get("use_musicbert", False),
     )
     datamodule.setup()
+
+    if datamodule.main_tasks != config.get("main_tasks"):
+        config["main_tasks"] = datamodule.main_tasks
+        if config.get("cl_training", False):
+            config["epochs_per_task"] = [config["num_epochs"] // len(config["main_tasks"])] * len(config["main_tasks"])
 
     config["metadata"] = datamodule.metadata
     config["in_channels"] = datamodule.features
@@ -315,6 +324,8 @@ def main():
             feature_type=config.get("feature_type", "cadence"),
             augment=config.get("use_transpositions", True),
             training_dataloader_type=config.get("training_dataloader_type", "sequential"),
+            alignment_dir=config.get("musicbert_alignment_dir"),
+            require_alignment=config.get("use_musicbert", False),
         )
         datamodule.setup()
         # Test on best model

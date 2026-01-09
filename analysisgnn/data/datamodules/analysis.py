@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from analysisgnn.data import RNAGraphDataset, RNAplusGraphDataset
 from analysisgnn.data.datasets.dlc import DLCGraphDataset, DLCplusGraphDataset
@@ -159,6 +160,7 @@ class AnalysisDataModule(LightningDataModule):
                  tasks= ["cadence", "rna", "phrase", "ks", "pedal", "staff", "metrical_strength", "is_in_label"],
                  max_samples=None, main_tasks=["cadence", "rna", "all"], feature_type="cadence", training_dataloader_type="combined",                 
                  alignment_dir=None,
+                 require_alignment=False,
                  ):
         super(AnalysisDataModule, self).__init__()
         # only load the datasets that are needed
@@ -188,10 +190,6 @@ class AnalysisDataModule(LightningDataModule):
                 else:
                     raise ValueError(f"Task {t} is not available")
 
-        if max_samples is not None:
-            for k in self.datasets.keys():
-                # shuffle the indices and keep only the first max_samples
-                self.datasets[k] = Subset(self.datasets[k], torch.randperm(len(self.datasets[k]))[:max_samples])
         # Join all the lists dataset.test_pieces
         self.random_split = random_split
         self.cadence_encoder = CadenceEncoder()
@@ -212,6 +210,40 @@ class AnalysisDataModule(LightningDataModule):
         self.remove_beats = remove_beats
         self.remove_measures = remove_measures
         self.alignment_dir = alignment_dir
+        self.require_alignment = require_alignment
+
+        if max_samples is not None:
+            for k in list(self.datasets.keys()):
+                indices = list(range(len(self.datasets[k])))
+                if not self.augment:
+                    keep = []
+                    for i in indices:
+                        graph = self.datasets[k][i]
+                        transposition = getattr(graph, "transposition", None)
+                        if transposition is None:
+                            try:
+                                transposition = graph["transposition"]
+                            except Exception:
+                                transposition = None
+                        if transposition is None:
+                            try:
+                                transposition = graph["interval"]
+                            except Exception:
+                                transposition = None
+                        if transposition is None or transposition == "P1":
+                            keep.append(i)
+                    indices = keep
+                if not indices:
+                    if self.verbose:
+                        print(f"Dataset {k} has no samples after transposition filter.")
+                    self.datasets[k] = Subset(self.datasets[k], [])
+                    continue
+                if len(indices) > max_samples:
+                    perm = torch.randperm(len(indices))[:max_samples].tolist()
+                    indices = [indices[i] for i in perm]
+                self.datasets[k] = Subset(self.datasets[k], indices)
+        if self.alignment_dir is not None:
+            self._setup_alignment_transforms()
         # assert that the features are the same
         key = list(self.datasets.keys())[0]
         self.features = self.datasets[key][0]["note"].x.shape[-1]
@@ -244,7 +276,158 @@ class AnalysisDataModule(LightningDataModule):
     def prepare_data(self):
         pass
 
+    def _alignment_name_for_graph(self, graph):
+        name = getattr(graph, "name", None)
+        if name is None:
+            try:
+                name = graph["name"]
+            except Exception:
+                name = None
+        if name is None:
+            return None
+
+        interval = getattr(graph, "transposition", None)
+        if interval is None:
+            interval = getattr(graph, "interval", None)
+        if interval is None:
+            try:
+                interval = graph["transposition"]
+            except Exception:
+                interval = None
+        if interval is None:
+            try:
+                interval = graph["interval"]
+            except Exception:
+                interval = None
+
+        if interval and interval != "P1":
+            return f"{name}_{interval}"
+        return str(name)
+
+    def _wrap_dataset_transform(self, dataset, fn):
+        base = dataset.dataset if isinstance(dataset, Subset) else dataset
+        previous = getattr(base, "transform", None)
+        if previous is None:
+            base.transform = fn
+            return
+
+        def composed(graph, previous=previous):
+            graph = previous(graph)
+            return fn(graph)
+
+        base.transform = composed
+
+    def _setup_alignment_transforms(self):
+        alignment_dir = Path(self.alignment_dir)
+        if not alignment_dir.exists():
+            raise ValueError(f"Alignment directory not found: {self.alignment_dir}")
+
+        def add_note_idx(graph):
+            if "note" in getattr(graph, "node_types", []):
+                note_store = graph["note"]
+                if not hasattr(note_store, "note_idx"):
+                    note_store.note_idx = torch.arange(note_store.num_nodes)
+            return graph
+
+        def attach_alignment(graph):
+            if hasattr(graph, "input_ids") and hasattr(graph, "token2note"):
+                return graph
+            align_name = self._alignment_name_for_graph(graph)
+            if not align_name:
+                return graph
+            alignment_path = alignment_dir / f"{align_name}.npz"
+            if not alignment_path.exists():
+                return graph
+            alignment = load_alignment_npz(str(alignment_path))
+            attach_alignment_to_graph(graph, alignment)
+            return graph
+
+        for dataset in self.datasets.values():
+            self._wrap_dataset_transform(dataset, add_note_idx)
+            self._wrap_dataset_transform(dataset, attach_alignment)
+
+    def _filter_datasets_by_alignment(self):
+        if self.alignment_dir is None:
+            return
+        alignment_dir = Path(self.alignment_dir)
+        if not alignment_dir.exists():
+            raise ValueError(f"Alignment directory not found: {self.alignment_dir}")
+        alignment_names = {p.stem for p in alignment_dir.glob("*.npz")}
+
+        removed = []
+        for key in list(self.datasets.keys()):
+            dataset = self.datasets[key]
+            aligned_idx = []
+            missing = 0
+            for i in range(len(dataset)):
+                graph = dataset[i]
+                align_name = self._alignment_name_for_graph(graph)
+                if align_name and align_name in alignment_names:
+                    aligned_idx.append(i)
+                else:
+                    missing += 1
+            if not aligned_idx:
+                removed.append(key)
+                del self.datasets[key]
+                continue
+            if missing and self.verbose:
+                print(f"Dataset {key}: missing {missing} alignment(s); keeping {len(aligned_idx)} graphs.")
+            if missing:
+                self.datasets[key] = Subset(dataset, aligned_idx)
+
+        if removed:
+            self.main_tasks = [task for task in self.main_tasks if task in self.datasets]
+            if self.training_dataloader_type == "combined":
+                self.current_task = self.main_tasks
+                self.current_val_tasks = self.main_tasks
+            if self.verbose:
+                print(f"Removed datasets without alignments: {removed}")
+        if not self.datasets:
+            raise ValueError(f"No datasets remain after filtering by alignments in {alignment_dir}")
+
+    def _filter_datasets_by_transposition(self, interval: str = "P1"):
+        removed = []
+        for key in list(self.datasets.keys()):
+            dataset = self.datasets[key]
+            keep_idx = []
+            for i in range(len(dataset)):
+                graph = dataset[i]
+                transposition = getattr(graph, "transposition", None)
+                if transposition is None:
+                    try:
+                        transposition = graph["transposition"]
+                    except Exception:
+                        transposition = None
+                if transposition is None:
+                    try:
+                        transposition = graph["interval"]
+                    except Exception:
+                        transposition = None
+                if transposition is None or transposition == interval:
+                    keep_idx.append(i)
+
+            if not keep_idx:
+                removed.append(key)
+                del self.datasets[key]
+                continue
+            if len(keep_idx) != len(dataset):
+                self.datasets[key] = Subset(dataset, keep_idx)
+
+        if removed:
+            self.main_tasks = [task for task in self.main_tasks if task in self.datasets]
+            if self.training_dataloader_type == "combined":
+                self.current_task = self.main_tasks
+                self.current_val_tasks = self.main_tasks
+            if self.verbose:
+                print(f"Removed datasets without '{interval}' transposition: {removed}")
+        if not self.datasets:
+            raise ValueError(f"No datasets remain after filtering transpositions ({interval}).")
+
     def setup(self, stage=None):
+        if self.require_alignment:
+            self._filter_datasets_by_alignment()
+        if not self.augment:
+            self._filter_datasets_by_transposition("P1")
         # random split
         self.train_idx = {}
         self.val_idx = {}
@@ -252,16 +435,20 @@ class AnalysisDataModule(LightningDataModule):
         for k in self.datasets.keys():
             # Test set are files with property test=True
             if self.random_split:
-                trainval_idx, self.test_idx[k] = train_test_split(range(len(self.datasets[k])), test_size=0.2, random_state=0)
+                trainval_idx, self.test_idx[k] = train_test_split(
+                    range(len(self.datasets[k])), test_size=0.2, random_state=0
+                )
             else:
                 test_mask = np.array([g["test"] for g in self.datasets[k]])
-                assert test_mask.sum() > 0, f"No test files found in dataset {k}"
-                trainval_idx = np.where(~test_mask)[0]
-                self.test_idx[k] = np.where(test_mask)[0]
-
-            if not self.augment:
-                # remove the transposed versions
-                trainval_idx = [i for i in trainval_idx if self.datasets[k][i]["transposition"] == "P1"]
+                if test_mask.sum() > 0:
+                    trainval_idx = np.where(~test_mask)[0]
+                    self.test_idx[k] = np.where(test_mask)[0]
+                else:
+                    if self.verbose:
+                        print(f"No test files found in dataset {k}; falling back to random split.")
+                    trainval_idx, self.test_idx[k] = train_test_split(
+                        range(len(self.datasets[k])), test_size=0.2, random_state=0
+                    )
 
             self.train_idx[k], self.val_idx[k] = train_test_split(trainval_idx, test_size=0.1, random_state=0)
 
@@ -332,27 +519,13 @@ class AnalysisDataModule(LightningDataModule):
         return CombinedLoader(test_loaders, "max_size")
 
     def _build_transform(self):
-        def transform(graph):
-            graph = transform_to_pyg(graph)
-            if self.alignment_dir is None:
-                return graph
-
-            graph_name = getattr(graph, "name", None)
-            if graph_name is None:
+        def transform(graph, num_hops=None, *args, **kwargs):
+            if num_hops is None:
                 try:
-                    graph_name = graph["name"]
+                    num_hops = len(self.num_neighbors)
                 except Exception:
-                    graph_name = None
-
-            if graph_name is None:
-                return graph
-
-            alignment_path = os.path.join(self.alignment_dir, f"{graph_name}.npz")
-            if not os.path.exists(alignment_path):
-                return graph
-
-            alignment = load_alignment_npz(alignment_path)
-            attach_alignment_to_graph(graph, alignment)
+                    num_hops = 1
+            graph = transform_to_pyg(graph, num_hops)
             return graph
 
         return transform
