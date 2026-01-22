@@ -41,7 +41,7 @@ def isin_pairwise(element,test_elements, assume_unique=True):
     return torch.isin(element_cantor_proj, test_elements_cantor_proj, assume_unique=assume_unique)
 
 
-def onsetwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["quality", "inversion", "degree1", "degree2"]):        
+def onsetwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["cadence", "phrase", "root", "localkey", "quality", "inversion", "degree1", "degree2", "romanNumeral", "section"]):        
     if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
         batch_size = len(graph["note"].x) if batch_size is None else batch_size
         edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
@@ -101,7 +101,7 @@ def onsetwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None
     return logits_softmax_dict
 
 
-def beatwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["quality", "inversion", "degree1", "degree2", "romanNumeral"]):        
+def beatwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["root", "localkey", "quality", "inversion", "degree1", "degree2", "romanNumeral", "cadence", "phrase", "section"]):        
     if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
         batch_size = len(graph["note"].x) if batch_size is None else batch_size
         edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
@@ -135,7 +135,7 @@ def beatwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None,
     return logits_softmax_dict
 
 
-def measurewise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["localkey", "cadence"]):
+def measurewise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["localkey", "cadence", "phrase", "section"]):
     if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
         batch_size = len(graph["note"].x) if batch_size is None else batch_size
         edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
@@ -1918,13 +1918,13 @@ class ContinualAnalysisGNN(LightningModule):
             predictions = onsetwise_logit_aggregation(predictions, graph=data, batch_size=batch_size)
 
             # aggregate to beatwise prediction
-            beat_predictions = beatwise_logit_aggregation(predictions, graph=data, batch_size=batch_size)
+            predictions = beatwise_logit_aggregation(predictions, graph=data, batch_size=batch_size)
 
             # aggregate to measurewise prediction
-            measure_predictions = measurewise_logit_aggregation(predictions, graph=data, batch_size=batch_size
+            predictions = measurewise_logit_aggregation(predictions, graph=data, batch_size=batch_size)
             
             if return_edit_info:
-                edit_info = {"node_mask": node_mask, "label_overrides": overrides, "beat_predictions": beat_predictions, "measure_predictions": measure_predictions}
+                edit_info = {"node_mask": node_mask, "label_overrides": overrides}
                 return predictions, edit_info
             return predictions
             
