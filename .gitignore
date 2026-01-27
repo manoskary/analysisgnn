@@ -214,3 +214,4 @@ wandb/
 .vscode/
 
 /lightning_logs/
+.scratch/

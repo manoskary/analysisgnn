@@ -12,7 +12,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from analysisgnn.data.musicbert_alignment import build_alignment_from_tsv
 from analysisgnn.data.remi_bpe_aligner import load_alignment_npz
+from analysisgnn.utils.dcl_tsv_utils import create_spec_file
+
+INTERVALS = ["P1", "m2", "M2", "m3", "M3", "P4", "A4", "P5", "m6", "M6", "m7", "M7"]
 
 
 def _get_tqdm():
@@ -74,6 +78,57 @@ def _expected_alignment_name(graph) -> str:
     return str(name)
 
 
+def _parse_alignment_name(stem: str) -> Tuple[str, str]:
+    for interval in sorted(INTERVALS, key=len, reverse=True):
+        suffix = f"_{interval}"
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)], interval
+    return stem, "P1"
+
+
+def _build_tsv_index(dataset: str, raw_dir: Optional[str], force_reload: bool, verbose: bool) -> Dict[str, str]:
+    if dataset == "dlc":
+        from analysisgnn.data.datasets.dlc import DLCDataset, make_dlc_nickname
+
+        base_dataset = DLCDataset(raw_dir=raw_dir, force_reload=force_reload, verbose=verbose)
+        index = {}
+        for tsv_path, collection in zip(base_dataset.scores, base_dataset.collections):
+            base_name = os.path.splitext(os.path.basename(tsv_path))[0]
+            nickname = make_dlc_nickname(collection, base_name)
+            index[nickname] = tsv_path
+        return index
+    if dataset == "rna":
+        from analysisgnn.data.datasets.chord import AugmentedNetv100Dataset
+
+        base_dataset = AugmentedNetv100Dataset(raw_dir=raw_dir, force_reload=force_reload, verbose=verbose)
+        return {os.path.splitext(os.path.basename(path))[0]: path for path in base_dataset.scores}
+    return {}
+
+
+def _get_alignment_spec(
+    dataset: str,
+    raw_dir: Optional[str],
+    force_reload: bool,
+    verbose: bool,
+) -> Tuple[dict, dict, Optional[List[str]]]:
+    if dataset == "dlc":
+        from analysisgnn.data.datasets.dlc import DLCDataset
+
+        base_dataset = DLCDataset(raw_dir=raw_dir, force_reload=force_reload, verbose=verbose)
+        spec_file_path = os.path.join(base_dataset.raw_path, "processing", "DLC", "dlc_pitch_array_specs.csv")
+        replace_dtypes = dict(object="string", int64="Int64")
+        spec_file, converters = create_spec_file(spec_file_path, **replace_dtypes)
+        return spec_file, converters, ["tpc"]
+    if dataset == "rna":
+        from analysisgnn.data.datasets.chord import AugmentedNetv100Dataset
+
+        base_dataset = AugmentedNetv100Dataset(raw_dir=raw_dir, force_reload=force_reload, verbose=verbose)
+        spec_file_path = os.path.join(base_dataset.raw_path, "processing", "DLC", "dlc_pitch_array_specs.csv")
+        spec_file, converters = create_spec_file(spec_file_path)
+        return spec_file, converters, ["s_note"]
+    raise ValueError(f"Unsupported dataset: {dataset}")
+
+
 def _evaluate_alignment(path: Path, weight_tol: float) -> Dict[str, object]:
     try:
         alignment = load_alignment_npz(str(path))
@@ -130,6 +185,160 @@ def _evaluate_alignment(path: Path, weight_tol: float) -> Dict[str, object]:
     }
 
 
+def _compare_edges(a: np.ndarray, b: np.ndarray, weight_tol: float) -> Dict[str, float]:
+    if a.size == 0 and b.size == 0:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "weight_mae": 0.0}
+    if a.size == 0 or b.size == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "weight_mae": 1.0}
+
+    a_keys = {(int(t), int(n)): float(w) for t, n, w in a}
+    b_keys = {(int(t), int(n)): float(w) for t, n, w in b}
+    inter = set(a_keys.keys()) & set(b_keys.keys())
+    precision = len(inter) / len(a_keys) if a_keys else 0.0
+    recall = len(inter) / len(b_keys) if b_keys else 0.0
+    if precision + recall == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
+
+    if inter:
+        weight_mae = float(
+            np.mean([abs(a_keys[key] - b_keys[key]) for key in inter])
+        )
+    else:
+        weight_mae = 1.0
+
+    if weight_mae < weight_tol:
+        weight_mae = 0.0
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "weight_mae": weight_mae,
+    }
+
+
+def _note_meta_arrays(note_meta: Dict[int, object]) -> Tuple[np.ndarray, np.ndarray]:
+    if not note_meta:
+        return np.asarray([], dtype=int), np.asarray([], dtype=int)
+    ids = sorted(note_meta.keys())
+    pitches = np.asarray([note_meta[idx].pitch for idx in ids], dtype=int)
+    onset_ticks = np.asarray([note_meta[idx].onset_tick for idx in ids], dtype=int)
+    return pitches, onset_ticks
+
+
+def _deep_validate(
+    paths: List[Path],
+    dataset: str,
+    raw_dir: Optional[str],
+    tokenizer_name: str,
+    include_transpositions: bool,
+    force_reload: bool,
+    verbose: bool,
+    max_files: Optional[int],
+    seed: int,
+    weight_tol: float,
+) -> None:
+    from miditok import MusicTokenizer
+
+    if dataset == "none":
+        print("deep validation skipped: --dataset none")
+        return
+
+    rng = np.random.default_rng(seed)
+    sample_paths = paths
+    if max_files is not None and len(sample_paths) > max_files:
+        sample_paths = list(rng.choice(sample_paths, size=max_files, replace=False))
+
+    tsv_index = _build_tsv_index(dataset, raw_dir, force_reload, verbose)
+    spec_file, converters, drop_na_subset = _get_alignment_spec(dataset, raw_dir, force_reload, verbose)
+    tokenizer = MusicTokenizer.from_pretrained(tokenizer_name)
+
+    mismatched_tokens = []
+    mismatched_edges = []
+    note_meta_mismatch = []
+    missing_tsv = []
+    failures = []
+
+    for path in sample_paths:
+        stem = path.stem
+        base_name, interval = _parse_alignment_name(stem)
+        tsv_path = tsv_index.get(base_name)
+        if tsv_path is None:
+            missing_tsv.append(stem)
+            continue
+        if interval != "P1" and not include_transpositions:
+            continue
+
+        try:
+            stored = load_alignment_npz(str(path))
+        except Exception as exc:
+            failures.append((stem, f"load_failed: {exc}"))
+            continue
+
+        try:
+            rebuilt = build_alignment_from_tsv(
+                tsv_path=tsv_path,
+                tokenizer=tokenizer,
+                spec_file=spec_file,
+                converters=converters,
+                drop_na_subset=drop_na_subset,
+                interval=interval,
+            )
+        except Exception as exc:
+            failures.append((stem, f"rebuild_failed: {exc}"))
+            continue
+
+        stored_ids = np.asarray(stored.input_ids)
+        rebuilt_ids = np.asarray(rebuilt.input_ids)
+        if stored_ids.shape != rebuilt_ids.shape or not np.array_equal(stored_ids, rebuilt_ids):
+            mismatch = abs(len(stored_ids) - len(rebuilt_ids))
+            min_len = min(len(stored_ids), len(rebuilt_ids))
+            overlap = float(np.mean(stored_ids[:min_len] == rebuilt_ids[:min_len])) if min_len else 0.0
+            mismatched_tokens.append((stem, mismatch, overlap))
+
+        edge_cmp = _compare_edges(
+            np.asarray(stored.token2note),
+            np.asarray(rebuilt.token2note),
+            weight_tol=weight_tol,
+        )
+        if edge_cmp["f1"] < 0.98 or edge_cmp["weight_mae"] > weight_tol:
+            mismatched_edges.append((stem, edge_cmp))
+
+        stored_pitch, stored_onset = _note_meta_arrays(stored.note_meta)
+        rebuilt_pitch, rebuilt_onset = _note_meta_arrays(rebuilt.note_meta)
+        if stored_pitch.shape != rebuilt_pitch.shape:
+            note_meta_mismatch.append((stem, "count"))
+        else:
+            pitch_match = float(np.mean(stored_pitch == rebuilt_pitch)) if stored_pitch.size else 1.0
+            onset_match = float(np.mean(stored_onset == rebuilt_onset)) if stored_onset.size else 1.0
+            if pitch_match < 0.98 or onset_match < 0.98:
+                note_meta_mismatch.append((stem, f"pitch={pitch_match:.3f}, onset={onset_match:.3f}"))
+
+    print(f"deep checked: {len(sample_paths)}")
+    if missing_tsv:
+        print(f"deep missing tsv: {len(missing_tsv)}")
+        for stem in missing_tsv[:10]:
+            print(f"- {stem}")
+    if failures:
+        print(f"deep failures: {len(failures)}")
+        for stem, err in failures[:10]:
+            print(f"- {stem}: {err}")
+    if mismatched_tokens:
+        print(f"deep token mismatches: {len(mismatched_tokens)}")
+        for stem, length_diff, overlap in mismatched_tokens[:10]:
+            print(f"- {stem}: len_diff={length_diff}, prefix_match={overlap:.3f}")
+    if mismatched_edges:
+        print(f"deep edge mismatches: {len(mismatched_edges)}")
+        for stem, stats in mismatched_edges[:10]:
+            print(f"- {stem}: f1={stats['f1']:.3f}, weight_mae={stats['weight_mae']:.3f}")
+    if note_meta_mismatch:
+        print(f"deep note_meta mismatches: {len(note_meta_mismatch)}")
+        for stem, detail in note_meta_mismatch[:10]:
+            print(f"- {stem}: {detail}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate MusicBERT alignment files.")
     parser.add_argument(
@@ -152,6 +361,20 @@ def main() -> None:
     parser.add_argument("--max_files", type=int, default=None, help="Limit number of alignment files to scan.")
     parser.add_argument("--weight_tol", type=float, default=1e-2, help="Tolerance for token weight sums.")
     parser.add_argument("--min_note_coverage", type=float, default=0.8, help="Flag files below this coverage.")
+    parser.add_argument("--deep", action="store_true", help="Rebuild a subset of alignments for consistency checks.")
+    parser.add_argument(
+        "--deep_max_files",
+        type=int,
+        default=25,
+        help="Max alignments to rebuild in deep mode.",
+    )
+    parser.add_argument("--deep_seed", type=int, default=0, help="Seed for deep sampling.")
+    parser.add_argument(
+        "--tokenizer_name",
+        type=str,
+        default="manoskary/miditok-REMI",
+        help="Tokenizer name for deep validation.",
+    )
     args = parser.parse_args()
 
     alignment_dir = Path(args.alignment_dir)
@@ -245,6 +468,20 @@ def main() -> None:
             print(f"note count mismatches: {len(mismatched)}")
             for name, detail in mismatched[:10]:
                 print(f"- {name}: {detail}")
+
+    if args.deep:
+        _deep_validate(
+            paths=paths,
+            dataset=args.dataset,
+            raw_dir=args.raw_dir,
+            tokenizer_name=args.tokenizer_name,
+            include_transpositions=args.include_transpositions,
+            force_reload=args.force_reload,
+            verbose=args.verbose,
+            max_files=args.deep_max_files,
+            seed=args.deep_seed,
+            weight_tol=args.weight_tol,
+        )
 
 
 if __name__ == "__main__":

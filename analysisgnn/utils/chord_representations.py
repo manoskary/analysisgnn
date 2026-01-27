@@ -534,7 +534,7 @@ available_representations = {
     "quality": ChordQuality15,
     "inversion": Inversion4,
     "root": ChordRoot38,
-    "romanNumeral": RomanNumeral76,
+    "romanNumeral": SimpleRomanNumeral185,
     "hrhythm": HarmonicRhythm2,
     "pcset": PitchClassSet94,
     "bass": Bass38,

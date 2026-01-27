@@ -51,6 +51,12 @@ def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpus', type=str, default="-1",
                         help="GPUs to use, for multiple separate by comma, i.e. 0,1,2. Use -1 for CPU. (Default: -1)")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default=None,
+        help="Trainer precision (e.g., 16-mixed, bf16-mixed, 32-true). Defaults to 16-mixed on CUDA.",
+    )
     parser.add_argument('--num_layers', type=int, default=3,
                         help="Number of layers on the Graph Convolutional Encoder Network")
     parser.add_argument('--hidden_channels', type=int, default=256, help="Number of hidden units")
@@ -76,6 +82,12 @@ def get_parser():
     parser.add_argument("--raw_dir", type=str, default=None, help="Raw directory to use")
     parser.add_argument("--batch_size", type=int, default=100, help="Batch size")
     parser.add_argument("--auto_batch_size", type=bool, help="Automatically find optimal batch size", default=True)
+    parser.add_argument(
+        "--accumulate_grad_batches",
+        type=int,
+        default=1,
+        help="Number of batches to accumulate gradients before stepping the optimizer",
+    )
     parser.add_argument("--use_reledge", action="store_true", help="Use reledge")
     parser.add_argument("--use_wandb", help="Use wandb", action="store_true",)
     parser.add_argument("--use_metrical", action="store_true", help="Use metrical graphs")
@@ -144,6 +156,11 @@ def main():
     config = vars(args)
     config["task_dict"] = TASK_DICT
     config["use_edge_loss"] = config.get("use_edge_loss", False)
+    if config.get("precision") is None:
+        if config["gpus"] != "-1" and torch.cuda.is_available():
+            config["precision"] = "16-mixed"
+        else:
+            config["precision"] = "32-true"
 
     if args.config_path is not None:
         import json
@@ -224,12 +241,29 @@ def main():
                 artifact = run.use_artifact('melkisedeath/AnalysisGNN/model-zun976rt:v0', type='model')
                 artifact_dir = artifact.download()
                 config["checkpoint_path"] = artifact_dir + "/model.ckpt"
-            except :
+            except Exception:
                 raise ValueError(f"Checkpoint path {config['checkpoint_path']} does not exist!")
         # Load model from checkpoint
-        print(f"Loading model from checkpoint {config['checkpoint_path']}")                    
-        model = ContinualAnalysisGNN.load_from_checkpoint(config["checkpoint_path"])
-        model.note_encoder = note_encoder
+        print(f"Loading model from checkpoint {config['checkpoint_path']}")
+        ckpt = torch.load(config["checkpoint_path"], map_location="cpu")
+        ckpt_state = ckpt.get("state_dict", {})
+        has_note_encoder = any(key.startswith("note_encoder.") for key in ckpt_state.keys())
+        if has_note_encoder and note_encoder is None:
+            raise ValueError(
+                "Checkpoint contains MusicBERT note encoder weights, but --use_musicbert "
+                "is not enabled. Re-run with --use_musicbert (and LoRA flags if needed)."
+            )
+        if note_encoder is not None:
+            strict = True
+            if config.get("musicbert_use_lora", False) or not has_note_encoder:
+                strict = False
+            model = ContinualAnalysisGNN.load_from_checkpoint(
+                config["checkpoint_path"],
+                note_encoder=note_encoder,
+                strict=strict,
+            )
+        else:
+            model = ContinualAnalysisGNN.load_from_checkpoint(config["checkpoint_path"])
         model.current_task = config["main_tasks"][0]
     else:
         model = ContinualAnalysisGNN(config, note_encoder=note_encoder)
@@ -298,6 +332,8 @@ def main():
         reload_dataloaders_every_n_epochs=1,
         log_every_n_steps=1,
         gradient_clip_val=1.0,
+        accumulate_grad_batches=config["accumulate_grad_batches"],
+        precision=config["precision"],
     )
 
     print(f"Training model {model_name} with config: {config}")

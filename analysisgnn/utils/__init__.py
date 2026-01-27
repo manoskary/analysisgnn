@@ -3,3 +3,4 @@ from .graph import *
 from .hgraph import *
 from .globals import *
 from .music import transpose_note_array
+from .texture import *

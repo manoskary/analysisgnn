@@ -135,14 +135,14 @@ def beatwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None,
     return logits_softmax_dict
 
 
-def measurewise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["localkey", "cadence", "phrase", "section"]):
+def measurewise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["localkey"]):
     if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
         batch_size = len(graph["note"].x) if batch_size is None else batch_size
         edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
         valid_label_mask = torch.ones(batch_size, dtype=torch.bool).to(graph["note"].x.device) if valid_label_mask is None else valid_label_mask
         # NOTE: Aggregate per measure
-        measure_edges_out = edge_index_dict["measure", "contains", "note"]
-        measure_edges_in = edge_index_dict["note", "contains", "measure"]
+        measure_edges_out = edge_index_dict["measure", "connects", "note"]
+        measure_edges_in = edge_index_dict["note", "connects", "measure"]
         # find number of measures from measure_edges_in and measure_edges_out
         num_measures = max(measure_edges_out[0].max(), measure_edges_in[1].max()) + 1
         measure_edge_mask_src = measure_edges_out[1] < batch_size
@@ -163,10 +163,9 @@ def measurewise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=No
                 # create a tensor of size (num_measures, num_classes) to store the aggregated logits
                 measure_logits = torch.zeros((num_measures, v.size(-1)), device=v.device)
                 # aggregate logits from notes to measures
-                measure_logits = torch_scatter.scatter_mean(v[measure_edges_out[1]], measure_edges_out[0], dim=0, dim_size=num_measures, out=measure_logits)
+                measure_logits = torch_scatter.scatter_mean(v[measure_edges_out[1]], measure_edges_out[0], dim=0, dim_size=num_measures, out=measure_logits)                
                 # distribute back to notes
                 aggregate_logit_dict[k] = torch_scatter.scatter_mean(measure_logits[measure_edges_in[1]], measure_edges_in[0], dim=0, out=v).softmax(-1)
-
         return logits_softmax_dict
 
 
