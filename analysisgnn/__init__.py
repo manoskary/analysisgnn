@@ -15,7 +15,6 @@ from . import models
 from . import descriptors
 from . import utils
 from . import metrics
-from . import inference
 
 # Key imports for easy access
 from .models.analysis import ContinualAnalysisGNN
@@ -29,6 +28,5 @@ __all__ = [
     "models",
     "descriptors",
     "utils",
-    "metrics",
-    "inference"
+    "metrics"
 ]
