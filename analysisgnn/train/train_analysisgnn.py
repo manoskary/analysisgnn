@@ -90,6 +90,10 @@ def get_parser():
     )
     parser.add_argument("--use_reledge", action="store_true", help="Use reledge")
     parser.add_argument("--use_wandb", help="Use wandb", action="store_true",)
+    parser.add_argument("--wandb_project", type=str, default="AnalysisGNN-MusicBERT",
+                        help="W&B project name")
+    parser.add_argument("--wandb_entity", type=str, default="melkisedeath",
+                        help="W&B entity/team name")
     parser.add_argument("--use_metrical", action="store_true", help="Use metrical graphs")
     parser.add_argument("--subgraph_size", type=int, default=500, help="Subgraph size")
     parser.add_argument("--add_beats", action="store_true", help="Add beats to the graph")
@@ -286,15 +290,26 @@ def main():
 
     if config["use_wandb"]:
 
-        group = f"{'_'.join(config['main_tasks'])}"
+        task_group = "-".join(config["main_tasks"])
+        musicbert_tag = "mb"
+        if not config.get("use_musicbert", False):
+            musicbert_tag = "no-mb"
+        elif config.get("musicbert_use_lora", False):
+            musicbert_tag = "mb-lora"
+        elif config.get("musicbert_freeze_backbone", True):
+            musicbert_tag = "mb-frozen"
+        else:
+            musicbert_tag = "mb-unfrozen"
 
-        ft = config.get("feature_type", "cadence")
         aug = "aug" if config.get("use_transpositions", True) else "noaug"
-        job_type = f"{aug}-{ft}_features"        
+        feature_tag = config.get("feature_type", "cadence")
+        group = f"{task_group}-{musicbert_tag}-{feature_tag}-{aug}"
+
+        job_type = f"{musicbert_tag}/{feature_tag}-{aug}"
 
         wandb.init(
-            project="AnalysisGNN",
-            entity="melkisedeath",
+            project=config["wandb_project"],
+            entity=config["wandb_entity"],
             group=group,
             job_type=job_type,
             name=model_name,
@@ -304,10 +319,10 @@ def main():
 
         wandb_logger = WandbLogger(
             config=config,
-            project="AnalysisGNN",
-            entity="melkisedeath",
+            project=config["wandb_project"],
+            entity=config["wandb_entity"],
             group=group,
-            job_type=f"{aug}/{ft}-features",
+            job_type=job_type,
             name=model_name,
             tags=args.tags.split(",") if args.tags != "" else None,
             log_model=True,
