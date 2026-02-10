@@ -141,6 +141,26 @@ def get_parser():
     parser.add_argument("--musicbert_lora_alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--musicbert_lora_dropout", type=float, default=0.1, help="LoRA dropout")
     parser.add_argument("--musicbert_alignment_dir", type=str, default=None, help="Directory with MusicBERT alignment .npz files")
+    parser.add_argument(
+        "--musicbert_fusion",
+        type=str,
+        default="replace",
+        choices=["replace", "concat", "gate"],
+        help="How to fuse MusicBERT embeddings with note features.",
+    )
+    parser.add_argument(
+        "--mt_conflict_method",
+        type=str,
+        default="none",
+        choices=["none", "pcgrad", "gradnorm"],
+        help="Conflict mitigation for multitask losses.",
+    )
+    parser.add_argument(
+        "--gradnorm_alpha",
+        type=float,
+        default=1.5,
+        help="GradNorm alpha parameter (only used when mt_conflict_method=gradnorm).",
+    )
     return parser
 
 
@@ -219,6 +239,7 @@ def main():
             config["epochs_per_task"] = [config["num_epochs"] // len(config["main_tasks"])] * len(config["main_tasks"])
 
     config["metadata"] = datamodule.metadata
+    config["base_in_channels"] = datamodule.features
     config["in_channels"] = datamodule.features
 
     note_encoder = None
@@ -234,7 +255,14 @@ def main():
             adapter_cfg=adapter_cfg,
             freeze_backbone=config.get("musicbert_freeze_backbone", True),
         )
-        config["in_channels"] = note_encoder.backbone.model.config.hidden_size
+        musicbert_dim = note_encoder.backbone.model.config.hidden_size
+        fusion = config.get("musicbert_fusion", "replace")
+        if fusion == "concat":
+            config["in_channels"] = config["base_in_channels"] + musicbert_dim
+        elif fusion == "gate":
+            config["in_channels"] = config["base_in_channels"]
+        else:
+            config["in_channels"] = musicbert_dim
 
     if config["load_from_checkpoint"] and config["checkpoint_path"] is not None:
         # if checkpoint_path is url from wandb, download it
@@ -303,19 +331,25 @@ def main():
 
         aug = "aug" if config.get("use_transpositions", True) else "noaug"
         feature_tag = config.get("feature_type", "cadence")
-        group = f"{task_group}-{musicbert_tag}-{feature_tag}-{aug}"
-
-        job_type = f"{musicbert_tag}/{feature_tag}-{aug}"
-
-        wandb.init(
-            project=config["wandb_project"],
-            entity=config["wandb_entity"],
-            group=group,
-            job_type=job_type,
-            name=model_name,
-            tags=args.tags.split(",") if args.tags != "" else None,
-            config=config,
+        phase = "train+eval" if args.do_train and args.do_eval else ("train" if args.do_train else ("eval" if args.do_eval else "run"))
+        ckpt_tag = ""
+        if args.do_eval and not args.do_train and config.get("checkpoint_path"):
+            ckpt_parent = os.path.basename(os.path.dirname(os.path.dirname(config["checkpoint_path"])))
+            ckpt_tag = f"-ckpt={ckpt_parent}"
+        run_name = (
+            f"{phase}-{config['model']}"
+            f"-tasks={task_group}"
+            f"-feat={feature_tag}"
+            f"-{musicbert_tag}"
+            f"-{aug}"
+            f"-ep={config['num_epochs']}"
+            f"-bs={config['batch_size']}"
+            f"-lr={config['lr']}{ckpt_tag}"
         )
+        group = f"{task_group}-{feature_tag}-{musicbert_tag}-{aug}"
+        job_type = phase
+        user_tags = args.tags.split(",") if args.tags != "" else []
+        tags = [t for t in [phase, task_group, feature_tag, musicbert_tag, aug] + user_tags if t]
 
         wandb_logger = WandbLogger(
             config=config,
@@ -323,8 +357,8 @@ def main():
             entity=config["wandb_entity"],
             group=group,
             job_type=job_type,
-            name=model_name,
-            tags=args.tags.split(",") if args.tags != "" else None,
+            name=run_name,
+            tags=tags,
             log_model=True,
         )
         wandb_logger.log_hyperparams(args)
@@ -338,6 +372,8 @@ def main():
     if config.get("use_swa", False):
         swa = StochasticWeightAveraging(swa_lrs=5e-5, swa_epoch_start=50)
         callbacks.append(swa)
+    manual_optimization = config.get("mt_strategy") == "famo" or config.get("mt_conflict_method") in {"pcgrad", "gradnorm"}
+    gradient_clip_val = 0.0 if manual_optimization else 1.0
     trainer = Trainer(
         max_epochs=config["num_epochs"]+1, accelerator=accelerator, devices=devices,
         # strategy=strategy,
@@ -346,7 +382,7 @@ def main():
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=1,
         log_every_n_steps=1,
-        gradient_clip_val=1.0,
+        gradient_clip_val=gradient_clip_val,
         accumulate_grad_batches=config["accumulate_grad_batches"],
         precision=config["precision"],
     )

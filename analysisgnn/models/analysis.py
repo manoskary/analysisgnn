@@ -41,6 +41,57 @@ def isin_pairwise(element,test_elements, assume_unique=True):
     return torch.isin(element_cantor_proj, test_elements_cantor_proj, assume_unique=assume_unique)
 
 
+class PCGrad:
+    """Projected Conflicting Gradient (PCGrad) optimizer wrapper."""
+
+    def __init__(self, optimizer: Optimizer) -> None:
+        self.optimizer = optimizer
+
+    def _params(self):
+        params = []
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    params.append(p)
+        return params
+
+    def pc_backward(self, losses: List[torch.Tensor], retain_graph: bool = False) -> None:
+        params = self._params()
+        if not params or not losses:
+            return
+        grads = []
+        for loss in losses:
+            grad = torch.autograd.grad(
+                loss,
+                params,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            grads.append([g if g is not None else torch.zeros_like(p) for g, p in zip(grad, params)])
+
+        # Project conflicting gradients.
+        for i in range(len(grads)):
+            for j in range(len(grads)):
+                if i == j:
+                    continue
+                gij = sum((gi * gj).sum() for gi, gj in zip(grads[i], grads[j]))
+                if gij < 0:
+                    gj_norm_sq = sum((gj ** 2).sum() for gj in grads[j]) + 1e-12
+                    coeff = gij / gj_norm_sq
+                    grads[i] = [gi - coeff * gj for gi, gj in zip(grads[i], grads[j])]
+
+        final_grads = [sum(task_grads[k] for task_grads in grads) for k in range(len(params))]
+        for p, g in zip(params, final_grads):
+            if p.grad is None:
+                p.grad = g.detach()
+            else:
+                p.grad = p.grad + g.detach()
+
+        if not retain_graph:
+            for loss in losses:
+                loss.detach_()
+
+
 def onsetwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["cadence", "phrase", "root", "localkey", "quality", "inversion", "degree1", "degree2", "romanNumeral", "section"]):        
     if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
         batch_size = len(graph["note"].x) if batch_size is None else batch_size
@@ -1012,6 +1063,36 @@ class ContinualAnalysisGNN(LightningModule):
         self.lambda_featl = hparams.get("lambda_featl", 0.1)
         self.previous_tasks = []
         self.note_encoder = note_encoder
+        self.musicbert_fusion = hparams.get("musicbert_fusion", "replace")
+        self.base_in_channels = hparams.get("base_in_channels", hparams.get("in_channels"))
+        self.musicbert_hidden_size = hparams.get("musicbert_hidden_size", None)
+        if self.note_encoder is not None and self.musicbert_hidden_size is None:
+            try:
+                self.musicbert_hidden_size = self.note_encoder.backbone.model.config.hidden_size
+            except Exception:
+                self.musicbert_hidden_size = None
+
+        self.musicbert_proj = None
+        self.musicbert_gate = None
+        if self.note_encoder is not None and self.musicbert_fusion == "gate":
+            if self.musicbert_hidden_size is None or self.base_in_channels is None:
+                raise ValueError("Gate fusion requires base_in_channels and musicbert hidden size.")
+            self.musicbert_proj = nn.Linear(self.musicbert_hidden_size, self.base_in_channels)
+            self.musicbert_gate = nn.Sequential(
+                nn.Linear(self.base_in_channels * 2, self.base_in_channels),
+                nn.Sigmoid(),
+            )
+
+        self.mt_conflict_method = hparams.get("mt_conflict_method", "none")
+        self.gradnorm_alpha = hparams.get("gradnorm_alpha", 1.5)
+        self.task_list = list(self.task_dict.keys())
+        self.task_to_idx = {t: i for i, t in enumerate(self.task_list)}
+        self.gradnorm_weights = None
+        self.initial_task_losses = {}
+        if self.mt_conflict_method in {"pcgrad", "gradnorm"} and self.mt_strategy != "famo":
+            self.automatic_optimization = False
+            if self.mt_conflict_method == "gradnorm":
+                self.gradnorm_weights = nn.Parameter(torch.ones(len(self.task_list)))
         
         # Semi-supervised node masking parameters
         self.train_with_masking = hparams.get("train_with_masking", False)
@@ -1145,6 +1226,19 @@ class ContinualAnalysisGNN(LightningModule):
 
         return note_embeddings
 
+    def _fuse_note_features(self, note_features: Optional[torch.Tensor], note_embeddings: torch.Tensor) -> torch.Tensor:
+        if note_features is None or self.musicbert_fusion == "replace":
+            return note_embeddings
+        if self.musicbert_fusion == "concat":
+            return torch.cat([note_features, note_embeddings], dim=-1)
+        if self.musicbert_fusion == "gate":
+            if self.musicbert_proj is None or self.musicbert_gate is None:
+                return note_embeddings
+            projected = self.musicbert_proj(note_embeddings)
+            gate = self.musicbert_gate(torch.cat([note_features, projected], dim=-1))
+            return gate * projected + (1.0 - gate) * note_features
+        return note_embeddings
+
     def _normalize_musicbert_inputs(self, batch):
         input_ids = batch.input_ids
         attention_mask = batch.attention_mask
@@ -1183,41 +1277,40 @@ class ContinualAnalysisGNN(LightningModule):
 
         return input_ids_tensor, attention_mask_tensor, token2note_list, num_notes
 
-    def common_step(self, batch):
-        x_dict = batch.x_dict
-        if self.note_encoder is not None:
-            note_embeddings = self._encode_notes_with_musicbert(batch)
-            x_dict = dict(x_dict)
-            x_dict["note"] = note_embeddings
+    def _compute_task_losses(self, batch):
+        x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
         batch_size = batch["note"].batch_size
         labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
         pitch_spelling = batch["note"].pitch_spelling
-        key_signature = batch["note"].key_signature        
-        # limit labels to the num_labels values of the self.task_dict and set the rest to 0
+        key_signature = batch["note"].key_signature
         labels_dict = {
-            k: torch.where(labels_dict[k] < self.task_dict[k], labels_dict[k], torch.zeros_like(labels_dict[k])) for k
-            in labels_dict.keys()}
+            k: torch.where(
+                (labels_dict[k] >= 0) & (labels_dict[k] < self.task_dict[k]),
+                labels_dict[k],
+                torch.full_like(labels_dict[k], -1),
+            )
+            for k in labels_dict.keys()
+        }
         edge_index_dict = batch.edge_index_dict
         batch_dict = batch.batch_dict
-
         num_sampled_edges_dict = batch.num_sampled_edges_dict
         num_sampled_nodes_dict = batch.num_sampled_nodes_dict
 
         mask_dict = self.create_mask_dict(labels_dict, batch, batch_size)
 
-        # Support optional node masking for semi-supervised learning
-        # Check if node_mask is provided in the batch (explicit masks from data)
-        node_mask_from_batch = batch["note"].node_mask[:batch_size] if hasattr(batch["note"], "node_mask") and batch["note"].node_mask is not None else None
-        
-        # Apply random masking if train_with_masking is enabled (during training only)
+        node_mask_from_batch = (
+            batch["note"].node_mask[:batch_size]
+            if hasattr(batch["note"], "node_mask") and batch["note"].node_mask is not None
+            else None
+        )
+
         if self.train_with_masking and self.training and node_mask_from_batch is None:
-            # Create random masks for BERT-style semi-supervised learning
-            node_mask = self.create_random_node_mask(batch_size, device=labels_dict[list(labels_dict.keys())[0]].device)
+            node_mask = self.create_random_node_mask(
+                batch_size, device=labels_dict[list(labels_dict.keys())[0]].device
+            )
         else:
-            # Use explicitly provided masks or no masking
             node_mask = node_mask_from_batch
 
-        # NOTE: mask to remove invalid labels
         if "valid_label" not in batch["note"].keys():
             valid_label_mask = torch.ones_like(batch["note"]["pitch_spelling"][:batch_size]).bool()
         else:
@@ -1225,13 +1318,14 @@ class ContinualAnalysisGNN(LightningModule):
 
         labels_dict = {k: v[valid_label_mask] for k, v in labels_dict.items()}
         mask_dict = {k: v[valid_label_mask] for k, v in mask_dict.items()}
-        # Apply node_mask filtering if present
         if node_mask is not None:
             node_mask = node_mask[valid_label_mask]
         labels_dict = {k: v[mask_dict[k]] for k, v in labels_dict.items()}
         labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
+        labels_dict = {k: v for k, v in labels_dict.items() if self._metric_safe_mask(v, k).any()}
         if not labels_dict:
-            return torch.tensor(0.0, device=batch["note"].x.device)
+            zero = torch.tensor(0.0, device=batch["note"].x.device)
+            return {}, zero, zero, zero
         mask_dict = {k: mask_dict[k] for k in labels_dict.keys()}
 
         x = self.model.encode(
@@ -1241,44 +1335,40 @@ class ContinualAnalysisGNN(LightningModule):
             edge_index_dict=edge_index_dict,
             batch_dict=batch_dict,
             batch_size=batch_size,
-            neighbor_mask_node=num_sampled_nodes_dict, neighbor_mask_edge=num_sampled_edges_dict)
-        # feature loss verifies that the features are not too different
+            neighbor_mask_node=num_sampled_nodes_dict,
+            neighbor_mask_edge=num_sampled_edges_dict,
+        )
         feature_loss = x.pow(2).mean()
 
-        # NOTE: EDGE_BASED_LABELING
         edge_loss = torch.tensor(0.0, device=x.device)
         rna_keys = ["quality", "inversion", "degree1", "degree2", "localkey"]
         if self.use_edge_loss and all(rna_key in labels_dict.keys() for rna_key in rna_keys):
-            # target_edge_index_dict 
-            target_edge_index_dict = {k: v[:, (v[0] < batch_size) & (v[1] < batch_size)] for k, v in edge_index_dict.items() if k[0] == "note" and k[-1] == "note"}
-            # randomly select the same number of edges for each key as the batch size
+            target_edge_index_dict = {
+                k: v[:, (v[0] < batch_size) & (v[1] < batch_size)]
+                for k, v in edge_index_dict.items()
+                if k[0] == "note" and k[-1] == "note"
+            }
             for k, v in target_edge_index_dict.items():
                 if v.size(1) > batch_size:
                     target_edge_index_dict[k] = v[:, torch.randperm(v.size(1))[:batch_size]]
                 else:
                     target_edge_index_dict[k] = v
-            
-            # edges share the same label when rna_keys are the same
-            
+
             ground_truth_same_label_edge_dict = {
                 k: torch.zeros(v.shape[-1], device=x.device) for k, v in target_edge_index_dict.items()
             }
-            # for every edge type if all the source and target nodes have the same label, then the edge label is True else False
             for k, v in target_edge_index_dict.items():
                 if k[0] == "note" and k[-1] == "note":
                     src_labels = torch.stack([labels_dict[rna_key][v[0]] for rna_key in rna_keys], dim=1)
                     tgt_labels = torch.stack([labels_dict[rna_key][v[1]] for rna_key in rna_keys], dim=1)
                     same_label_mask = (src_labels == tgt_labels).all(dim=1)
                     ground_truth_same_label_edge_dict[k] = same_label_mask.long()
-            # compute logits for the edges
             edge_logits_dict = self.edge_clf(target_edge_index_dict, x)
-            # compute edge loss by stacking the loss in a tensor
             edge_loss = torch.tensor(0.0, device=self.device)
             for k, v in edge_logits_dict.items():
                 if k in ground_truth_same_label_edge_dict.keys():
                     edge_loss += self.edge_loss(v, ground_truth_same_label_edge_dict[k])
-
-            edge_loss /= len(edge_logits_dict.keys())                                        
+            edge_loss /= len(edge_logits_dict.keys())
 
         x = x[valid_label_mask]
 
@@ -1289,21 +1379,15 @@ class ContinualAnalysisGNN(LightningModule):
             mask_dict["cadence"] = torch.ones_like(y_over).bool()
             feature_loss = self.update_feature_loss(feature_loss, x_over, y_over, x, y, batch_size)
             x = x_over
-            # Reset node_mask for SMOTE case (all nodes become targets)
             if node_mask is not None:
                 node_mask = torch.ones_like(y_over, dtype=torch.float32)
 
         logits_dict = self.model.forward_clf(x)
         logits_dict = {k: logits_dict[k][mask_dict[k]] for k in labels_dict.keys()}
-        
-        # Apply node_mask filtering and logit clamping after mask_dict filtering
+
         if node_mask is not None:
-            # Apply the same mask_dict filtering to node_mask
-            # Use the first task's mask (assuming consistent masking across tasks)
             first_task_key = list(labels_dict.keys())[0]
             filtered_node_mask = node_mask[mask_dict[first_task_key]]
-            
-            # Apply logit clamping for context nodes on the filtered data
             from analysisgnn.utils.node_masking import clamp_logits_dict, split_nodes_by_mask
             _, context_indices, _ = split_nodes_by_mask(filtered_node_mask)
             if len(context_indices) > 0:
@@ -1312,31 +1396,31 @@ class ContinualAnalysisGNN(LightningModule):
             filtered_node_mask = None
 
         loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=filtered_node_mask)
-        # pop the total loss and remove it from the dict
-        total_loss = loss_dict.pop("total") / len(labels_dict.keys())
+        task_losses = {k: loss_dict[k] for k in labels_dict.keys()}
+        total_task_loss = loss_dict["total"] / len(labels_dict.keys())
 
-        memory_loss = 0
+        memory_loss = 0.0
         if len(self.previous_tasks) > 0:
             if self.lambda_dctn > 0:
-                x = self.memory_model.encode(
+                x_mem = self.memory_model.encode(
                     pitch_spelling=pitch_spelling,
                     key_signature=key_signature,
                     x_dict=x_dict,
                     edge_index_dict=edge_index_dict,
                     batch_dict=batch_dict,
                     batch_size=batch_size,
-                    neighbor_mask_node=num_sampled_nodes_dict, neighbor_mask_edge=num_sampled_edges_dict
+                    neighbor_mask_node=num_sampled_nodes_dict,
+                    neighbor_mask_edge=num_sampled_edges_dict,
                 )
-                logits_dict = self.model.forward_clf(x, self.previous_tasks)
-                memory_dict_logits = self.memory_model.forward_clf(x, self.previous_tasks)
+                logits_mem = self.model.forward_clf(x_mem, self.previous_tasks)
+                memory_dict_logits = self.memory_model.forward_clf(x_mem, self.previous_tasks)
                 temp = 2.0
                 teacher_probs = {k: F.softmax(v / temp, 1) for k, v in memory_dict_logits.items()}
-                student_log_probs  = {k: F.log_softmax(v / temp, 1) for k, v in logits_dict.items()}
-                # logits_dict = {k: (self.model.clf_task(x, k) if k not in labels_dict.keys() else logits_dict[k]) for k in self.previous_tasks}
-                # memory_dict_logits = {k: self.memory_model.clf_task(x, k) for k in self.previous_tasks}
+                student_log_probs = {k: F.log_softmax(v / temp, 1) for k, v in logits_mem.items()}
                 memory_loss_dict = {
-                    k: F.kl_div(student_log_probs[k] , teacher_probs[k], reduction='batchmean') * (temp**2) for k
-                    in self.previous_tasks}
+                    k: F.kl_div(student_log_probs[k], teacher_probs[k], reduction="batchmean") * (temp ** 2)
+                    for k in self.previous_tasks
+                }
                 memory_loss = torch.stack(list(memory_loss_dict.values())).mean()
                 self.log("train/memory_loss", memory_loss, prog_bar=True)
                 memory_loss = self.lambda_dctn * memory_loss
@@ -1346,40 +1430,182 @@ class ContinualAnalysisGNN(LightningModule):
                 self.log("train/ewc_loss", ewc_loss.item(), prog_bar=True)
                 memory_loss += self.lambda_ewc * ewc_loss
 
-        # Add edge loss to total loss with a weighting factor
-        lambda_edge = self.hparams.get("lambda_edge", 0.05)  # Add this to your config
-        total_loss += memory_loss + feature_loss * self.lambda_featl + edge_loss * lambda_edge
-        
+        lambda_edge = self.hparams.get("lambda_edge", 0.05)
+        aux_loss = memory_loss + feature_loss * self.lambda_featl + edge_loss * lambda_edge
+
+        return task_losses, total_task_loss, aux_loss, feature_loss
+
+    def _metric_safe_mask(self, labels: torch.Tensor, task_name: str) -> torch.Tensor:
+        num_classes = self.task_dict[task_name]
+        return (labels >= 0) & (labels < num_classes)
+
+    def _safe_metric_value(
+        self,
+        metric: nn.Module,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        task_name: str,
+    ):
+        valid_mask = self._metric_safe_mask(labels, task_name)
+        if not torch.any(valid_mask):
+            return None
+        return metric(logits[valid_mask], labels[valid_mask])
+
+    def _gradnorm_shared_params(self):
+        if hasattr(self.model, "project_dict") and "note" in self.model.project_dict:
+            params = [p for p in self.model.project_dict["note"].parameters() if p.requires_grad]
+            if params:
+                return params
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    def _should_step_optimizer(self) -> bool:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return True
+        fit_loop = getattr(trainer, "fit_loop", None)
+        if fit_loop is None:
+            return True
+        try:
+            return not fit_loop._should_accumulate()
+        except Exception:
+            return True
+
+    def _apply_pcgrad(self, task_losses: Dict[str, torch.Tensor], aux_loss: torch.Tensor):
+        opt = self.optimizers()
+        if opt is None:
+            return
+        should_step = self._should_step_optimizer()
+        losses = list(task_losses.values())
+        if len(losses) == 1:
+            self.manual_backward(losses[0] + aux_loss)
+        else:
+            pcgrad = PCGrad(opt)
+            pcgrad.pc_backward(losses, retain_graph=aux_loss is not None)
+            if aux_loss is not None:
+                self.manual_backward(aux_loss)
+        if should_step:
+            opt.step()
+            opt.zero_grad()
+            sched = self.lr_schedulers()
+            if sched is not None:
+                sched.step()
+
+    def _apply_gradnorm(self, task_losses: Dict[str, torch.Tensor], aux_loss: torch.Tensor):
+        opt = self.optimizers()
+        if opt is None:
+            return
+        should_step = self._should_step_optimizer()
+        tasks = list(task_losses.keys())
+        loss_vec = torch.stack([task_losses[t] for t in tasks])
+
+        for t, loss in task_losses.items():
+            if t not in self.initial_task_losses:
+                self.initial_task_losses[t] = loss.detach()
+
+        init_losses = torch.stack([self.initial_task_losses[t] for t in tasks]).to(loss_vec.device)
+        indices = torch.tensor([self.task_to_idx[t] for t in tasks], device=loss_vec.device)
+        weights = self.gradnorm_weights[indices]
+        weighted_losses = weights * loss_vec
+        total_task_loss = weighted_losses.sum()
+
+        shared_params = self._gradnorm_shared_params()
+        grad_norms = []
+        for w, loss in zip(weights, loss_vec):
+            grads = torch.autograd.grad(
+                w * loss,
+                shared_params,
+                retain_graph=True,
+                create_graph=True,
+                allow_unused=True,
+            )
+            norms = [g.norm() for g in grads if g is not None]
+            grad_norms.append(torch.norm(torch.stack(norms)) if norms else torch.tensor(0.0, device=loss_vec.device))
+        grad_norms = torch.stack(grad_norms)
+
+        loss_ratio = loss_vec.detach() / (init_losses + 1e-8)
+        loss_ratio = loss_ratio / loss_ratio.mean()
+        target = grad_norms.detach().mean() * (loss_ratio ** self.gradnorm_alpha)
+        gradnorm_loss = torch.sum(torch.abs(grad_norms - target))
+
+        total_loss = total_task_loss + aux_loss + gradnorm_loss
+
+        self.manual_backward(total_loss)
+        if should_step:
+            opt.step()
+            opt.zero_grad()
+            with torch.no_grad():
+                self.gradnorm_weights.clamp_(min=1e-3)
+                self.gradnorm_weights.mul_(len(self.gradnorm_weights) / (self.gradnorm_weights.sum() + 1e-8))
+
+            sched = self.lr_schedulers()
+            if sched is not None:
+                sched.step()
+
+    def common_step(self, batch):
+        task_losses, total_task_loss, aux_loss, feature_loss = self._compute_task_losses(batch)
+        if not task_losses:
+            return torch.tensor(0.0, device=batch["note"].x.device)
+        total_loss = total_task_loss + aux_loss
         self.log("train/total_loss", total_loss.item(), prog_bar=True)
         self.log("train/feature_loss", feature_loss.item(), prog_bar=True)
-
-        for k in loss_dict.keys():
-            self.log(f"train/{k}_loss", loss_dict[k].item())
-
+        for k, loss in task_losses.items():
+            self.log(f"train/{k}_loss", loss.item())
         return total_loss
 
     def _maybe_encode_x_dict(self, batch, x_dict):
         if self.note_encoder is None:
             return x_dict
         note_embeddings = self._encode_notes_with_musicbert(batch)
+        note_features = x_dict.get("note") if isinstance(x_dict, dict) else None
+        fused = self._fuse_note_features(note_features, note_embeddings)
         x_dict = dict(x_dict)
-        x_dict["note"] = note_embeddings
+        x_dict["note"] = fused
         return x_dict
 
     def training_step(self, batch, batch_idx):
+        if self.mt_conflict_method == "none" or self.mt_strategy == "famo":
+            if isinstance(batch, dict):
+                combined_batch = batch
+                loss = 0
+                count = 0
+                for _, bt in combined_batch.items():
+                    if bt is None:
+                        continue
+                    loss += self.common_step(bt)
+                    count += 1
+                return loss / max(count, 1)
+            return self.common_step(batch)
+
         if isinstance(batch, dict):
-            combined_batch = batch
-            loss = 0
-            for gtask_key, batch in combined_batch.items():
-                if batch is None:
+            losses = []
+            for _, bt in batch.items():
+                if bt is None:
                     continue
+                losses.append(self._training_step_conflict(bt))
+            if losses:
+                return torch.stack([l.detach() for l in losses]).mean()
+            return torch.tensor(0.0, device=self.device)
+        return self._training_step_conflict(batch)
 
-                loss += self.common_step(batch)
+    def _training_step_conflict(self, batch):
+        task_losses, total_task_loss, aux_loss, feature_loss = self._compute_task_losses(batch)
+        if not task_losses:
+            return torch.tensor(0.0, device=batch["note"].x.device)
 
-            return loss / len(combined_batch.keys())
+        if self.mt_conflict_method == "pcgrad":
+            self._apply_pcgrad(task_losses, aux_loss)
+            total_loss = (sum(task_losses.values()) / len(task_losses)) + aux_loss
+        elif self.mt_conflict_method == "gradnorm":
+            self._apply_gradnorm(task_losses, aux_loss)
+            total_loss = total_task_loss + aux_loss
         else:
-            loss = self.common_step(batch)
-            return loss
+            total_loss = total_task_loss + aux_loss
+
+        self.log("train/total_loss", total_loss.item(), prog_bar=True)
+        self.log("train/feature_loss", feature_loss.item(), prog_bar=True)
+        for k, loss in task_losses.items():
+            self.log(f"train/{k}_loss", loss.item())
+        return total_loss
 
     def validation_step(self, combined_batch, batch_idx):
         # combined_batch = combined_batch if isinstance(combined_batch, dict) else {self.current_task: combined_batch}
@@ -1393,10 +1619,15 @@ class ContinualAnalysisGNN(LightningModule):
             labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
             pitch_spelling = batch["note"].pitch_spelling
             key_signature = batch["note"].key_signature
-            # limit labels to the num_labels values of the self.task_dict and set the rest to 0
+            # Keep only valid class indices and map everything else to ignore_index (-1).
             labels_dict = {
-                k: torch.where(labels_dict[k] < self.task_dict[k], labels_dict[k], torch.zeros_like(labels_dict[k])) for
-                k in labels_dict.keys()}
+                k: torch.where(
+                    (labels_dict[k] >= 0) & (labels_dict[k] < self.task_dict[k]),
+                    labels_dict[k],
+                    torch.full_like(labels_dict[k], -1),
+                )
+                for k in labels_dict.keys()
+            }
             edge_index_dict = batch.edge_index_dict
             batch_dict = batch.batch_dict
 
@@ -1414,6 +1645,7 @@ class ContinualAnalysisGNN(LightningModule):
             mask_dict = {k: v[valid_label_mask] for k, v in mask_dict.items()}
             labels_dict = {k: v[mask_dict[k]] for k, v in labels_dict.items()}
             labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
+            labels_dict = {k: v for k, v in labels_dict.items() if self._metric_safe_mask(v, k).any()}
             if not labels_dict:
                 continue
             mask_dict = {k: mask_dict[k] for k in labels_dict.keys()}
@@ -1431,14 +1663,26 @@ class ContinualAnalysisGNN(LightningModule):
             logits_dict = {k: (v[mask_dict[k]] if k in mask_dict.keys() else v) for k, v in logits_dict.items()}
             loss_dict = self.clf_loss(logits_dict, labels_dict)
             total_loss = loss_dict.pop("total") / len(labels_dict.keys())
-            accuracy_dict = {k: self.accuracy_dict[k](logits_dict[k], labels_dict[k]) for k in labels_dict.keys()}
-            f1_dict = {k: self.f1_dict[k](logits_dict[k], labels_dict[k]) for k in labels_dict.keys()}
+            accuracy_dict = {}
+            f1_dict = {}
+            for task_name in labels_dict.keys():
+                acc = self._safe_metric_value(
+                    self.accuracy_dict[task_name], logits_dict[task_name], labels_dict[task_name], task_name
+                )
+                f1 = self._safe_metric_value(
+                    self.f1_dict[task_name], logits_dict[task_name], labels_dict[task_name], task_name
+                )
+                if acc is not None and f1 is not None:
+                    accuracy_dict[task_name] = acc
+                    f1_dict[task_name] = f1
             self.log("val/total_loss", total_loss.item(), batch_size=batch_size, prog_bar=True)
 
             for k in loss_dict.keys():
                 self.log(f"val/{k}_loss", loss_dict[k].item(), batch_size=batch_size)
-                self.log(f"val/{k}_acc", accuracy_dict[k], batch_size=batch_size)
-                self.log(f"val/{k}_f1", f1_dict[k], batch_size=batch_size)
+                if k in accuracy_dict:
+                    self.log(f"val/{k}_acc", accuracy_dict[k], batch_size=batch_size)
+                if k in f1_dict:
+                    self.log(f"val/{k}_f1", f1_dict[k], batch_size=batch_size)
 
             # RNA accuracy calculation based on in_label notes only
             if "tpc_in_label" in logits_dict.keys():
@@ -1446,15 +1690,22 @@ class ContinualAnalysisGNN(LightningModule):
                 mask = logits_dict["tpc_in_label"].argmax(-1).bool()
                 if not mask.any():
                     continue
-                rna_acc_total = {}
                 if all([k in labels_dict.keys() for k in rna_keys]):
+                    stacked = []
                     for k in rna_keys:                        
-                        rna_acc = self.accuracy_dict[k](logits_dict[k][mask], labels_dict[k][mask])
-                        rna_acc_total[k] = logits_dict[k][mask].argmax(-1).eq(labels_dict[k][mask])
+                        valid = mask & self._metric_safe_mask(labels_dict[k], k)
+                        if not valid.any():
+                            continue
+                        rna_acc = self.accuracy_dict[k](logits_dict[k][valid], labels_dict[k][valid])
+                        stacked.append(logits_dict[k][valid].argmax(-1).eq(labels_dict[k][valid]))
                         self.log(f"val/NCT_{k}_acc", rna_acc, batch_size=batch_size)
                     # stack and get accuracy over all rna keys
-                    rna_acc_total = torch.stack(list(rna_acc_total.values())).all(dim=0).float().mean()
-                    self.log("val/total_rna_acc", rna_acc_total, batch_size=batch_size)
+                    if stacked:
+                        min_len = min(x.numel() for x in stacked)
+                        if min_len > 0:
+                            stacked = [x[:min_len] for x in stacked]
+                            total_rna_acc = torch.stack(stacked).all(dim=0).float().mean()
+                            self.log("val/total_rna_acc", total_rna_acc, batch_size=batch_size)
 
     def on_validation_epoch_end(self):
         # if the epoch % self.total_epochs // 3 == 0, change the task
@@ -1483,10 +1734,15 @@ class ContinualAnalysisGNN(LightningModule):
             labels_dict = {k: batch["note"][k] for k in self.task_dict.keys() if k in batch["note"].keys()}
             pitch_spelling = batch["note"].pitch_spelling
             key_signature = batch["note"].key_signature
-            # limit labels to the num_labels values of the self.task_dict and set the rest to 0
+            # Keep only valid class indices and map everything else to ignore_index (-1).
             labels_dict = {
-                k: torch.where(labels_dict[k] < self.task_dict[k], labels_dict[k], torch.zeros_like(labels_dict[k])) for
-                k in labels_dict.keys()}
+                k: torch.where(
+                    (labels_dict[k] >= 0) & (labels_dict[k] < self.task_dict[k]),
+                    labels_dict[k],
+                    torch.full_like(labels_dict[k], -1),
+                )
+                for k in labels_dict.keys()
+            }
             edge_index_dict = batch.edge_index_dict
             batch_dict = batch.batch_dict
             batch_size = batch["note"].batch_size
@@ -1499,6 +1755,7 @@ class ContinualAnalysisGNN(LightningModule):
                 valid_label_mask = batch["note"]["valid_label"][:batch_size].bool()
             labels_dict = {k: v[:batch_size][valid_label_mask] for k, v in labels_dict.items()}
             labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
+            labels_dict = {k: v for k, v in labels_dict.items() if self._metric_safe_mask(v, k).any()}
             if not labels_dict:
                 continue
             logits_dict = self.model(
@@ -1514,8 +1771,18 @@ class ContinualAnalysisGNN(LightningModule):
             logits_softmax_dict = {k: v.softmax(-1) for k, v in logits_dict.items()}
             loss_dict = self.clf_loss(logits_dict, labels_dict)
             total_loss = loss_dict.pop("total") / len(labels_dict.keys())
-            accuracy_dict = {k: self.accuracy_dict[k](logits_dict[k], labels_dict[k]) for k in labels_dict.keys()}
-            f1_dict = {k: self.f1_dict[k](logits_dict[k], labels_dict[k]) for k in labels_dict.keys()}
+            accuracy_dict = {}
+            f1_dict = {}
+            for task_name in labels_dict.keys():
+                acc = self._safe_metric_value(
+                    self.accuracy_dict[task_name], logits_dict[task_name], labels_dict[task_name], task_name
+                )
+                f1 = self._safe_metric_value(
+                    self.f1_dict[task_name], logits_dict[task_name], labels_dict[task_name], task_name
+                )
+                if acc is not None and f1 is not None:
+                    accuracy_dict[task_name] = acc
+                    f1_dict[task_name] = f1
 
             self.log("test/total_loss", total_loss.item(), add_dataloader_idx=True, batch_size=batch_size, prog_bar=True)
             # RNA calculation Onsetwise
@@ -1528,13 +1795,32 @@ class ContinualAnalysisGNN(LightningModule):
                 onset_edges = onset_edges[:, torch.logical_and(onset_edge_mask_src, onset_edge_mask_dst)]
                 # remove self loops
                 onset_edges = onset_edges[:, onset_edges[0] != onset_edges[1]]
+                # Remap edges from full-batch node indices to valid-label node indices
+                # so they match logits_dict/labels_dict, which are already filtered by valid_label_mask.
+                remap = torch.full((batch_size,), -1, dtype=torch.long, device=onset_edges.device)
+                remap[valid_label_mask] = torch.arange(
+                    int(valid_label_mask.sum().item()),
+                    dtype=torch.long,
+                    device=onset_edges.device,
+                )
+                edge_valid = valid_label_mask[onset_edges[0]] & valid_label_mask[onset_edges[1]]
+                onset_edges = onset_edges[:, edge_valid]
+                if onset_edges.numel() > 0:
+                    onset_edges = torch.stack([remap[onset_edges[0]], remap[onset_edges[1]]], dim=0)
+                    onset_edges = onset_edges[:, (onset_edges[0] >= 0) & (onset_edges[1] >= 0)]
                 # aggregate the logit predictions based on the onset edges
                 aggregate_logit_dict = {}
                 for k, v in logits_softmax_dict.items():
                     if k in rna_keys:
-                        aggregate_logit_dict[k] = torch_scatter.scatter_mean(v[onset_edges[0]], onset_edges[1], dim=0, out=v).softmax(-1)
-                # keep valid labels
-                aggregate_logit_dict = {k: v[valid_label_mask] for k, v in aggregate_logit_dict.items()}
+                        if onset_edges.numel() == 0:
+                            aggregate_logit_dict[k] = v
+                        else:
+                            aggregate_logit_dict[k] = torch_scatter.scatter_mean(
+                                v[onset_edges[0]],
+                                onset_edges[1],
+                                dim=0,
+                                out=v.clone(),
+                            ).softmax(-1)
                 onsets = batch["note"].onset_div[:batch_size][valid_label_mask]
                 onsets = onsets - onsets.min()
                 batch_id = batch["note"].batch[:batch_size][valid_label_mask]
@@ -1554,15 +1840,19 @@ class ContinualAnalysisGNN(LightningModule):
                 # RNA calculation
                 rna_labels = {k: onsetwise_label_dict[k] for k in rna_keys}
                 rna_preds = {k: onsetwise_logit_dict[k].argmax(-1) for k in rna_keys}
-                # rna_accuracy is the logical and from the comparison of all the rna keys
-                rna_accuracy = (torch.stack([rna_preds[k] == rna_labels[k] for k in rna_keys]).t().float().mean(
-                    -1) == 1).float().mean()
-                self.log(f"test/RN(Onset)_{gtask_key}_accuracy", rna_accuracy.item(), add_dataloader_idx=True, batch_size=batch_size)
+                valid_rna = torch.stack([self._metric_safe_mask(rna_labels[k], k) for k in rna_keys]).all(dim=0)
+                if valid_rna.any():
+                    # rna_accuracy is the logical and from the comparison of all the rna keys
+                    rna_accuracy = (torch.stack([rna_preds[k][valid_rna] == rna_labels[k][valid_rna] for k in rna_keys]).t().float().mean(
+                        -1) == 1).float().mean()
+                    self.log(f"test/RN(Onset)_{gtask_key}_accuracy", rna_accuracy.item(), add_dataloader_idx=True, batch_size=batch_size)
 
 
             for k in labels_dict.keys():
-                self.log(f"test/{k}_{gtask_key}_acc", accuracy_dict[k], add_dataloader_idx=True, batch_size=batch_size)
-                self.log(f"test/{k}_{gtask_key}_f1", f1_dict[k], add_dataloader_idx=True, batch_size=batch_size)
+                if k in accuracy_dict:
+                    self.log(f"test/{k}_{gtask_key}_acc", accuracy_dict[k], add_dataloader_idx=True, batch_size=batch_size)
+                if k in f1_dict:
+                    self.log(f"test/{k}_{gtask_key}_f1", f1_dict[k], add_dataloader_idx=True, batch_size=batch_size)
 
             # RNA accuracy calculation based on in_label notes only
             if "tpc_in_label" in logits_dict.keys():
@@ -1571,13 +1861,20 @@ class ContinualAnalysisGNN(LightningModule):
                 if not mask.any():
                     continue
                 if all([k in labels_dict.keys() for k in rna_keys]):
+                    stacked = []
                     for k in rna_keys:
-                        rna_acc = self.accuracy_dict[k](logits_dict[k][mask], labels_dict[k][mask])
+                        valid = mask & self._metric_safe_mask(labels_dict[k], k)
+                        if not valid.any():
+                            continue
+                        rna_acc = self.accuracy_dict[k](logits_dict[k][valid], labels_dict[k][valid])
                         self.log(f"test/NCT_{k}_{gtask_key}_acc", rna_acc, batch_size=batch_size)
-
-                    rna_accuracy = (torch.stack([logits_dict[k][mask].argmax(-1) == labels_dict[k][mask] for k in rna_keys]).t().float().mean(
-                        -1) == 1).float().mean()
-                    self.log(f"test/RN(NCT)_{gtask_key}_accuracy", rna_accuracy.item(), add_dataloader_idx=True, batch_size=batch_size)
+                        stacked.append(logits_dict[k][valid].argmax(-1) == labels_dict[k][valid])
+                    if stacked:
+                        min_len = min(x.numel() for x in stacked)
+                        if min_len > 0:
+                            stacked = [x[:min_len] for x in stacked]
+                            rna_accuracy = (torch.stack(stacked).t().float().mean(-1) == 1).float().mean()
+                            self.log(f"test/RN(NCT)_{gtask_key}_accuracy", rna_accuracy.item(), add_dataloader_idx=True, batch_size=batch_size)
 
     def predict_step(self, batch, batch_idx):
         x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
@@ -1639,11 +1936,15 @@ class ContinualAnalysisGNN(LightningModule):
             labels_dict = {k: batch["note"][k] for k in self.task_dict.keys() if k in batch["note"].keys()}
             pitch_spelling = batch["note"].pitch_spelling
             key_signature = batch["note"].key_signature
-            # limit labels to the num_labels values of the self.task_dict and set the rest to 0
+            # Keep only valid class indices and map everything else to ignore_index (-1).
             labels_dict = {
-                k: torch.where(labels_dict[k] < self.task_dict[k], labels_dict[k], torch.zeros_like(labels_dict[k]))
-                for
-                k in labels_dict.keys()}
+                k: torch.where(
+                    (labels_dict[k] >= 0) & (labels_dict[k] < self.task_dict[k]),
+                    labels_dict[k],
+                    torch.full_like(labels_dict[k], -1),
+                )
+                for k in labels_dict.keys()
+            }
             edge_index_dict = batch.edge_index_dict
             batch_dict = batch.batch_dict
             batch_size = batch["note"].batch_size
