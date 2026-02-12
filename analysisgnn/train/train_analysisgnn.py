@@ -75,6 +75,11 @@ def get_parser():
     parser.add_argument("--force_reload", action="store_true", help="Force reload of the data")
     parser.add_argument("--model", type=str, default="HybridGNN", help="Encoder type to use",
                         choices=["HybridGNN", "HGT", "MetricalGNN"])
+    parser.add_argument(
+        "--disable_graph_encoder",
+        action="store_true",
+        help="Disable graph message passing and train classification heads directly on note representations.",
+    )
     parser.add_argument("--use_jk", help="Use Jumping Knowledge", action="store_true")
     parser.add_argument("--tags", type=str, default="", help="Tags to add to the WandB run api")
     parser.add_argument("--homogeneous", action="store_true", help="Use homogeneous graphs")
@@ -198,6 +203,8 @@ def main():
 
     if config.get("use_musicbert", False) and not config.get("musicbert_alignment_dir"):
         raise ValueError("MusicBERT training requires --musicbert_alignment_dir with .npz alignments.")
+    if config.get("disable_graph_encoder", False) and not config.get("use_musicbert", False):
+        print("Warning: --disable_graph_encoder is enabled without --use_musicbert.")
 
     if config["gpus"] == "-1":
         devices = 1
@@ -300,7 +307,7 @@ def main():
     else:
         model = ContinualAnalysisGNN(config, note_encoder=note_encoder)
 
-    if config["model"] == "MetricalGNN":
+    if not config.get("disable_graph_encoder", False) and config["model"] == "MetricalGNN":
         if config["add_measures"] and config["add_beats"]:
             config["model"] = "MetricalGNN"
         elif config["add_measures"]:
@@ -314,7 +321,8 @@ def main():
     if config["compile"]:
         model = torch.compile(model, dynamic=True)
 
-    model_name = f"{config['model']}_{config['num_layers']}x{config['hidden_channels']}-dropout={config['dropout']}-lr={config['lr']}-wd={config['weight_decay']}"
+    model_arch = f"{config['model']}-heads-only" if config.get("disable_graph_encoder", False) else config["model"]
+    model_name = f"{model_arch}_{config['num_layers']}x{config['hidden_channels']}-dropout={config['dropout']}-lr={config['lr']}-wd={config['weight_decay']}"
 
     if config["use_wandb"]:
 
@@ -331,25 +339,27 @@ def main():
 
         aug = "aug" if config.get("use_transpositions", True) else "noaug"
         feature_tag = config.get("feature_type", "cadence")
+        arch_tag = "no-gnn" if config.get("disable_graph_encoder", False) else "gnn"
         phase = "train+eval" if args.do_train and args.do_eval else ("train" if args.do_train else ("eval" if args.do_eval else "run"))
         ckpt_tag = ""
         if args.do_eval and not args.do_train and config.get("checkpoint_path"):
             ckpt_parent = os.path.basename(os.path.dirname(os.path.dirname(config["checkpoint_path"])))
             ckpt_tag = f"-ckpt={ckpt_parent}"
         run_name = (
-            f"{phase}-{config['model']}"
+            f"{phase}-{model_arch}"
             f"-tasks={task_group}"
             f"-feat={feature_tag}"
             f"-{musicbert_tag}"
+            f"-{arch_tag}"
             f"-{aug}"
             f"-ep={config['num_epochs']}"
             f"-bs={config['batch_size']}"
             f"-lr={config['lr']}{ckpt_tag}"
         )
-        group = f"{task_group}-{feature_tag}-{musicbert_tag}-{aug}"
+        group = f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}"
         job_type = phase
         user_tags = args.tags.split(",") if args.tags != "" else []
-        tags = [t for t in [phase, task_group, feature_tag, musicbert_tag, aug] + user_tags if t]
+        tags = [t for t in [phase, task_group, feature_tag, musicbert_tag, arch_tag, aug] + user_tags if t]
 
         wandb_logger = WandbLogger(
             config=config,

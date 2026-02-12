@@ -572,12 +572,27 @@ class CrossTaskTransformer(nn.Module):
     
 
 class TorchAnalysisGNN(nn.Module):
-    def __init__(self, metadata, in_channels, hidden_channels, out_channels, task_dict, num_layers, dropout=0.5, use_jk=True, logit_fusion=True, use_rnn=False, encoder_type="hybridgnn"):
+    def __init__(
+        self,
+        metadata,
+        in_channels,
+        hidden_channels,
+        out_channels,
+        task_dict,
+        num_layers,
+        dropout=0.5,
+        use_jk=True,
+        logit_fusion=True,
+        use_rnn=False,
+        encoder_type="hybridgnn",
+        use_graph_encoder=True,
+    ):
         super().__init__()
         self.pitch_embedding = nn.Embedding(35, 64)
         self.key_embedding = nn.Embedding(15, 64)
         self.logit_fusion = logit_fusion
         self.use_rnn = use_rnn
+        self.use_graph_encoder = use_graph_encoder
         self.hidden_channels = hidden_channels        
         self.project_dict = nn.ModuleDict({
             k: (nn.Sequential(
@@ -594,36 +609,50 @@ class TorchAnalysisGNN(nn.Module):
                 nn.Linear(hidden_channels, hidden_channels),
             )) for k in metadata[0]
         })
-        if encoder_type == "hgt":
-            self.encoder = HybridHGT(
-                metadata=metadata,
-                input_channels=hidden_channels,
-                hidden_channels=hidden_channels,
-                num_layers=num_layers,
-                heads=4,
-                dropout=dropout,
-                use_jk=use_jk
-            )
-        elif encoder_type == "hybridgnn":
-            self.encoder = HybridGNN(
-                metadata=metadata,
-                input_channels=hidden_channels,
-                hidden_channels=hidden_channels,
-                num_layers=num_layers,
-                dropout=dropout,
-                use_jk=use_jk
-            )
-        elif encoder_type == "metricalgnn":
-            self.encoder = MetricalGNN(
-                metadata=metadata,
-                input_channels=hidden_channels,
-                hidden_channels=hidden_channels,
-                output_channels=hidden_channels,
-                num_layers=num_layers,
-                dropout=dropout,
-                use_jk=use_jk,
-                fast=True
-            )
+        # In heads-only mode we still benefit from a learned projection block
+        # before onset pooling / classification.
+        self.no_gnn_note_mlp = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_channels),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_channels),
+        )
+        if self.use_graph_encoder:
+            if encoder_type == "hgt":
+                self.encoder = HybridHGT(
+                    metadata=metadata,
+                    input_channels=hidden_channels,
+                    hidden_channels=hidden_channels,
+                    num_layers=num_layers,
+                    heads=4,
+                    dropout=dropout,
+                    use_jk=use_jk
+                )
+            elif encoder_type == "hybridgnn":
+                self.encoder = HybridGNN(
+                    metadata=metadata,
+                    input_channels=hidden_channels,
+                    hidden_channels=hidden_channels,
+                    num_layers=num_layers,
+                    dropout=dropout,
+                    use_jk=use_jk
+                )
+            elif encoder_type == "metricalgnn":
+                self.encoder = MetricalGNN(
+                    metadata=metadata,
+                    input_channels=hidden_channels,
+                    hidden_channels=hidden_channels,
+                    output_channels=hidden_channels,
+                    num_layers=num_layers,
+                    dropout=dropout,
+                    use_jk=use_jk,
+                    fast=True
+                )
+        else:
+            self.encoder = None
         self.project_enc = nn.Sequential(
             nn.LayerNorm(2*hidden_channels),
             nn.Linear(2*hidden_channels, hidden_channels),
@@ -726,10 +755,15 @@ class TorchAnalysisGNN(nn.Module):
         z_dict = {k: v.clone() for k, v in x_dict.items()}
         z_dict["note"] = torch.cat([z_dict["note"], self.pitch_embedding(pitch_spelling), self.key_embedding(key_signature)], dim=-1)
         h_dict = {k: self.project_dict[k](z_dict[k]) for k in self.project_dict.keys()}
-        x = self.encoder(
-            x_dict=h_dict, edge_index_dict=edge_index_dict, batch_dict=batch_dict,
-            batch_size=batch_size, neighbor_mask_node=neighbor_mask_node,
-            neighbor_mask_edge=neighbor_mask_edge, return_edge_index=False, edge_attr_dict=None)
+        if self.use_graph_encoder:
+            x = self.encoder(
+                x_dict=h_dict, edge_index_dict=edge_index_dict, batch_dict=batch_dict,
+                batch_size=batch_size, neighbor_mask_node=neighbor_mask_node,
+                neighbor_mask_edge=neighbor_mask_edge, return_edge_index=False, edge_attr_dict=None)
+        else:
+            # Heads-only mode: use projected note features directly (no message passing).
+            x = h_dict["note"][:batch_size]
+            x = self.no_gnn_note_mlp(x)
         onset_edges = edge_index_dict[("note", "onset", "note")]
         onset_edge_mask = torch.logical_and(onset_edges[0] < batch_size, onset_edges[1] < batch_size)
         onset_edges = onset_edges[:, onset_edge_mask]
@@ -993,6 +1027,7 @@ class ContinualAnalysisGNN(LightningModule):
     def __init__(self, hparams: Dict[str, Any], note_encoder: Optional[nn.Module] = None):
         super().__init__()
         encoder_type = hparams.get("model", "hybridgnn").lower()
+        use_graph_encoder = not hparams.get("disable_graph_encoder", False)
         # save hparams as attributes
         self.model = TorchAnalysisGNN(
             metadata=hparams["metadata"],
@@ -1005,7 +1040,8 @@ class ContinualAnalysisGNN(LightningModule):
             logit_fusion=hparams.get("logit_fusion", False),
             use_rnn = hparams.get("use_rnn", False),
             use_jk = hparams.get("use_jk", True),
-            encoder_type=encoder_type
+            encoder_type=encoder_type,
+            use_graph_encoder=use_graph_encoder,
         )
         self.use_edge_loss = hparams.get("use_edge_loss", False)
         if self.use_edge_loss:
@@ -1113,7 +1149,8 @@ class ContinualAnalysisGNN(LightningModule):
                 logit_fusion=hparams.get("logit_fusion", False),
                 use_rnn=hparams.get("use_rnn", False),
                 use_jk=hparams.get("use_jk", True),
-                encoder_type=encoder_type
+                encoder_type=encoder_type,
+                use_graph_encoder=use_graph_encoder,
             )
             self.update_memory_model()
 
