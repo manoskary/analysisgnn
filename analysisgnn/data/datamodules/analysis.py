@@ -161,6 +161,8 @@ class AnalysisDataModule(LightningDataModule):
                  max_samples=None, main_tasks=["cadence", "rna", "all"], feature_type="cadence", training_dataloader_type="combined",                 
                  alignment_dir=None,
                  require_alignment=False,
+                 musicbert_embedding_cache_dir=None,
+                 require_cached_embeddings=False,
                  ):
         super(AnalysisDataModule, self).__init__()
         # only load the datasets that are needed
@@ -211,6 +213,8 @@ class AnalysisDataModule(LightningDataModule):
         self.remove_measures = remove_measures
         self.alignment_dir = alignment_dir
         self.require_alignment = require_alignment
+        self.musicbert_embedding_cache_dir = musicbert_embedding_cache_dir
+        self.require_cached_embeddings = require_cached_embeddings
 
         if max_samples is not None:
             for k in list(self.datasets.keys()):
@@ -242,7 +246,7 @@ class AnalysisDataModule(LightningDataModule):
                     perm = torch.randperm(len(indices))[:max_samples].tolist()
                     indices = [indices[i] for i in perm]
                 self.datasets[k] = Subset(self.datasets[k], indices)
-        if self.alignment_dir is not None:
+        if self.alignment_dir is not None or self.musicbert_embedding_cache_dir is not None:
             self._setup_alignment_transforms()
         # assert that the features are the same
         key = list(self.datasets.keys())[0]
@@ -250,6 +254,7 @@ class AnalysisDataModule(LightningDataModule):
         self.metadata = self._process_graph_metadata(self.datasets[key][0].metadata())
         self.current_val_tasks = [] if training_dataloader_type != "combined" else self.main_tasks
         self.current_task = None if training_dataloader_type != "combined" else self.main_tasks
+        self._loader_log_calls = {"train": 0, "val": 0, "test": 0}
 
     def _process_graph_metadata(self, metadata):
         nodes, edges = metadata
@@ -318,9 +323,16 @@ class AnalysisDataModule(LightningDataModule):
         base.transform = composed
 
     def _setup_alignment_transforms(self):
-        alignment_dir = Path(self.alignment_dir)
-        if not alignment_dir.exists():
+        alignment_dir = Path(self.alignment_dir) if self.alignment_dir is not None else None
+        if alignment_dir is not None and not alignment_dir.exists():
             raise ValueError(f"Alignment directory not found: {self.alignment_dir}")
+        embedding_cache_dir = (
+            Path(self.musicbert_embedding_cache_dir)
+            if self.musicbert_embedding_cache_dir is not None
+            else None
+        )
+        if embedding_cache_dir is not None and not embedding_cache_dir.exists():
+            raise ValueError(f"MusicBERT embedding cache directory not found: {self.musicbert_embedding_cache_dir}")
 
         def add_note_idx(graph):
             if "note" in getattr(graph, "node_types", []):
@@ -330,6 +342,8 @@ class AnalysisDataModule(LightningDataModule):
             return graph
 
         def attach_alignment(graph):
+            if alignment_dir is None:
+                return graph
             if hasattr(graph, "input_ids") and hasattr(graph, "token2note"):
                 return graph
             align_name = self._alignment_name_for_graph(graph)
@@ -342,9 +356,38 @@ class AnalysisDataModule(LightningDataModule):
             attach_alignment_to_graph(graph, alignment)
             return graph
 
+        def attach_cached_note_embeddings(graph):
+            if embedding_cache_dir is None:
+                return graph
+            if "note" not in getattr(graph, "node_types", []):
+                return graph
+            note_store = graph["note"]
+            if hasattr(note_store, "musicbert_note_embeddings"):
+                return graph
+
+            align_name = self._alignment_name_for_graph(graph)
+            if not align_name:
+                return graph
+
+            cache_path = embedding_cache_dir / f"{align_name}.npz"
+            if not cache_path.exists():
+                return graph
+
+            with np.load(cache_path) as payload:
+                if "note_embeddings" not in payload:
+                    return graph
+                note_embeddings = payload["note_embeddings"]
+            if note_embeddings.ndim != 2:
+                raise ValueError(
+                    f"Invalid cached MusicBERT embeddings shape {note_embeddings.shape} at {cache_path}"
+                )
+            note_store.musicbert_note_embeddings = torch.from_numpy(note_embeddings)
+            return graph
+
         for dataset in self.datasets.values():
             self._wrap_dataset_transform(dataset, add_note_idx)
             self._wrap_dataset_transform(dataset, attach_alignment)
+            self._wrap_dataset_transform(dataset, attach_cached_note_embeddings)
 
     def _filter_datasets_by_alignment(self):
         if self.alignment_dir is None:
@@ -385,6 +428,50 @@ class AnalysisDataModule(LightningDataModule):
         if not self.datasets:
             raise ValueError(f"No datasets remain after filtering by alignments in {alignment_dir}")
 
+    def _filter_datasets_by_embedding_cache(self):
+        if self.musicbert_embedding_cache_dir is None:
+            return
+        cache_dir = Path(self.musicbert_embedding_cache_dir)
+        if not cache_dir.exists():
+            raise ValueError(f"MusicBERT embedding cache directory not found: {cache_dir}")
+        cache_names = {p.stem for p in cache_dir.glob("*.npz")}
+
+        removed = []
+        for key in list(self.datasets.keys()):
+            dataset = self.datasets[key]
+            cached_idx = []
+            missing = 0
+            for i in range(len(dataset)):
+                graph = dataset[i]
+                cache_name = self._alignment_name_for_graph(graph)
+                if cache_name and cache_name in cache_names:
+                    cached_idx.append(i)
+                else:
+                    missing += 1
+            if not cached_idx:
+                removed.append(key)
+                del self.datasets[key]
+                continue
+            if missing and self.verbose:
+                print(
+                    f"Dataset {key}: missing {missing} cached MusicBERT embedding(s); "
+                    f"keeping {len(cached_idx)} graphs."
+                )
+            if missing:
+                self.datasets[key] = Subset(dataset, cached_idx)
+
+        if removed:
+            self.main_tasks = [task for task in self.main_tasks if task in self.datasets]
+            if self.training_dataloader_type == "combined":
+                self.current_task = self.main_tasks
+                self.current_val_tasks = self.main_tasks
+            if self.verbose:
+                print(f"Removed datasets without cached MusicBERT embeddings: {removed}")
+        if not self.datasets:
+            raise ValueError(
+                f"No datasets remain after filtering by cached MusicBERT embeddings in {cache_dir}"
+            )
+
     def _filter_datasets_by_transposition(self, interval: str = "P1"):
         removed = []
         for key in list(self.datasets.keys()):
@@ -423,9 +510,72 @@ class AnalysisDataModule(LightningDataModule):
         if not self.datasets:
             raise ValueError(f"No datasets remain after filtering transpositions ({interval}).")
 
+    @staticmethod
+    def _graph_interval(graph):
+        interval = getattr(graph, "transposition", None)
+        if interval is None:
+            interval = getattr(graph, "interval", None)
+        if interval is None:
+            try:
+                interval = graph["transposition"]
+            except Exception:
+                interval = None
+        if interval is None:
+            try:
+                interval = graph["interval"]
+            except Exception:
+                interval = None
+        return interval if interval is not None else "P1"
+
+    def _interval_counts(self, dataset, indices):
+        counts = {}
+        for idx in indices:
+            graph = dataset[idx]
+            interval = self._graph_interval(graph)
+            counts[interval] = counts.get(interval, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: kv[0]))
+
+    def _log_split_interval_stats(self):
+        for key, dataset in self.datasets.items():
+            train_counts = self._interval_counts(dataset, self.train_idx[key])
+            val_counts = self._interval_counts(dataset, self.val_idx[key])
+            test_counts = self._interval_counts(dataset, self.test_idx[key])
+            print(
+                f"[split-stats] dataset={key} "
+                f"train={len(self.train_idx[key])} val={len(self.val_idx[key])} test={len(self.test_idx[key])} "
+                f"train_intervals={train_counts} val_intervals={val_counts} test_intervals={test_counts}"
+            )
+
+    def _log_loader_sizes(self, stage: str, loaders):
+        self._loader_log_calls[stage] += 1
+        epoch = getattr(getattr(self, "trainer", None), "current_epoch", None)
+        prefix = f"[loader-stats] stage={stage} call={self._loader_log_calls[stage]}"
+        if epoch is not None:
+            prefix += f" epoch={epoch}"
+
+        if isinstance(loaders, dict):
+            details = []
+            for task_name, loader in loaders.items():
+                try:
+                    num_batches = len(loader)
+                except Exception:
+                    num_batches = "?"
+                details.append(f"{task_name}:graphs={len(loader.dataset)},batches={num_batches}")
+            print(f"{prefix} {'; '.join(details)}")
+            return
+
+        try:
+            num_batches = len(loaders)
+        except Exception:
+            num_batches = "?"
+        dataset_size = len(loaders.dataset) if hasattr(loaders, "dataset") else "?"
+        print(f"{prefix} graphs={dataset_size} batches={num_batches}")
+
     def setup(self, stage=None):
         if self.require_alignment:
             self._filter_datasets_by_alignment()
+        if self.require_cached_embeddings:
+            self._filter_datasets_by_embedding_cache()
         if not self.augment:
             self._filter_datasets_by_transposition("P1")
         # random split
@@ -455,6 +605,7 @@ class AnalysisDataModule(LightningDataModule):
         if self.verbose:
             for k in self.datasets.keys():
                 print(f"Datataset {k} | Train: {len(self.train_idx[k])}, Val: {len(self.val_idx[k])}, Test: {len(self.test_idx[k])}")
+        self._log_split_interval_stats()
 
     def train_dataloader(self):
         transform = self._build_transform()
@@ -469,6 +620,7 @@ class AnalysisDataModule(LightningDataModule):
                                               subgraph_sample_ratio=0.5,
                                               transform=transform
                                               )
+            self._log_loader_sizes("train", train_loader)
             return train_loader
         elif self.training_dataloader_type == "combined":
             train_loaders = {}
@@ -483,6 +635,7 @@ class AnalysisDataModule(LightningDataModule):
                                                 subgraph_sample_ratio=0.5,
                                                 transform=transform
                                                 )
+            self._log_loader_sizes("train", train_loaders)
             return CombinedLoader(train_loaders, "min_size")
 
     def val_dataloader(self):
@@ -499,6 +652,7 @@ class AnalysisDataModule(LightningDataModule):
                                             subgraph_sample_ratio=0.5,
                                             transform=transform
                                             )
+        self._log_loader_sizes("val", val_loaders)
         return CombinedLoader(val_loaders, "max_size")
 
     def test_dataloader(self):
@@ -516,6 +670,7 @@ class AnalysisDataModule(LightningDataModule):
                                              transform=transform,
                                              shuffle=False
                                              )
+        self._log_loader_sizes("test", test_loaders)
         return CombinedLoader(test_loaders, "max_size")
 
     def _build_transform(self):

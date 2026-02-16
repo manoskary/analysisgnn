@@ -13,6 +13,8 @@ import torch
 import argparse
 import wandb
 import os
+from pathlib import Path
+import numpy as np
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.tuner import Tuner
 
@@ -55,7 +57,7 @@ def get_parser():
         "--precision",
         type=str,
         default=None,
-        help="Trainer precision (e.g., 16-mixed, bf16-mixed, 32-true). Defaults to 16-mixed on CUDA.",
+        help="Trainer precision (e.g., 16-mixed, bf16-mixed, 32-true). Defaults to bf16-mixed on Ampere+ CUDA, otherwise 16-mixed on CUDA.",
     )
     parser.add_argument('--num_layers', type=int, default=3,
                         help="Number of layers on the Graph Convolutional Encoder Network")
@@ -65,6 +67,7 @@ def get_parser():
     parser.add_argument('--dropout', type=float, default=0.3, help="Dropout")
     parser.add_argument('--lr', type=float, default=0.005, help="Learning rate")
     parser.add_argument('--weight_decay', type=float, default=5e-3, help="Weight decay")
+    parser.add_argument("--grad_clip_val", type=float, default=1.0, help="Gradient clipping value")
     parser.add_argument("--num_workers", type=int, default=5, help="Number of workers")
     parser.add_argument("--lambda_dctn", type=float, default=0.5, help="Lambda for the distilation loss")
     parser.add_argument("--lambda_featl", type=float, default=0.1, help="Lambda for the feature regularization loss")
@@ -147,6 +150,23 @@ def get_parser():
     parser.add_argument("--musicbert_lora_dropout", type=float, default=0.1, help="LoRA dropout")
     parser.add_argument("--musicbert_alignment_dir", type=str, default=None, help="Directory with MusicBERT alignment .npz files")
     parser.add_argument(
+        "--musicbert_cached_embeddings_dir",
+        type=str,
+        default=None,
+        help="Directory with precomputed note-level MusicBERT embeddings (.npz).",
+    )
+    parser.add_argument(
+        "--musicbert_require_cached_embeddings",
+        action="store_true",
+        help="Require cached MusicBERT embeddings for every graph (no runtime fallback).",
+    )
+    parser.add_argument(
+        "--musicbert_embedding_dim",
+        type=int,
+        default=None,
+        help="Override cached MusicBERT embedding dimension (auto-inferred when omitted).",
+    )
+    parser.add_argument(
         "--musicbert_fusion",
         type=str,
         default="replace",
@@ -156,7 +176,7 @@ def get_parser():
     parser.add_argument(
         "--mt_conflict_method",
         type=str,
-        default="none",
+        default="pcgrad",
         choices=["none", "pcgrad", "gradnorm"],
         help="Conflict mitigation for multitask losses.",
     )
@@ -166,7 +186,62 @@ def get_parser():
         default=1.5,
         help="GradNorm alpha parameter (only used when mt_conflict_method=gradnorm).",
     )
+    parser.add_argument(
+        "--scheduler_type",
+        type=str,
+        default="cosine_warmup",
+        choices=["cosine_warmup", "plateau"],
+        help="Learning-rate scheduler type.",
+    )
+    parser.add_argument("--warmup_ratio", type=float, default=0.05, help="Warmup ratio for cosine scheduler.")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.02, help="Minimum LR ratio for cosine scheduler.")
+    parser.add_argument("--plateau_factor", type=float, default=0.5, help="ReduceLROnPlateau factor.")
+    parser.add_argument("--plateau_patience", type=int, default=6, help="ReduceLROnPlateau patience.")
+    parser.add_argument("--plateau_min_lr", type=float, default=1e-6, help="ReduceLROnPlateau minimum LR.")
+    parser.add_argument("--monitor_metric", type=str, default="val/total_loss",
+                        help="Metric used by checkpointing/early stopping and plateau scheduler.")
+    parser.add_argument("--monitor_mode", type=str, default="min", choices=["min", "max"],
+                        help="Optimization mode for monitor_metric.")
+    parser.add_argument("--early_stop_patience", type=int, default=12, help="Early stopping patience.")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.002, help="Early stopping min_delta.")
+    parser.add_argument("--optimizer_stats_log_every_n_steps", type=int, default=50,
+                        help="Log LR and gradient norms every N optimizer steps.")
+    parser.add_argument("--robust_profile", action="store_true",
+                        help="Apply robust defaults for augmented multitask runs.")
+    parser.add_argument("--early_stopping", dest="early_stopping", action="store_true",
+                        help="Enable early stopping.")
+    parser.add_argument("--no_early_stopping", dest="early_stopping", action="store_false",
+                        help="Disable early stopping.")
+    parser.set_defaults(early_stopping=True)
     return parser
+
+
+def _get_primary_cuda_major() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        major, _ = torch.cuda.get_device_capability(0)
+        return int(major)
+    except Exception:
+        return 0
+
+
+def _infer_cached_embedding_dim(cache_dir: str) -> int:
+    cache_path = Path(cache_dir)
+    if not cache_path.exists():
+        raise ValueError(f"Cached MusicBERT embedding directory not found: {cache_dir}")
+    for npz_path in sorted(cache_path.glob("*.npz")):
+        with np.load(npz_path) as data:
+            if "note_embeddings" not in data:
+                continue
+            emb = data["note_embeddings"]
+            if emb.ndim != 2:
+                continue
+            return int(emb.shape[1])
+    raise ValueError(
+        f"Could not infer cached embedding dimension from {cache_dir}. "
+        "Expected at least one .npz file containing `note_embeddings`."
+    )
 
 
 def main():
@@ -185,11 +260,22 @@ def main():
     config = vars(args)
     config["task_dict"] = TASK_DICT
     config["use_edge_loss"] = config.get("use_edge_loss", False)
+    use_cuda = config["gpus"] != "-1" and torch.cuda.is_available()
+    cuda_major = _get_primary_cuda_major() if use_cuda else 0
+    ampere_or_newer = cuda_major >= 8
     if config.get("precision") is None:
-        if config["gpus"] != "-1" and torch.cuda.is_available():
-            config["precision"] = "16-mixed"
+        if use_cuda:
+            if ampere_or_newer and torch.cuda.is_bf16_supported():
+                config["precision"] = "bf16-mixed"
+            else:
+                config["precision"] = "16-mixed"
         else:
             config["precision"] = "32-true"
+    if use_cuda and ampere_or_newer:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        print("Enabled Ampere+ fast math (TF32 + high matmul precision).")
 
     if args.config_path is not None:
         import json
@@ -201,10 +287,70 @@ def main():
             if k not in config.keys():
                 config[k] = v
 
-    if config.get("use_musicbert", False) and not config.get("musicbert_alignment_dir"):
-        raise ValueError("MusicBERT training requires --musicbert_alignment_dir with .npz alignments.")
+    if config.get("robust_profile", False):
+        print("Applying robust profile defaults.")
+        config["scheduler_type"] = "cosine_warmup"
+        config["mt_conflict_method"] = "pcgrad"
+        config["monitor_metric"] = "val/total_loss"
+        config["monitor_mode"] = "min"
+        config["early_stopping"] = True
+        config["lr"] = 1e-3
+        config["weight_decay"] = 1e-2
+        config["dropout"] = 0.4
+        config["grad_clip_val"] = 0.5
+        if use_cuda and ampere_or_newer:
+            config["precision"] = "bf16-mixed" if torch.cuda.is_bf16_supported() else "16-mixed"
+
+    if config.get("mt_conflict_method") in {"pcgrad", "gradnorm"} and config.get("mt_strategy") == "wloss":
+        print(
+            "Warning: mt_conflict_method with mt_strategy=wloss is not supported cleanly. "
+            "Switching mt_strategy to fixed (non-learned task weights)."
+        )
+        config["mt_strategy"] = "fixed"
+    if config.get("mt_conflict_method") in {"pcgrad", "gradnorm"} and config.get("mt_strategy") == "famo":
+        print(
+            "Warning: mt_conflict_method and mt_strategy=famo are incompatible. "
+            "Switching mt_strategy to fixed."
+        )
+        config["mt_strategy"] = "fixed"
+
+    if config.get("use_musicbert", False):
+        has_alignments = bool(config.get("musicbert_alignment_dir"))
+        has_cached_embeddings = bool(config.get("musicbert_cached_embeddings_dir"))
+        if not has_alignments and not has_cached_embeddings:
+            raise ValueError(
+                "MusicBERT training requires either --musicbert_alignment_dir (runtime encoding) "
+                "or --musicbert_cached_embeddings_dir (precomputed note embeddings)."
+            )
     if config.get("disable_graph_encoder", False) and not config.get("use_musicbert", False):
         print("Warning: --disable_graph_encoder is enabled without --use_musicbert.")
+
+    use_cached_embeddings = (
+        config.get("use_musicbert", False)
+        and bool(config.get("musicbert_cached_embeddings_dir"))
+        and config.get("musicbert_freeze_backbone", True)
+        and not config.get("musicbert_use_lora", False)
+    )
+    if config.get("use_musicbert", False) and config.get("musicbert_cached_embeddings_dir"):
+        if not config.get("musicbert_freeze_backbone", True):
+            print(
+                "Warning: cached MusicBERT embeddings were provided but backbone is unfrozen; "
+                "falling back to runtime MusicBERT forward passes."
+            )
+        if config.get("musicbert_use_lora", False):
+            print(
+                "Warning: cached MusicBERT embeddings were provided with LoRA enabled; "
+                "falling back to runtime MusicBERT forward passes."
+            )
+    if config.get("musicbert_require_cached_embeddings", False) and not use_cached_embeddings:
+        raise ValueError(
+            "--musicbert_require_cached_embeddings requires frozen backbone without LoRA and "
+            "--musicbert_cached_embeddings_dir."
+        )
+    if use_cached_embeddings and not config.get("musicbert_require_cached_embeddings", False):
+        config["musicbert_require_cached_embeddings"] = True
+        print("Enabling strict cached-embedding mode (all graphs must have cached MusicBERT embeddings).")
+    config["musicbert_use_cached_embeddings"] = use_cached_embeddings
 
     if config["gpus"] == "-1":
         devices = 1
@@ -235,8 +381,10 @@ def main():
         feature_type=config.get("feature_type", "cadence"),
         augment=config.get("use_transpositions", True),
         training_dataloader_type=config.get("training_dataloader_type", "sequential"),
-        alignment_dir=config.get("musicbert_alignment_dir"),
-        require_alignment=config.get("use_musicbert", False),
+        alignment_dir=config.get("musicbert_alignment_dir") if not use_cached_embeddings else None,
+        require_alignment=config.get("use_musicbert", False) and not use_cached_embeddings,
+        musicbert_embedding_cache_dir=config.get("musicbert_cached_embeddings_dir") if use_cached_embeddings else None,
+        require_cached_embeddings=config.get("musicbert_require_cached_embeddings", False),
     )
     datamodule.setup()
 
@@ -251,18 +399,27 @@ def main():
 
     note_encoder = None
     if config.get("use_musicbert", False):
-        adapter_cfg = MusicBertAdapterConfig(
-            use_lora=config.get("musicbert_use_lora", False),
-            lora_r=config.get("musicbert_lora_r", 8),
-            lora_alpha=config.get("musicbert_lora_alpha", 16),
-            lora_dropout=config.get("musicbert_lora_dropout", 0.1),
-        )
-        note_encoder = MusicBertNoteEncoder(
-            pretrained_name=config.get("musicbert_model_name", "manoskary/musicbert-large"),
-            adapter_cfg=adapter_cfg,
-            freeze_backbone=config.get("musicbert_freeze_backbone", True),
-        )
-        musicbert_dim = note_encoder.backbone.model.config.hidden_size
+        if config.get("musicbert_use_cached_embeddings", False):
+            musicbert_dim = config.get("musicbert_embedding_dim")
+            if musicbert_dim is None:
+                musicbert_dim = _infer_cached_embedding_dim(config["musicbert_cached_embeddings_dir"])
+            config["musicbert_embedding_dim"] = int(musicbert_dim)
+            config["musicbert_hidden_size"] = int(musicbert_dim)
+            print(f"Using cached MusicBERT note embeddings (dim={musicbert_dim}).")
+        else:
+            adapter_cfg = MusicBertAdapterConfig(
+                use_lora=config.get("musicbert_use_lora", False),
+                lora_r=config.get("musicbert_lora_r", 8),
+                lora_alpha=config.get("musicbert_lora_alpha", 16),
+                lora_dropout=config.get("musicbert_lora_dropout", 0.1),
+            )
+            note_encoder = MusicBertNoteEncoder(
+                pretrained_name=config.get("musicbert_model_name", "manoskary/musicbert-large"),
+                adapter_cfg=adapter_cfg,
+                freeze_backbone=config.get("musicbert_freeze_backbone", True),
+            )
+            musicbert_dim = note_encoder.backbone.model.config.hidden_size
+            config["musicbert_hidden_size"] = int(musicbert_dim)
         fusion = config.get("musicbert_fusion", "replace")
         if fusion == "concat":
             config["in_channels"] = config["base_in_channels"] + musicbert_dim
@@ -287,7 +444,7 @@ def main():
         ckpt = torch.load(config["checkpoint_path"], map_location="cpu")
         ckpt_state = ckpt.get("state_dict", {})
         has_note_encoder = any(key.startswith("note_encoder.") for key in ckpt_state.keys())
-        if has_note_encoder and note_encoder is None:
+        if has_note_encoder and note_encoder is None and not config.get("musicbert_use_cached_embeddings", False):
             raise ValueError(
                 "Checkpoint contains MusicBERT note encoder weights, but --use_musicbert "
                 "is not enabled. Re-run with --use_musicbert (and LoRA flags if needed)."
@@ -298,11 +455,19 @@ def main():
                 strict = False
             model = ContinualAnalysisGNN.load_from_checkpoint(
                 config["checkpoint_path"],
+                hparams=config,
                 note_encoder=note_encoder,
                 strict=strict,
             )
         else:
-            model = ContinualAnalysisGNN.load_from_checkpoint(config["checkpoint_path"])
+            strict = not has_note_encoder
+            model = ContinualAnalysisGNN.load_from_checkpoint(
+                config["checkpoint_path"],
+                hparams=config,
+                strict=strict,
+            )
+        model.note_encoder = note_encoder
+        model.musicbert_use_cached_embeddings = config.get("musicbert_use_cached_embeddings", False)
         model.current_task = config["main_tasks"][0]
     else:
         model = ContinualAnalysisGNN(config, note_encoder=note_encoder)
@@ -330,6 +495,8 @@ def main():
         musicbert_tag = "mb"
         if not config.get("use_musicbert", False):
             musicbert_tag = "no-mb"
+        elif config.get("musicbert_use_cached_embeddings", False):
+            musicbert_tag = "mb-cache"
         elif config.get("musicbert_use_lora", False):
             musicbert_tag = "mb-lora"
         elif config.get("musicbert_freeze_backbone", True):
@@ -352,14 +519,16 @@ def main():
             f"-{musicbert_tag}"
             f"-{arch_tag}"
             f"-{aug}"
+            f"-sched={config['scheduler_type']}"
+            f"-conf={config['mt_conflict_method']}"
             f"-ep={config['num_epochs']}"
             f"-bs={config['batch_size']}"
             f"-lr={config['lr']}{ckpt_tag}"
         )
-        group = f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}"
+        group = f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-{config['scheduler_type']}-{config['mt_conflict_method']}"
         job_type = phase
         user_tags = args.tags.split(",") if args.tags != "" else []
-        tags = [t for t in [phase, task_group, feature_tag, musicbert_tag, arch_tag, aug] + user_tags if t]
+        tags = [t for t in [phase, task_group, feature_tag, musicbert_tag, arch_tag, aug, config["scheduler_type"], config["mt_conflict_method"]] + user_tags if t]
 
         wandb_logger = WandbLogger(
             config=config,
@@ -373,7 +542,9 @@ def main():
         )
         wandb_logger.log_hyperparams(args)
 
-    checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor="val/total_loss", mode="min", save_last=True)
+    monitor_metric = config.get("monitor_metric", "val/total_loss")
+    monitor_mode = config.get("monitor_mode", "min")
+    checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor=monitor_metric, mode=monitor_mode, save_last=True)
     # Set up spawn strategy
     # strategy = DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True) if use_ddp else "auto"
 
@@ -382,10 +553,21 @@ def main():
     if config.get("use_swa", False):
         swa = StochasticWeightAveraging(swa_lrs=5e-5, swa_epoch_start=50)
         callbacks.append(swa)
+    if config.get("early_stopping", True):
+        callbacks.append(
+            EarlyStopping(
+                monitor=monitor_metric,
+                mode=monitor_mode,
+                patience=config.get("early_stop_patience", 12),
+                min_delta=config.get("early_stop_min_delta", 0.002),
+                check_finite=True,
+                strict=False,
+            )
+        )
     manual_optimization = config.get("mt_strategy") == "famo" or config.get("mt_conflict_method") in {"pcgrad", "gradnorm"}
-    gradient_clip_val = 0.0 if manual_optimization else 1.0
+    gradient_clip_val = 0.0 if manual_optimization else float(config.get("grad_clip_val", 1.0))
     trainer = Trainer(
-        max_epochs=config["num_epochs"]+1, accelerator=accelerator, devices=devices,
+        max_epochs=config["num_epochs"], accelerator=accelerator, devices=devices,
         # strategy=strategy,
         num_sanity_val_steps=3,
         logger=wandb_logger if config["use_wandb"] else None,
@@ -421,15 +603,18 @@ def main():
             feature_type=config.get("feature_type", "cadence"),
             augment=config.get("use_transpositions", True),
             training_dataloader_type=config.get("training_dataloader_type", "sequential"),
-            alignment_dir=config.get("musicbert_alignment_dir"),
-            require_alignment=config.get("use_musicbert", False),
+            alignment_dir=config.get("musicbert_alignment_dir") if not config.get("musicbert_use_cached_embeddings", False) else None,
+            require_alignment=config.get("use_musicbert", False) and not config.get("musicbert_use_cached_embeddings", False),
+            musicbert_embedding_cache_dir=config.get("musicbert_cached_embeddings_dir") if config.get("musicbert_use_cached_embeddings", False) else None,
+            require_cached_embeddings=config.get("musicbert_require_cached_embeddings", False),
         )
         datamodule.setup()
         # Test on best model
         if config["load_from_checkpoint"] and config["checkpoint_path"] is not None:
             trainer.test(model, datamodule=datamodule, ckpt_path=config["checkpoint_path"])
         else:
-            trainer.test(model, datamodule=datamodule, ckpt_path=checkpoint_callback.best_model_path)
+            ckpt_path = checkpoint_callback.best_model_path if checkpoint_callback.best_model_path else "last"
+            trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,15 @@ class MusicBertBackbone(nn.Module):
         self.adapter_cfg = adapter_cfg
         self.use_autocast = use_autocast
         self.autocast_dtype = autocast_dtype
+        if torch.cuda.is_available():
+            try:
+                major, _ = torch.cuda.get_device_capability(0)
+            except Exception:
+                major = 0
+            if major >= 8:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.set_float32_matmul_precision("high")
 
         if adapter_cfg and adapter_cfg.use_lora:
             from peft import LoraConfig, get_peft_model
@@ -74,7 +83,17 @@ class MusicBertBackbone(nn.Module):
             return nullcontext()
         if device_type != "cuda":
             return nullcontext()
-        dtype = self.autocast_dtype or torch.get_autocast_gpu_dtype()
+        dtype = self.autocast_dtype
+        if dtype is None:
+            if torch.cuda.is_bf16_supported():
+                try:
+                    major, _ = torch.cuda.get_device_capability(0)
+                except Exception:
+                    major = 0
+                if major >= 8:
+                    dtype = torch.bfloat16
+        if dtype is None:
+            dtype = torch.get_autocast_gpu_dtype()
         return torch.autocast(device_type="cuda", dtype=dtype)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:

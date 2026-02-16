@@ -267,8 +267,7 @@ class LinearWarmupCosineAnnealingLR(LRScheduler):
         self,
         optimizer: Optimizer,
         warmup_steps: int,
-        max_epochs: int,
-        steps_per_epoch: Optional[int] = None,
+        total_steps: int,
         warmup_start_lr: float = 0.0,
         eta_min: float = 0.0,
         last_epoch: int = -1,
@@ -277,17 +276,15 @@ class LinearWarmupCosineAnnealingLR(LRScheduler):
         Args:
             optimizer (Optimizer): Wrapped optimizer.
             warmup_steps (int): Maximum number of steps for linear warmup
-            max_epochs (int): Maximum number of epochs
+            total_steps (int): Total number of optimization steps.
             warmup_start_lr (float): Learning rate to start the linear warmup. Default: 0.
             eta_min (float): Minimum learning rate. Default: 0.
             last_epoch (int): The index of last epoch. Default: -1.
         """
-        self.warmup_steps = warmup_steps
-        self.max_epochs = max_epochs
-        self.steps_per_epoch = steps_per_epoch if steps_per_epoch is not None else 1
+        self.total_steps = max(1, int(total_steps))
+        self.warmup_steps = min(max(0, int(warmup_steps)), self.total_steps - 1)
         self.warmup_start_lr = warmup_start_lr
         self.eta_min = eta_min
-        self.current_step = 0
 
         super(LinearWarmupCosineAnnealingLR, self).__init__(optimizer, last_epoch)
 
@@ -302,41 +299,38 @@ class LinearWarmupCosineAnnealingLR(LRScheduler):
                 UserWarning,
             )
 
-        # Handle warmup based on steps
-        if self.current_step < self.warmup_steps:
+        current_step = min(max(self.last_epoch, 0), self.total_steps)
+
+        if current_step < self.warmup_steps:
+            warmup_progress = current_step / max(1, self.warmup_steps)
             return [
-                self.warmup_start_lr + (base_lr - self.warmup_start_lr) * (self.current_step / self.warmup_steps)
+                self.warmup_start_lr + (base_lr - self.warmup_start_lr) * warmup_progress
                 for base_lr in self.base_lrs
             ]
-        
-        # After warmup, use cosine annealing schedule based on epochs
+
+        cosine_steps = max(1, self.total_steps - self.warmup_steps)
+        cosine_progress = min(max((current_step - self.warmup_steps) / cosine_steps, 0.0), 1.0)
         return [
-            self.eta_min + 0.5 * (base_lr - self.eta_min) *
-            (1 + math.cos(math.pi * (self.last_epoch - self.warmup_steps / self.steps_per_epoch) / 
-                         (self.max_epochs - self.warmup_steps / self.steps_per_epoch)))
+            self.eta_min + 0.5 * (base_lr - self.eta_min) * (1.0 + math.cos(math.pi * cosine_progress))
             for base_lr in self.base_lrs
         ]
-
-    def step(self, epoch=None):
-        # Increment step counter
-        self.current_step += 1
-        
-        return super().step(epoch)
 
     def _get_closed_form_lr(self) -> List[float]:
         """
         Called when epoch is passed as a param to the `step` function of the scheduler.
         """
-        if self.current_step < self.warmup_steps:
+        current_step = min(max(self.last_epoch, 0), self.total_steps)
+        if current_step < self.warmup_steps:
+            warmup_progress = current_step / max(1, self.warmup_steps)
             return [
-                self.warmup_start_lr + (base_lr - self.warmup_start_lr) * (self.current_step / self.warmup_steps)
+                self.warmup_start_lr + (base_lr - self.warmup_start_lr) * warmup_progress
                 for base_lr in self.base_lrs
             ]
 
+        cosine_steps = max(1, self.total_steps - self.warmup_steps)
+        cosine_progress = min(max((current_step - self.warmup_steps) / cosine_steps, 0.0), 1.0)
         return [
-            self.eta_min + 0.5 * (base_lr - self.eta_min) *
-            (1 + math.cos(math.pi * (self.last_epoch - self.warmup_steps / self.steps_per_epoch) / 
-                         (self.max_epochs - self.warmup_steps / self.steps_per_epoch)))
+            self.eta_min + 0.5 * (base_lr - self.eta_min) * (1.0 + math.cos(math.pi * cosine_progress))
             for base_lr in self.base_lrs
         ]
 
@@ -1099,6 +1093,7 @@ class ContinualAnalysisGNN(LightningModule):
         self.lambda_featl = hparams.get("lambda_featl", 0.1)
         self.previous_tasks = []
         self.note_encoder = note_encoder
+        self.musicbert_use_cached_embeddings = hparams.get("musicbert_use_cached_embeddings", False)
         self.musicbert_fusion = hparams.get("musicbert_fusion", "replace")
         self.base_in_channels = hparams.get("base_in_channels", hparams.get("in_channels"))
         self.musicbert_hidden_size = hparams.get("musicbert_hidden_size", None)
@@ -1121,6 +1116,16 @@ class ContinualAnalysisGNN(LightningModule):
 
         self.mt_conflict_method = hparams.get("mt_conflict_method", "none")
         self.gradnorm_alpha = hparams.get("gradnorm_alpha", 1.5)
+        self.grad_clip_val = float(hparams.get("grad_clip_val", 0.0))
+        self.optimizer_stats_log_every_n_steps = int(hparams.get("optimizer_stats_log_every_n_steps", 50))
+        self.monitor_metric = hparams.get("monitor_metric", "val/total_loss")
+        self.monitor_mode = hparams.get("monitor_mode", "min")
+        self.scheduler_type = hparams.get("scheduler_type", "cosine_warmup")
+        self.warmup_ratio = float(hparams.get("warmup_ratio", 0.05))
+        self.min_lr_ratio = float(hparams.get("min_lr_ratio", 0.02))
+        self.plateau_factor = float(hparams.get("plateau_factor", 0.5))
+        self.plateau_patience = int(hparams.get("plateau_patience", 6))
+        self.plateau_min_lr = float(hparams.get("plateau_min_lr", 1e-6))
         self.task_list = list(self.task_dict.keys())
         self.task_to_idx = {t: i for i, t in enumerate(self.task_list)}
         self.gradnorm_weights = None
@@ -1204,6 +1209,37 @@ class ContinualAnalysisGNN(LightningModule):
         return node_mask
 
     def _encode_notes_with_musicbert(self, batch):
+        note_store = batch["note"]
+        cached_embeddings = (
+            getattr(note_store, "musicbert_note_embeddings", None)
+            if self.musicbert_use_cached_embeddings
+            else None
+        )
+        if cached_embeddings is not None:
+            if not isinstance(cached_embeddings, torch.Tensor):
+                cached_embeddings = torch.tensor(cached_embeddings)
+            cached_embeddings = cached_embeddings.to(device=self.device)
+            if cached_embeddings.ndim != 2:
+                raise ValueError(
+                    "Cached MusicBERT embeddings must be 2D [num_nodes, hidden_dim], "
+                    f"got shape {tuple(cached_embeddings.shape)}"
+                )
+            expected_nodes = int(note_store.num_nodes)
+            if cached_embeddings.shape[0] != expected_nodes:
+                raise ValueError(
+                    "Cached MusicBERT embeddings do not match sampled node count: "
+                    f"{cached_embeddings.shape[0]} vs {expected_nodes}"
+                )
+            return cached_embeddings
+
+        if self.note_encoder is None:
+            if self.musicbert_use_cached_embeddings:
+                raise ValueError(
+                    "MusicBERT cached embeddings are enabled but missing on the batch. "
+                    "Ensure `--musicbert_cached_embeddings_dir` is set and contains .npz files for all graphs."
+                )
+            raise ValueError("MusicBERT note encoder is not available.")
+
         required_fields = ["input_ids", "attention_mask", "token2note", "num_notes"]
         missing_fields = [field for field in required_fields if not hasattr(batch, field)]
         if missing_fields:
@@ -1223,7 +1259,6 @@ class ContinualAnalysisGNN(LightningModule):
 
         note_list = [note_embeddings[i, :num_notes[i]] for i in range(len(num_notes))]
         note_embeddings = torch.cat(note_list, dim=0)
-        note_store = batch["note"]
         if hasattr(note_store, "note_idx"):
             note_idx = note_store.note_idx
             if not isinstance(note_idx, torch.Tensor):
@@ -1264,6 +1299,12 @@ class ContinualAnalysisGNN(LightningModule):
         return note_embeddings
 
     def _fuse_note_features(self, note_features: Optional[torch.Tensor], note_embeddings: torch.Tensor) -> torch.Tensor:
+        if note_features is not None and note_embeddings.dtype != note_features.dtype:
+            note_embeddings = note_embeddings.to(note_features.dtype)
+        elif note_features is None:
+            note_dtype = self.model.project_dict["note"][0].weight.dtype
+            if note_embeddings.dtype != note_dtype:
+                note_embeddings = note_embeddings.to(note_dtype)
         if note_features is None or self.musicbert_fusion == "replace":
             return note_embeddings
         if self.musicbert_fusion == "concat":
@@ -1507,6 +1548,73 @@ class ContinualAnalysisGNN(LightningModule):
         except Exception:
             return True
 
+    @staticmethod
+    def _grad_norm(params: List[torch.nn.Parameter]) -> float:
+        norms = [p.grad.detach().norm(2) for p in params if p.grad is not None]
+        if not norms:
+            return 0.0
+        stacked = torch.stack(norms)
+        return float(torch.norm(stacked, p=2).item())
+
+    def _log_optimizer_stats(self, optimizer: Optimizer) -> None:
+        if self.optimizer_stats_log_every_n_steps <= 0:
+            return
+        if int(self.global_step) % self.optimizer_stats_log_every_n_steps != 0:
+            return
+        lr = float(optimizer.param_groups[0]["lr"])
+        self.log("train/lr", lr, on_step=True, on_epoch=False, logger=True)
+
+        all_params = []
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    all_params.append(p)
+        total_grad_norm = self._grad_norm(all_params)
+        self.log("train/grad_norm_total", total_grad_norm, on_step=True, on_epoch=False, logger=True)
+
+        note_proj_params = []
+        if hasattr(self.model, "project_dict") and "note" in self.model.project_dict:
+            note_proj_params = [
+                p for p in self.model.project_dict["note"].parameters() if p.requires_grad
+            ]
+        if note_proj_params:
+            note_proj_grad_norm = self._grad_norm(note_proj_params)
+            self.log(
+                "train/grad_norm_note_proj",
+                note_proj_grad_norm,
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+            )
+
+    def _manual_clip_gradients(self, optimizer: Optimizer) -> None:
+        if self.grad_clip_val <= 0:
+            return
+        params = []
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    params.append(p)
+        if params:
+            torch.nn.utils.clip_grad_norm_(params, max_norm=self.grad_clip_val)
+
+    def _get_scheduler_obj(self):
+        sched = self.lr_schedulers()
+        if isinstance(sched, (list, tuple)):
+            return sched[0] if sched else None
+        return sched
+
+    def _manual_scheduler_step(self, when: str, metric: Optional[float] = None) -> None:
+        sched = self._get_scheduler_obj()
+        if sched is None:
+            return
+        if self.scheduler_type == "plateau":
+            if when == "epoch" and metric is not None:
+                sched.step(metric)
+            return
+        if when == "step":
+            sched.step()
+
     def _apply_pcgrad(self, task_losses: Dict[str, torch.Tensor], aux_loss: torch.Tensor):
         opt = self.optimizers()
         if opt is None:
@@ -1517,15 +1625,16 @@ class ContinualAnalysisGNN(LightningModule):
             self.manual_backward(losses[0] + aux_loss)
         else:
             pcgrad = PCGrad(opt)
-            pcgrad.pc_backward(losses, retain_graph=aux_loss is not None)
-            if aux_loss is not None:
+            aux_requires_grad = aux_loss is not None and getattr(aux_loss, "requires_grad", False)
+            pcgrad.pc_backward(losses, retain_graph=aux_requires_grad)
+            if aux_requires_grad:
                 self.manual_backward(aux_loss)
         if should_step:
+            self._manual_clip_gradients(opt)
+            self._log_optimizer_stats(opt)
             opt.step()
             opt.zero_grad()
-            sched = self.lr_schedulers()
-            if sched is not None:
-                sched.step()
+            self._manual_scheduler_step("step")
 
     def _apply_gradnorm(self, task_losses: Dict[str, torch.Tensor], aux_loss: torch.Tensor):
         opt = self.optimizers()
@@ -1568,15 +1677,15 @@ class ContinualAnalysisGNN(LightningModule):
 
         self.manual_backward(total_loss)
         if should_step:
+            self._manual_clip_gradients(opt)
+            self._log_optimizer_stats(opt)
             opt.step()
             opt.zero_grad()
             with torch.no_grad():
                 self.gradnorm_weights.clamp_(min=1e-3)
                 self.gradnorm_weights.mul_(len(self.gradnorm_weights) / (self.gradnorm_weights.sum() + 1e-8))
 
-            sched = self.lr_schedulers()
-            if sched is not None:
-                sched.step()
+            self._manual_scheduler_step("step")
 
     def common_step(self, batch):
         task_losses, total_task_loss, aux_loss, feature_loss = self._compute_task_losses(batch)
@@ -1590,7 +1699,7 @@ class ContinualAnalysisGNN(LightningModule):
         return total_loss
 
     def _maybe_encode_x_dict(self, batch, x_dict):
-        if self.note_encoder is None:
+        if self.note_encoder is None and not self.musicbert_use_cached_embeddings:
             return x_dict
         note_embeddings = self._encode_notes_with_musicbert(batch)
         note_features = x_dict.get("note") if isinstance(x_dict, dict) else None
@@ -1623,6 +1732,10 @@ class ContinualAnalysisGNN(LightningModule):
                 return torch.stack([l.detach() for l in losses]).mean()
             return torch.tensor(0.0, device=self.device)
         return self._training_step_conflict(batch)
+
+    def on_before_optimizer_step(self, optimizer, *args, **kwargs):
+        if self.automatic_optimization:
+            self._log_optimizer_stats(optimizer)
 
     def _training_step_conflict(self, batch):
         task_losses, total_task_loss, aux_loss, feature_loss = self._compute_task_losses(batch)
@@ -1761,6 +1874,15 @@ class ContinualAnalysisGNN(LightningModule):
                     print(f"Changing Task to {next_task} \n")
                 else:
                     print("All Tasks have been processed")
+
+        if not self.automatic_optimization and self.scheduler_type == "plateau":
+            metric = self.trainer.callback_metrics.get(self.monitor_metric, None)
+            if metric is not None:
+                if isinstance(metric, torch.Tensor):
+                    metric = float(metric.detach().cpu().item())
+                else:
+                    metric = float(metric)
+                self._manual_scheduler_step("epoch", metric=metric)
 
     def test_step(self, combined_batch, batch_idx) -> STEP_OUTPUT:
         for gtask_key, batch in combined_batch.items():
@@ -2015,37 +2137,67 @@ class ContinualAnalysisGNN(LightningModule):
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        
-        # Calculate total training steps for better scheduler configuration
-        if hasattr(self.trainer, 'estimated_stepping_batches') and self.trainer.estimated_stepping_batches:
-            total_steps = self.trainer.estimated_stepping_batches
-        else:
-            # Fallback calculation
-            total_steps = self.total_epochs * 5000  # Rough estimate, adjust based on your data
-        steps_per_epoch = max(1, math.ceil(total_steps / max(self.total_epochs, 1)))
-        
-        warmup_steps = min(500, total_steps // 20)  # 5% of total steps or 500, whichever is smaller
-        
-        # Use the LinearWarmupCosineAnnealingLR for better performance
-        scheduler = LinearWarmupCosineAnnealingLR(
-            optimizer, 
-            warmup_steps=warmup_steps, 
-            max_epochs=self.total_epochs,
-            steps_per_epoch=steps_per_epoch,
-            eta_min=self.lr * 0.01,  # Lower minimum for better convergence
-            last_epoch=-1
-        )
-        
-        return {
-            "optimizer": optimizer, 
-            "lr_scheduler": {
+        monitor_metric = self.monitor_metric
+
+        if self.scheduler_type == "plateau":
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode=self.monitor_mode,
+                factor=self.plateau_factor,
+                patience=self.plateau_patience,
+                min_lr=self.plateau_min_lr,
+            )
+            scheduler_cfg = {
                 "scheduler": scheduler,
-                "interval": "step",
+                "interval": "epoch",
                 "frequency": 1,
-                "monitor": "val/total_loss",  # Monitor validation loss instead of training
-                "strict": False,
             }
+            if self.automatic_optimization:
+                scheduler_cfg["monitor"] = monitor_metric
+                scheduler_cfg["strict"] = False
+
+            optim_cfg = {
+                "optimizer": optimizer,
+                "lr_scheduler": scheduler_cfg,
+            }
+            if self.automatic_optimization:
+                optim_cfg["monitor"] = monitor_metric
+            return optim_cfg
+
+        # Default scheduler: step-wise warmup + cosine decay.
+        if hasattr(self.trainer, "estimated_stepping_batches") and self.trainer.estimated_stepping_batches:
+            total_steps = int(self.trainer.estimated_stepping_batches)
+        else:
+            total_steps = int(max(self.total_epochs, 1) * 1000)
+        total_steps = max(1, total_steps)
+
+        warmup_steps = int(total_steps * self.warmup_ratio)
+        warmup_steps = min(max(0, warmup_steps), total_steps - 1)
+        eta_min = float(self.lr * self.min_lr_ratio)
+
+        scheduler = LinearWarmupCosineAnnealingLR(
+            optimizer,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            eta_min=eta_min,
+            last_epoch=-1,
+        )
+
+        scheduler_cfg = {
+            "scheduler": scheduler,
+            "interval": "step",
+            "frequency": 1,
         }
+        if self.automatic_optimization:
+            scheduler_cfg["strict"] = False
+
+        optim_cfg = {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler_cfg,
+        }
+        if self.automatic_optimization:
+            optim_cfg["monitor"] = monitor_metric
+        return optim_cfg
 
     def update_feature_loss(self, feature_loss, x_over, y_over, x, y, batch_size=100):
         """
