@@ -44,10 +44,19 @@ def isin_pairwise(element,test_elements, assume_unique=True):
 class PCGrad:
     """Projected Conflicting Gradient (PCGrad) optimizer wrapper."""
 
-    def __init__(self, optimizer: Optimizer) -> None:
+    def __init__(
+        self,
+        optimizer: Optional[Optimizer] = None,
+        parameters: Optional[List[torch.nn.Parameter]] = None,
+    ) -> None:
         self.optimizer = optimizer
+        self.parameters = parameters
 
     def _params(self):
+        if self.parameters is not None:
+            return [p for p in self.parameters if p.requires_grad]
+        if self.optimizer is None:
+            return []
         params = []
         for group in self.optimizer.param_groups:
             for p in group["params"]:
@@ -59,37 +68,62 @@ class PCGrad:
         params = self._params()
         if not params or not losses:
             return
-        grads = []
-        for loss in losses:
+        grads: List[List[Optional[torch.Tensor]]] = []
+        for i, loss in enumerate(losses):
+            keep_graph = retain_graph or (i < len(losses) - 1)
             grad = torch.autograd.grad(
                 loss,
                 params,
-                retain_graph=True,
+                retain_graph=keep_graph,
                 allow_unused=True,
             )
-            grads.append([g if g is not None else torch.zeros_like(p) for g, p in zip(grad, params)])
+            grads.append([g for g in grad])
 
         # Project conflicting gradients.
         for i in range(len(grads)):
             for j in range(len(grads)):
                 if i == j:
                     continue
-                gij = sum((gi * gj).sum() for gi, gj in zip(grads[i], grads[j]))
+                gij = 0.0
+                for gi, gj in zip(grads[i], grads[j]):
+                    if gi is None or gj is None:
+                        continue
+                    gij = gij + (gi * gj).sum()
                 if gij < 0:
-                    gj_norm_sq = sum((gj ** 2).sum() for gj in grads[j]) + 1e-12
+                    gj_norm_sq = 0.0
+                    for gj in grads[j]:
+                        if gj is None:
+                            continue
+                        gj_norm_sq = gj_norm_sq + (gj ** 2).sum()
+                    gj_norm_sq = gj_norm_sq + 1e-12
                     coeff = gij / gj_norm_sq
-                    grads[i] = [gi - coeff * gj for gi, gj in zip(grads[i], grads[j])]
+                    projected = []
+                    for gi, gj in zip(grads[i], grads[j]):
+                        if gi is None:
+                            projected.append(None)
+                        elif gj is None:
+                            projected.append(gi)
+                        else:
+                            projected.append(gi - coeff * gj)
+                    grads[i] = projected
 
-        final_grads = [sum(task_grads[k] for task_grads in grads) for k in range(len(params))]
+        final_grads = []
+        for k in range(len(params)):
+            grad_k = None
+            for task_grads in grads:
+                g = task_grads[k]
+                if g is None:
+                    continue
+                grad_k = g if grad_k is None else (grad_k + g)
+            final_grads.append(grad_k)
+
         for p, g in zip(params, final_grads):
+            if g is None:
+                continue
             if p.grad is None:
                 p.grad = g.detach()
             else:
                 p.grad = p.grad + g.detach()
-
-        if not retain_graph:
-            for loss in losses:
-                loss.detach_()
 
 
 def onsetwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["cadence", "phrase", "root", "localkey", "quality", "inversion", "degree1", "degree2", "romanNumeral", "section"]):        
@@ -1130,6 +1164,8 @@ class ContinualAnalysisGNN(LightningModule):
         self.task_to_idx = {t: i for i, t in enumerate(self.task_list)}
         self.gradnorm_weights = None
         self.initial_task_losses = {}
+        self._pcgrad_shared_params_cache: Optional[List[torch.nn.Parameter]] = None
+        self._pcgrad_head_params_cache: Optional[List[torch.nn.Parameter]] = None
         if self.mt_conflict_method in {"pcgrad", "gradnorm"} and self.mt_strategy != "famo":
             self.automatic_optimization = False
             if self.mt_conflict_method == "gradnorm":
@@ -1536,6 +1572,65 @@ class ContinualAnalysisGNN(LightningModule):
                 return params
         return [p for p in self.model.parameters() if p.requires_grad]
 
+    def _pcgrad_param_groups(self):
+        if self._pcgrad_shared_params_cache is not None and self._pcgrad_head_params_cache is not None:
+            cached = self._pcgrad_shared_params_cache + self._pcgrad_head_params_cache
+            if all(p.requires_grad for p in cached):
+                return self._pcgrad_shared_params_cache, self._pcgrad_head_params_cache
+            self._pcgrad_shared_params_cache = None
+            self._pcgrad_head_params_cache = None
+
+        head_prefixes = ("clf_dict.", "clf_proj_layers.", "cross_task_transformer.", "fusion_layers.")
+        seen = set()
+        shared_params: List[torch.nn.Parameter] = []
+        head_params: List[torch.nn.Parameter] = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            pid = id(param)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if name.startswith(head_prefixes):
+                head_params.append(param)
+            else:
+                shared_params.append(param)
+
+        for module in (self.note_encoder, self.musicbert_proj, self.musicbert_gate):
+            if module is None:
+                continue
+            for param in module.parameters():
+                if not param.requires_grad:
+                    continue
+                pid = id(param)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                shared_params.append(param)
+
+        # If no explicit heads were detected, keep previous behavior.
+        if not head_params:
+            shared_params = [p for p in self.parameters() if p.requires_grad]
+
+        self._pcgrad_shared_params_cache = shared_params
+        self._pcgrad_head_params_cache = head_params
+        return shared_params, head_params
+
+    @staticmethod
+    def _accumulate_param_grads(
+        params: List[torch.nn.Parameter],
+        grads: List[Optional[torch.Tensor]],
+    ) -> None:
+        for param, grad in zip(params, grads):
+            if grad is None:
+                continue
+            grad_detached = grad.detach()
+            if param.grad is None:
+                param.grad = grad_detached
+            else:
+                param.grad = param.grad + grad_detached
+
     def _should_step_optimizer(self) -> bool:
         trainer = getattr(self, "trainer", None)
         if trainer is None:
@@ -1615,20 +1710,57 @@ class ContinualAnalysisGNN(LightningModule):
         if when == "step":
             sched.step()
 
-    def _apply_pcgrad(self, task_losses: Dict[str, torch.Tensor], aux_loss: torch.Tensor):
+    def _apply_pcgrad(self, task_losses: Union[Dict[str, torch.Tensor], List[torch.Tensor]], aux_loss: torch.Tensor):
         opt = self.optimizers()
         if opt is None:
             return
         should_step = self._should_step_optimizer()
-        losses = list(task_losses.values())
-        if len(losses) == 1:
-            self.manual_backward(losses[0] + aux_loss)
+        losses = list(task_losses.values()) if isinstance(task_losses, dict) else list(task_losses)
+        losses = [loss for loss in losses if loss is not None]
+        if not losses:
+            return
+        aux_requires_grad = aux_loss is not None and getattr(aux_loss, "requires_grad", False)
+
+        shared_params, head_params = self._pcgrad_param_groups()
+        head_requires_grad = len(head_params) > 0
+
+        if not shared_params and not head_params:
+            loss_mean = torch.stack(losses).mean()
+            if aux_requires_grad:
+                self.manual_backward(loss_mean + aux_loss)
+            else:
+                self.manual_backward(loss_mean)
         else:
-            pcgrad = PCGrad(opt)
-            aux_requires_grad = aux_loss is not None and getattr(aux_loss, "requires_grad", False)
-            pcgrad.pc_backward(losses, retain_graph=aux_requires_grad)
+            # Apply gradient surgery only on shared parameters.
+            if shared_params:
+                retain_for_heads = head_requires_grad or aux_requires_grad
+                if len(losses) == 1:
+                    grads = torch.autograd.grad(
+                        losses[0],
+                        shared_params,
+                        retain_graph=retain_for_heads,
+                        allow_unused=True,
+                    )
+                    self._accumulate_param_grads(shared_params, list(grads))
+                else:
+                    pcgrad = PCGrad(parameters=shared_params)
+                    pcgrad.pc_backward(losses, retain_graph=retain_for_heads)
+
+            # Backprop average task loss through task-specific heads normally.
+            if head_params:
+                loss_mean = torch.stack(losses).mean()
+                head_grads = torch.autograd.grad(
+                    loss_mean,
+                    head_params,
+                    retain_graph=aux_requires_grad,
+                    allow_unused=True,
+                )
+                self._accumulate_param_grads(head_params, list(head_grads))
+
+            # Aux terms (feature/edge/etc.) update all relevant parameters.
             if aux_requires_grad:
                 self.manual_backward(aux_loss)
+
         if should_step:
             self._manual_clip_gradients(opt)
             self._log_optimizer_stats(opt)
@@ -1723,6 +1855,8 @@ class ContinualAnalysisGNN(LightningModule):
             return self.common_step(batch)
 
         if isinstance(batch, dict):
+            if self.mt_conflict_method == "pcgrad":
+                return self._training_step_conflict_combined_pcgrad(batch)
             losses = []
             for _, bt in batch.items():
                 if bt is None:
@@ -1755,6 +1889,42 @@ class ContinualAnalysisGNN(LightningModule):
         self.log("train/feature_loss", feature_loss.item(), prog_bar=True)
         for k, loss in task_losses.items():
             self.log(f"train/{k}_loss", loss.item())
+        return total_loss
+
+    def _training_step_conflict_combined_pcgrad(self, combined_batch):
+        task_loss_terms: List[torch.Tensor] = []
+        per_task_losses: Dict[str, List[torch.Tensor]] = {}
+        feature_losses: List[torch.Tensor] = []
+        aux_total: Optional[torch.Tensor] = None
+
+        for _, batch in combined_batch.items():
+            if batch is None:
+                continue
+            task_losses, _, aux_loss, feature_loss = self._compute_task_losses(batch)
+            if not task_losses:
+                continue
+
+            feature_losses.append(feature_loss.detach())
+            aux_total = aux_loss if aux_total is None else (aux_total + aux_loss)
+            for task_name, loss in task_losses.items():
+                task_loss_terms.append(loss)
+                per_task_losses.setdefault(task_name, []).append(loss.detach())
+
+        if not task_loss_terms:
+            return torch.tensor(0.0, device=self.device)
+
+        if aux_total is None:
+            aux_total = torch.tensor(0.0, device=task_loss_terms[0].device)
+
+        self._apply_pcgrad(task_loss_terms, aux_total)
+        task_loss_mean = torch.stack(task_loss_terms).mean()
+        total_loss = task_loss_mean + aux_total
+
+        self.log("train/total_loss", total_loss.item(), prog_bar=True)
+        if feature_losses:
+            self.log("train/feature_loss", torch.stack(feature_losses).mean().item(), prog_bar=True)
+        for task_name, losses in per_task_losses.items():
+            self.log(f"train/{task_name}_loss", torch.stack(losses).mean().item())
         return total_loss
 
     def validation_step(self, combined_batch, batch_idx):
