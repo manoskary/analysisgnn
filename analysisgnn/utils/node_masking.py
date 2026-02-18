@@ -8,7 +8,7 @@ This module provides utilities for managing three types of nodes:
 """
 
 import torch
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 
 def create_node_mask(
@@ -55,6 +55,155 @@ def create_node_mask(
         mask[unlabeled_indices] = 0.0
     
     return mask
+
+
+def _sample_random_context_indices(
+    num_nodes: int,
+    num_context: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if num_context <= 0 or num_nodes <= 0:
+        return torch.zeros(0, dtype=torch.long, device=device)
+    num_context = min(num_context, num_nodes)
+    return torch.randperm(num_nodes, device=device)[:num_context]
+
+
+def _sample_span_context_indices(
+    onset_div: torch.Tensor,
+    num_context: int,
+    span_min_onsets: int,
+    span_max_onsets: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if num_context <= 0 or onset_div.numel() == 0:
+        return torch.zeros(0, dtype=torch.long, device=device)
+
+    unique_onsets = torch.unique(onset_div.detach().to(device=device), sorted=True)
+    if unique_onsets.numel() == 0:
+        return torch.zeros(0, dtype=torch.long, device=device)
+
+    span_min = max(1, int(span_min_onsets))
+    span_max = max(span_min, int(span_max_onsets))
+    target = min(int(num_context), int(onset_div.numel()))
+
+    selected = set()
+    max_trials = max(16, unique_onsets.numel() * 2)
+    trial = 0
+    while len(selected) < target and trial < max_trials:
+        trial += 1
+        if unique_onsets.numel() == 1:
+            start_idx = 0
+        else:
+            start_idx = int(torch.randint(0, int(unique_onsets.numel()), (1,), device=device).item())
+        span_len = int(torch.randint(span_min, span_max + 1, (1,), device=device).item())
+        end_idx = min(start_idx + span_len, int(unique_onsets.numel()))
+        span_onsets = unique_onsets[start_idx:end_idx]
+        if span_onsets.numel() == 0:
+            continue
+        in_span = torch.isin(onset_div, span_onsets)
+        span_idx = torch.where(in_span)[0].detach().cpu().tolist()
+        selected.update(span_idx)
+
+    if len(selected) > target:
+        selected_list = torch.tensor(sorted(selected), dtype=torch.long, device=device)
+        keep = torch.randperm(selected_list.numel(), device=device)[:target]
+        return selected_list[keep]
+
+    if len(selected) < target:
+        remaining = torch.tensor(
+            sorted(set(range(int(onset_div.numel()))) - selected),
+            dtype=torch.long,
+            device=device,
+        )
+        if remaining.numel() > 0:
+            need = min(target - len(selected), int(remaining.numel()))
+            extra = remaining[torch.randperm(remaining.numel(), device=device)[:need]]
+            selected.update(extra.detach().cpu().tolist())
+
+    return torch.tensor(sorted(selected), dtype=torch.long, device=device)
+
+
+def sample_context_indices(
+    num_nodes: int,
+    known_ratio: float,
+    policy: str = "hybrid",
+    onset_div: Optional[torch.Tensor] = None,
+    span_min_onsets: int = 2,
+    span_max_onsets: int = 8,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Sample context-node indices for masked prediction.
+
+    Policies:
+    - random: uniform random node sampling
+    - span: contiguous onset-span sampling
+    - hybrid: half random + half span (default)
+    """
+    if device is None:
+        device = torch.device("cpu")
+    num_nodes = int(num_nodes)
+    if num_nodes <= 0:
+        return torch.zeros(0, dtype=torch.long, device=device)
+    ratio = float(max(0.0, min(1.0, known_ratio)))
+    num_context = int(round(num_nodes * ratio))
+    if num_context <= 0:
+        return torch.zeros(0, dtype=torch.long, device=device)
+
+    policy = str(policy).lower()
+    if policy not in {"random", "span", "hybrid"}:
+        raise ValueError("policy must be one of: random, span, hybrid")
+
+    if onset_div is None or not torch.is_tensor(onset_div):
+        onset_div = None
+    else:
+        onset_div = onset_div[:num_nodes].to(device=device)
+
+    if policy == "random" or onset_div is None:
+        return _sample_random_context_indices(num_nodes, num_context, device)
+    if policy == "span":
+        return _sample_span_context_indices(
+            onset_div=onset_div,
+            num_context=num_context,
+            span_min_onsets=span_min_onsets,
+            span_max_onsets=span_max_onsets,
+            device=device,
+        )
+
+    span_target = num_context // 2
+    random_target = num_context - span_target
+    span_indices = _sample_span_context_indices(
+        onset_div=onset_div,
+        num_context=span_target,
+        span_min_onsets=span_min_onsets,
+        span_max_onsets=span_max_onsets,
+        device=device,
+    )
+    remaining = torch.tensor(
+        sorted(set(range(num_nodes)) - set(span_indices.detach().cpu().tolist())),
+        dtype=torch.long,
+        device=device,
+    )
+    random_indices = torch.zeros(0, dtype=torch.long, device=device)
+    if remaining.numel() > 0 and random_target > 0:
+        take = min(random_target, int(remaining.numel()))
+        random_indices = remaining[torch.randperm(remaining.numel(), device=device)[:take]]
+
+    merged = torch.cat([span_indices, random_indices], dim=0)
+    merged = torch.unique(merged, sorted=True)
+    if merged.numel() < num_context:
+        remaining = torch.tensor(
+            sorted(set(range(num_nodes)) - set(merged.detach().cpu().tolist())),
+            dtype=torch.long,
+            device=device,
+        )
+        if remaining.numel() > 0:
+            need = min(num_context - int(merged.numel()), int(remaining.numel()))
+            extra = remaining[torch.randperm(remaining.numel(), device=device)[:need]]
+            merged = torch.unique(torch.cat([merged, extra], dim=0), sorted=True)
+    if merged.numel() > num_context:
+        merged = merged[torch.randperm(merged.numel(), device=device)[:num_context]]
+    return merged
 
 
 def split_nodes_by_mask(
@@ -111,7 +260,29 @@ def clamp_logits_to_labels(
     
     # Create one-hot encoding for context node labels
     if len(context_indices) > 0:
+        if not isinstance(context_indices, torch.Tensor):
+            context_indices = torch.tensor(context_indices, device=logits.device)
+        context_indices = context_indices.to(device=logits.device, dtype=torch.long).reshape(-1)
+        labels = labels.to(device=logits.device, dtype=torch.long).reshape(-1)
+
+        # Keep only in-bounds node indices.
+        valid_idx = (
+            (context_indices >= 0)
+            & (context_indices < logits.shape[0])
+            & (context_indices < labels.shape[0])
+        )
+        context_indices = context_indices[valid_idx]
+        if context_indices.numel() == 0:
+            return clamped_logits
+
         context_labels = labels[context_indices]
+        # Keep only valid class labels to avoid scatter device-side asserts.
+        valid_labels = (context_labels >= 0) & (context_labels < num_classes)
+        context_indices = context_indices[valid_labels]
+        context_labels = context_labels[valid_labels]
+        if context_indices.numel() == 0:
+            return clamped_logits
+
         # Use very large values (scaled by temperature) for the correct class
         one_hot = torch.zeros(len(context_indices), num_classes, 
                             dtype=logits.dtype, device=logits.device)

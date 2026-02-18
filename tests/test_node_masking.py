@@ -17,6 +17,7 @@ from analysisgnn.utils.node_masking import (
     split_nodes_by_mask,
     clamp_logits_to_labels,
     clamp_logits_dict,
+    sample_context_indices,
     validate_node_mask,
 )
 from analysisgnn.models.chord import MultiTaskLoss
@@ -92,6 +93,49 @@ class TestNodeMaskSplitting(unittest.TestCase):
         self.assertEqual(len(unlabeled_idx), 0)
 
 
+class TestContextSampling(unittest.TestCase):
+    """Test context-node sampling policies."""
+
+    def test_random_policy_count(self):
+        num_nodes = 100
+        known_ratio = 0.2
+        context_idx = sample_context_indices(
+            num_nodes=num_nodes,
+            known_ratio=known_ratio,
+            policy="random",
+        )
+        self.assertEqual(context_idx.numel(), int(round(num_nodes * known_ratio)))
+        self.assertTrue((context_idx >= 0).all())
+        self.assertTrue((context_idx < num_nodes).all())
+
+    def test_span_policy_uses_onsets(self):
+        onset_div = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3, 4, 4], dtype=torch.long)
+        context_idx = sample_context_indices(
+            num_nodes=onset_div.numel(),
+            known_ratio=0.4,
+            policy="span",
+            onset_div=onset_div,
+            span_min_onsets=1,
+            span_max_onsets=2,
+        )
+        self.assertEqual(context_idx.numel(), int(round(onset_div.numel() * 0.4)))
+        chosen_onsets = torch.unique(onset_div[context_idx])
+        self.assertTrue(chosen_onsets.numel() >= 1)
+
+    def test_hybrid_policy_count(self):
+        onset_div = torch.tensor([i // 2 for i in range(40)], dtype=torch.long)
+        context_idx = sample_context_indices(
+            num_nodes=40,
+            known_ratio=0.25,
+            policy="hybrid",
+            onset_div=onset_div,
+            span_min_onsets=2,
+            span_max_onsets=4,
+        )
+        self.assertEqual(context_idx.numel(), int(round(40 * 0.25)))
+        self.assertEqual(torch.unique(context_idx).numel(), context_idx.numel())
+
+
 class TestLogitClamping(unittest.TestCase):
     """Test logit clamping for context nodes."""
     
@@ -134,6 +178,24 @@ class TestLogitClamping(unittest.TestCase):
         
         # Should be unchanged
         self.assertTrue(torch.allclose(logits, clamped_logits))
+
+    def test_clamp_ignores_invalid_context_labels(self):
+        """Invalid labels in context should be skipped safely."""
+        logits = torch.randn(6, 4)
+        labels = torch.tensor([0, 1, -1, 3, 5, -1])  # -1 and 5 are invalid for 4 classes
+        context_indices = torch.tensor([1, 2, 4, 5])
+
+        clamped_logits = clamp_logits_to_labels(
+            logits, labels, context_indices, num_classes=4
+        )
+
+        # Only valid context label index=1 should be hard-clamped.
+        pred = clamped_logits.argmax(dim=1)
+        self.assertEqual(int(pred[1].item()), 1)
+        # Invalid-labeled indices should remain unchanged.
+        self.assertTrue(torch.allclose(clamped_logits[2], logits[2]))
+        self.assertTrue(torch.allclose(clamped_logits[4], logits[4]))
+        self.assertTrue(torch.allclose(clamped_logits[5], logits[5]))
     
     def test_clamp_dict(self):
         """Test clamping for multiple tasks."""
@@ -298,11 +360,19 @@ class TestMultiTaskLossWithMasking(unittest.TestCase):
         # Compute loss with half unlabeled
         mask_half = torch.cat([torch.ones(5), torch.zeros(5)])
         loss_half = self.loss_module(pred, gt, node_mask=mask_half)
-        
-        # Loss with half should be roughly half (accounting for normalization)
-        # We just check it's positive and less than full loss
+
+        # Unlabeled nodes (mask=0) should contribute zero:
+        # with this mask, loss should equal the mean loss over first 5 samples.
+        expected_total = 0.0
+        for task in self.tasks.keys():
+            per_sample = self.loss_ft[task](pred[task], gt[task])
+            expected_total += per_sample[:5].mean().item()
+
         self.assertTrue(loss_half['total'].item() > 0)
-        self.assertTrue(loss_half['total'].item() <= loss_all['total'].item())
+        self.assertAlmostEqual(loss_half['total'].item(), expected_total, places=5)
+
+        # Sanity check that masking changed the objective.
+        self.assertNotAlmostEqual(loss_half['total'].item(), loss_all['total'].item(), places=5)
 
 
 class TestIntegration(unittest.TestCase):

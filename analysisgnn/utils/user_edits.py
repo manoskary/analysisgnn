@@ -34,6 +34,11 @@ import torch
 
 from analysisgnn.utils.chord_representations import available_representations
 from analysisgnn.utils.node_masking import create_node_mask
+from analysisgnn.utils.masked_conditioning import (
+    MaskedConditioningSpec,
+    build_known_labels_from_overrides,
+    normalize_masked_conditioning_spec,
+)
 
 
 def _normalize_indices(value: Any, name: str) -> list:
@@ -190,3 +195,48 @@ def normalize_user_edits(
         )
 
     return node_mask, overrides
+
+
+def normalize_user_edits_to_masked_conditioning(
+    user_edits: Optional[Dict[str, Any]],
+    num_nodes: int,
+    tasks_num_classes: Dict[str, int],
+    device: Optional[torch.device] = None,
+    masked_spec: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[torch.Tensor], Dict[str, Dict[str, torch.Tensor]], Optional[MaskedConditioningSpec]]:
+    """
+    Normalize user edits and optionally merge with a masked conditioning spec.
+
+    This is a convenience helper for inference paths that want:
+    1) the legacy `(node_mask, overrides)` output, and
+    2) a normalized `MaskedConditioningSpec` using `label_overrides` as known labels.
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    node_mask, overrides = normalize_user_edits(
+        user_edits=user_edits,
+        num_nodes=num_nodes,
+        tasks_num_classes=tasks_num_classes,
+        device=device,
+    )
+    base_known_labels, base_known_indices = build_known_labels_from_overrides(
+        overrides=overrides,
+        num_nodes=num_nodes,
+        tasks_num_classes=tasks_num_classes,
+        device=device,
+    )
+    base_tasks = list(base_known_labels.keys())
+    conditioning = normalize_masked_conditioning_spec(
+        masked_spec=masked_spec,
+        num_nodes=num_nodes,
+        tasks_num_classes=tasks_num_classes,
+        device=device,
+        base_node_mask=node_mask,
+        base_known_labels_by_task=base_known_labels,
+        base_known_indices_by_task=base_known_indices,
+        base_masked_tasks=base_tasks,
+        base_constraint_mode="hard",
+        base_feedback_mode="single_pass",
+    )
+    return node_mask, overrides, conditioning

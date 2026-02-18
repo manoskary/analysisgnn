@@ -18,6 +18,13 @@ from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 import math
 import warnings
 from analysisgnn.utils.chord_representations import available_representations
+from analysisgnn.utils.masked_conditioning import MaskedConditioningSpec
+from analysisgnn.utils.node_masking import (
+    create_node_mask,
+    sample_context_indices,
+    split_nodes_by_mask,
+    clamp_logits_to_labels,
+)
 
 
 def isin_pairwise(element,test_elements, assume_unique=True):
@@ -746,10 +753,29 @@ class TorchAnalysisGNN(nn.Module):
         x = torch.cat(x, dim=0)
         return x
 
-    def forward(self, pitch_spelling, key_signature, x_dict, edge_index_dict, batch_dict, batch_size, neighbor_mask_node,
-                neighbor_mask_edge):
+    def forward(
+        self,
+        pitch_spelling,
+        key_signature,
+        x_dict,
+        edge_index_dict,
+        batch_dict,
+        batch_size,
+        neighbor_mask_node,
+        neighbor_mask_edge,
+        label_context=None,
+    ):
         x = self.encode(
-            pitch_spelling, key_signature, x_dict, edge_index_dict, batch_dict, batch_size, neighbor_mask_node, neighbor_mask_edge)
+            pitch_spelling,
+            key_signature,
+            x_dict,
+            edge_index_dict,
+            batch_dict,
+            batch_size,
+            neighbor_mask_node,
+            neighbor_mask_edge,
+            label_context=label_context,
+        )
         logits_dict = self.forward_clf(x)
         return logits_dict
 
@@ -778,11 +804,33 @@ class TorchAnalysisGNN(nn.Module):
 
         return raw_logits
 
-    def encode(self, pitch_spelling, key_signature, x_dict, edge_index_dict, batch_dict, batch_size, neighbor_mask_node, neighbor_mask_edge):
+    def encode(
+        self,
+        pitch_spelling,
+        key_signature,
+        x_dict,
+        edge_index_dict,
+        batch_dict,
+        batch_size,
+        neighbor_mask_node,
+        neighbor_mask_edge,
+        label_context=None,
+    ):
         # initialize all values of x_dict with zeros and size self.hidden_channels except from notes
         z_dict = {k: v.clone() for k, v in x_dict.items()}
         z_dict["note"] = torch.cat([z_dict["note"], self.pitch_embedding(pitch_spelling), self.key_embedding(key_signature)], dim=-1)
         h_dict = {k: self.project_dict[k](z_dict[k]) for k in self.project_dict.keys()}
+        if isinstance(label_context, dict) and "note_bias" in label_context:
+            note_bias = label_context["note_bias"]
+            if note_bias is not None:
+                if note_bias.shape[0] != h_dict["note"].shape[0]:
+                    raise ValueError(
+                        "Label conditioning note_bias node count mismatch: "
+                        f"{note_bias.shape[0]} vs {h_dict['note'].shape[0]}"
+                    )
+                if note_bias.dtype != h_dict["note"].dtype:
+                    note_bias = note_bias.to(h_dict["note"].dtype)
+                h_dict["note"] = h_dict["note"] + note_bias
         if self.use_graph_encoder:
             x = self.encoder(
                 x_dict=h_dict, edge_index_dict=edge_index_dict, batch_dict=batch_dict,
@@ -1173,7 +1221,35 @@ class ContinualAnalysisGNN(LightningModule):
         
         # Semi-supervised node masking parameters
         self.train_with_masking = hparams.get("train_with_masking", False)
-        self.mask_ratio = hparams.get("mask_ratio", 0.15)
+        self.mask_ratio = float(hparams.get("mask_ratio", 0.15))
+        # Label-conditioned masked prediction parameters.
+        self.masked_prediction_train = bool(hparams.get("masked_prediction_train", False))
+        self.masked_tasks = [t for t in hparams.get("masked_tasks", []) if t in self.task_dict]
+        self.known_ratio = float(hparams.get("known_ratio", self.mask_ratio))
+        self.mask_sampling_policy = str(hparams.get("mask_sampling_policy", "hybrid")).lower()
+        self.mask_span_min_onsets = int(hparams.get("mask_span_min_onsets", 2))
+        self.mask_span_max_onsets = int(hparams.get("mask_span_max_onsets", 8))
+        self.constraint_mode = str(hparams.get("constraint_mode", "hard")).lower()
+        self.feedback_mode = str(hparams.get("feedback_mode", "single_pass")).lower()
+        self.label_condition_dropout = float(hparams.get("dropout", 0.0))
+        if self.feedback_mode != "single_pass":
+            warnings.warn(
+                f"feedback_mode='{self.feedback_mode}' is not implemented; falling back to 'single_pass'.",
+                RuntimeWarning,
+            )
+            self.feedback_mode = "single_pass"
+        if self.constraint_mode not in {"hard", "soft"}:
+            warnings.warn(
+                f"constraint_mode='{self.constraint_mode}' is invalid; falling back to 'hard'.",
+                RuntimeWarning,
+            )
+            self.constraint_mode = "hard"
+        if self.masked_prediction_train and len(self.masked_tasks) == 0:
+            raise ValueError("masked_prediction_train requires a non-empty masked_tasks list.")
+        self.label_condition_embeddings = nn.ModuleDict()
+        self.label_condition_fusion = None
+        if self.masked_tasks:
+            self._init_label_conditioning_modules(self.masked_tasks)
         
         self.current_task = self.main_tasks[0] if self.cl_training else self.main_tasks
         self.current_val_tasks = [self.main_tasks[0]] if self.cl_training else self.main_tasks
@@ -1225,8 +1301,6 @@ class ContinualAnalysisGNN(LightningModule):
                 - 1.0 for target nodes
                 - 0.1 for context nodes (down-weighted)
         """
-        from analysisgnn.utils.node_masking import create_node_mask
-        
         # Random selection of context nodes
         num_context = int(batch_size * self.mask_ratio)
         all_indices = torch.randperm(batch_size, device=device)
@@ -1243,6 +1317,215 @@ class ContinualAnalysisGNN(LightningModule):
         )
         
         return node_mask
+
+    def _init_label_conditioning_modules(self, tasks: Optional[List[str]] = None) -> None:
+        tasks = list(self.masked_tasks if tasks is None else tasks)
+        hidden_size = int(self.model.hidden_channels)
+        if self.label_condition_fusion is None:
+            self.label_condition_fusion = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_size),
+                nn.Dropout(self.label_condition_dropout),
+                nn.Linear(hidden_size, hidden_size),
+            )
+        for task in tasks:
+            if task not in self.task_dict:
+                continue
+            if task in self.label_condition_embeddings:
+                continue
+            self.label_condition_embeddings[task] = nn.Embedding(
+                self.task_dict[task] + 1, hidden_size
+            )
+
+    def _create_masked_prediction_node_mask(
+        self,
+        batch,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        onset_div = None
+        if hasattr(batch["note"], "onset_div"):
+            onset_div = batch["note"].onset_div[:batch_size]
+        context_indices = sample_context_indices(
+            num_nodes=batch_size,
+            known_ratio=self.known_ratio,
+            policy=self.mask_sampling_policy,
+            onset_div=onset_div,
+            span_min_onsets=self.mask_span_min_onsets,
+            span_max_onsets=self.mask_span_max_onsets,
+            device=device,
+        )
+        if context_indices.numel() > 0:
+            target_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+            target_mask[context_indices] = False
+            target_indices = torch.where(target_mask)[0]
+        else:
+            target_indices = torch.arange(batch_size, device=device, dtype=torch.long)
+        return create_node_mask(
+            num_nodes=batch_size,
+            target_indices=target_indices,
+            context_indices=context_indices if context_indices.numel() > 0 else None,
+            context_weight=0.1,
+            device=device,
+        )
+
+    def _get_node_mask_for_batch(
+        self,
+        batch,
+        batch_size: int,
+        device: torch.device,
+        allow_sampling: bool = True,
+    ) -> Optional[torch.Tensor]:
+        node_mask_from_batch = (
+            batch["note"].node_mask[:batch_size]
+            if hasattr(batch["note"], "node_mask") and batch["note"].node_mask is not None
+            else None
+        )
+        if node_mask_from_batch is not None:
+            if not isinstance(node_mask_from_batch, torch.Tensor):
+                node_mask_from_batch = torch.tensor(node_mask_from_batch, device=device)
+            return node_mask_from_batch.to(device=device, dtype=torch.float32)
+
+        if not allow_sampling:
+            return None
+        if self.masked_prediction_train:
+            return self._create_masked_prediction_node_mask(batch, batch_size, device)
+        if self.train_with_masking and self.training:
+            return self.create_random_node_mask(batch_size=batch_size, device=device)
+        return None
+
+    def _build_batch_masked_conditioning(
+        self,
+        labels_dict: Dict[str, torch.Tensor],
+        node_mask: Optional[torch.Tensor],
+        batch_size: int,
+        total_nodes: int,
+        device: torch.device,
+    ) -> Optional[MaskedConditioningSpec]:
+        if not self.masked_prediction_train:
+            return None
+        if not self.masked_tasks:
+            return None
+        full_node_mask = None
+        if node_mask is not None:
+            full_node_mask = torch.zeros(total_nodes, dtype=torch.float32, device=device)
+            full_node_mask[:batch_size] = node_mask[:batch_size].to(device=device, dtype=torch.float32)
+
+        if node_mask is None:
+            context_indices = torch.zeros(0, dtype=torch.long, device=device)
+        else:
+            _, context_indices, _ = split_nodes_by_mask(node_mask[:batch_size])
+
+        known_labels_by_task: Dict[str, torch.Tensor] = {}
+        known_indices_by_task: Dict[str, torch.Tensor] = {}
+        effective_tasks = []
+        for task in self.masked_tasks:
+            if task not in labels_dict:
+                continue
+            labels = labels_dict[task][:batch_size].to(device=device, dtype=torch.long)
+            num_classes = self.task_dict[task]
+            valid = (labels >= 0) & (labels < num_classes)
+            known = torch.full((total_nodes,), -1, dtype=torch.long, device=device)
+            if context_indices.numel() > 0:
+                task_context = context_indices[valid[context_indices]]
+                if task_context.numel() > 0:
+                    known[task_context] = labels[task_context]
+                    known_indices_by_task[task] = task_context
+                else:
+                    known_indices_by_task[task] = torch.zeros(0, dtype=torch.long, device=device)
+            else:
+                known_indices_by_task[task] = torch.zeros(0, dtype=torch.long, device=device)
+            known_labels_by_task[task] = known
+            effective_tasks.append(task)
+
+        if not effective_tasks:
+            return None
+        return MaskedConditioningSpec(
+            node_mask=full_node_mask,
+            known_labels_by_task=known_labels_by_task,
+            known_indices_by_task=known_indices_by_task,
+            masked_tasks=effective_tasks,
+            constraint_mode=self.constraint_mode,
+            feedback_mode=self.feedback_mode,
+        )
+
+    def _build_model_label_context(
+        self,
+        conditioning: Optional[MaskedConditioningSpec],
+        num_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if conditioning is None:
+            return None
+        if conditioning.feedback_mode != "single_pass":
+            return None
+        masked_tasks = [t for t in conditioning.masked_tasks if t in self.task_dict]
+        if not masked_tasks:
+            return None
+        self._init_label_conditioning_modules(masked_tasks)
+
+        note_bias = None
+        used = 0
+        for task in masked_tasks:
+            if task not in conditioning.known_labels_by_task:
+                continue
+            if task not in self.label_condition_embeddings:
+                continue
+            known = conditioning.known_labels_by_task[task]
+            if known.numel() != num_nodes:
+                raise ValueError(
+                    f"Known-label tensor size mismatch for task '{task}': {known.numel()} vs {num_nodes}"
+                )
+            known = known.to(device=device, dtype=torch.long)
+            mask_id = self.task_dict[task]
+            tokens = torch.where(
+                (known >= 0) & (known < mask_id),
+                known,
+                torch.full_like(known, mask_id),
+            )
+            emb = self.label_condition_embeddings[task](tokens)
+            note_bias = emb if note_bias is None else (note_bias + emb)
+            used += 1
+        if note_bias is None or used == 0:
+            return None
+        note_bias = note_bias / float(used)
+        if self.label_condition_fusion is not None:
+            note_bias = self.label_condition_fusion(note_bias)
+        note_bias = note_bias.to(device=device, dtype=dtype)
+        return {"note_bias": note_bias}
+
+    def _apply_known_label_constraints(
+        self,
+        logits_dict: Dict[str, torch.Tensor],
+        conditioning: Optional[MaskedConditioningSpec],
+        valid_tasks: Optional[List[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if conditioning is None:
+            return logits_dict
+        if conditioning.constraint_mode != "hard":
+            return logits_dict
+        tasks = valid_tasks if valid_tasks is not None else list(logits_dict.keys())
+        out = dict(logits_dict)
+        for task in tasks:
+            if task not in out:
+                continue
+            if task not in conditioning.known_indices_by_task:
+                continue
+            indices = conditioning.known_indices_by_task[task]
+            if indices is None or indices.numel() == 0:
+                continue
+            labels = conditioning.known_labels_by_task[task]
+            indices = indices.to(device=out[task].device, dtype=torch.long)
+            labels = labels.to(device=out[task].device, dtype=torch.long)
+            out[task] = clamp_logits_to_labels(
+                out[task],
+                labels,
+                indices,
+                num_classes=self.task_dict.get(task),
+            )
+        return out
 
     def _encode_notes_with_musicbert(self, batch):
         note_store = batch["note"]
@@ -1394,6 +1677,7 @@ class ContinualAnalysisGNN(LightningModule):
     def _compute_task_losses(self, batch):
         x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
         batch_size = batch["note"].batch_size
+        total_nodes = int(batch["note"].x.size(0))
         labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
         pitch_spelling = batch["note"].pitch_spelling
         key_signature = batch["note"].key_signature
@@ -1410,37 +1694,51 @@ class ContinualAnalysisGNN(LightningModule):
         num_sampled_edges_dict = batch.num_sampled_edges_dict
         num_sampled_nodes_dict = batch.num_sampled_nodes_dict
 
+        device = labels_dict[list(labels_dict.keys())[0]].device if labels_dict else batch["note"].x.device
         mask_dict = self.create_mask_dict(labels_dict, batch, batch_size)
-
-        node_mask_from_batch = (
-            batch["note"].node_mask[:batch_size]
-            if hasattr(batch["note"], "node_mask") and batch["note"].node_mask is not None
-            else None
+        node_mask = self._get_node_mask_for_batch(
+            batch=batch,
+            batch_size=batch_size,
+            device=device,
+            allow_sampling=True,
         )
-
-        if self.train_with_masking and self.training and node_mask_from_batch is None:
-            node_mask = self.create_random_node_mask(
-                batch_size, device=labels_dict[list(labels_dict.keys())[0]].device
-            )
-        else:
-            node_mask = node_mask_from_batch
+        batch_conditioning = self._build_batch_masked_conditioning(
+            labels_dict=labels_dict,
+            node_mask=node_mask,
+            batch_size=batch_size,
+            total_nodes=total_nodes,
+            device=device,
+        )
+        label_context = self._build_model_label_context(
+            conditioning=batch_conditioning,
+            num_nodes=total_nodes,
+            dtype=x_dict["note"].dtype,
+            device=x_dict["note"].device,
+        )
 
         if "valid_label" not in batch["note"].keys():
             valid_label_mask = torch.ones_like(batch["note"]["pitch_spelling"][:batch_size]).bool()
         else:
             valid_label_mask = batch["note"]["valid_label"][:batch_size].bool()
 
-        labels_dict = {k: v[valid_label_mask] for k, v in labels_dict.items()}
-        mask_dict = {k: v[valid_label_mask] for k, v in mask_dict.items()}
-        if node_mask is not None:
-            node_mask = node_mask[valid_label_mask]
-        labels_dict = {k: v[mask_dict[k]] for k, v in labels_dict.items()}
-        labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
-        labels_dict = {k: v for k, v in labels_dict.items() if self._metric_safe_mask(v, k).any()}
+        labels_valid = {k: v[valid_label_mask] for k, v in labels_dict.items()}
+        mask_valid = {k: v[valid_label_mask] for k, v in mask_dict.items()}
+        node_mask_valid = node_mask[valid_label_mask] if node_mask is not None else None
+        labels_dict = {}
+        mask_dict = {}
+        for task, values in labels_valid.items():
+            if task not in mask_valid:
+                continue
+            task_values = values[mask_valid[task]]
+            if task_values.numel() == 0:
+                continue
+            if not self._metric_safe_mask(task_values, task).any():
+                continue
+            labels_dict[task] = task_values
+            mask_dict[task] = mask_valid[task]
         if not labels_dict:
             zero = torch.tensor(0.0, device=batch["note"].x.device)
             return {}, zero, zero, zero
-        mask_dict = {k: mask_dict[k] for k in labels_dict.keys()}
 
         x = self.model.encode(
             pitch_spelling=pitch_spelling,
@@ -1451,6 +1749,7 @@ class ContinualAnalysisGNN(LightningModule):
             batch_size=batch_size,
             neighbor_mask_node=num_sampled_nodes_dict,
             neighbor_mask_edge=num_sampled_edges_dict,
+            label_context=label_context,
         )
         feature_loss = x.pow(2).mean()
 
@@ -1493,25 +1792,69 @@ class ContinualAnalysisGNN(LightningModule):
             mask_dict["cadence"] = torch.ones_like(y_over).bool()
             feature_loss = self.update_feature_loss(feature_loss, x_over, y_over, x, y, batch_size)
             x = x_over
-            if node_mask is not None:
-                node_mask = torch.ones_like(y_over, dtype=torch.float32)
+            if node_mask_valid is not None:
+                node_mask_valid = torch.ones_like(y_over, dtype=torch.float32)
 
         logits_dict = self.model.forward_clf(x)
         logits_dict = {k: logits_dict[k][mask_dict[k]] for k in labels_dict.keys()}
 
-        if node_mask is not None:
-            first_task_key = list(labels_dict.keys())[0]
-            filtered_node_mask = node_mask[mask_dict[first_task_key]]
-            from analysisgnn.utils.node_masking import clamp_logits_dict, split_nodes_by_mask
-            _, context_indices, _ = split_nodes_by_mask(filtered_node_mask)
-            if len(context_indices) > 0:
-                logits_dict = clamp_logits_dict(logits_dict, labels_dict, context_indices, self.task_dict)
-        else:
-            filtered_node_mask = None
+        raw_task_node_masks = {}
+        task_loss_masks = {}
+        if node_mask_valid is not None:
+            for task in labels_dict.keys():
+                raw_task_mask = node_mask_valid[mask_dict[task]]
+                raw_task_node_masks[task] = raw_task_mask
+                if self.masked_prediction_train and task in self.masked_tasks:
+                    task_loss_masks[task] = torch.where(
+                        raw_task_mask > 0.9,
+                        torch.ones_like(raw_task_mask),
+                        torch.zeros_like(raw_task_mask),
+                    )
+                else:
+                    task_loss_masks[task] = raw_task_mask
+            if self.constraint_mode == "hard":
+                for task in labels_dict.keys():
+                    _, context_indices, _ = split_nodes_by_mask(raw_task_node_masks[task])
+                    if context_indices.numel() == 0:
+                        continue
+                    valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                    context_indices = context_indices[valid_context]
+                    if context_indices.numel() == 0:
+                        continue
+                    logits_dict[task] = clamp_logits_to_labels(
+                        logits_dict[task],
+                        labels_dict[task],
+                        context_indices,
+                        num_classes=self.task_dict.get(task),
+                    )
 
-        loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=filtered_node_mask)
+        node_mask_for_loss = task_loss_masks if task_loss_masks else None
+        loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=node_mask_for_loss)
         task_losses = {k: loss_dict[k] for k in labels_dict.keys()}
         total_task_loss = loss_dict["total"] / len(labels_dict.keys())
+        if self.masked_prediction_train:
+            masked_losses = [task_losses[t] for t in self.masked_tasks if t in task_losses]
+            if masked_losses:
+                masked_target_total_loss = torch.stack(masked_losses).mean()
+                self.log("train/masked_target_total_loss", masked_target_total_loss, prog_bar=False)
+            for task in self.masked_tasks:
+                if task not in labels_dict:
+                    continue
+                task_logits = logits_dict[task]
+                task_labels = labels_dict[task]
+                raw_mask = raw_task_node_masks.get(task)
+                if raw_mask is None:
+                    continue
+                target_indices, context_indices, _ = split_nodes_by_mask(raw_mask)
+                if target_indices.numel() > 0:
+                    target_acc = (task_logits[target_indices].argmax(-1) == task_labels[target_indices]).float().mean()
+                    self.log(f"train/{task}_target_acc", target_acc, prog_bar=False)
+                if context_indices.numel() > 0:
+                    valid_context = self._metric_safe_mask(task_labels, task)[context_indices]
+                    context_indices = context_indices[valid_context]
+                if context_indices.numel() > 0:
+                    consistency = (task_logits[context_indices].argmax(-1) == task_labels[context_indices]).float().mean()
+                    self.log(f"train/{task}_known_consistency", consistency, prog_bar=False)
 
         memory_loss = 0.0
         if len(self.previous_tasks) > 0:
@@ -1525,6 +1868,7 @@ class ContinualAnalysisGNN(LightningModule):
                     batch_size=batch_size,
                     neighbor_mask_node=num_sampled_nodes_dict,
                     neighbor_mask_edge=num_sampled_edges_dict,
+                    label_context=label_context,
                 )
                 logits_mem = self.model.forward_clf(x_mem, self.previous_tasks)
                 memory_dict_logits = self.memory_model.forward_clf(x_mem, self.previous_tasks)
@@ -1936,6 +2280,7 @@ class ContinualAnalysisGNN(LightningModule):
                 continue
             x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
             batch_size = batch["note"].batch_size
+            total_nodes = int(batch["note"].x.size(0))
             labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
             pitch_spelling = batch["note"].pitch_spelling
             key_signature = batch["note"].key_signature
@@ -1954,6 +2299,26 @@ class ContinualAnalysisGNN(LightningModule):
             num_sampled_edges_dict = batch.num_sampled_edges_dict
             num_sampled_nodes_dict = batch.num_sampled_nodes_dict
             mask_dict = self.create_mask_dict(labels_dict, batch, batch_size)
+            device = labels_dict[list(labels_dict.keys())[0]].device if labels_dict else batch["note"].x.device
+            node_mask = self._get_node_mask_for_batch(
+                batch=batch,
+                batch_size=batch_size,
+                device=device,
+                allow_sampling=self.masked_prediction_train,
+            )
+            batch_conditioning = self._build_batch_masked_conditioning(
+                labels_dict=labels_dict,
+                node_mask=node_mask,
+                batch_size=batch_size,
+                total_nodes=total_nodes,
+                device=device,
+            )
+            label_context = self._build_model_label_context(
+                conditioning=batch_conditioning,
+                num_nodes=total_nodes,
+                dtype=x_dict["note"].dtype,
+                device=x_dict["note"].device,
+            )
 
             # NOTE: mask to remove invalid labels
             if "valid_label" not in batch["note"].keys():
@@ -1961,14 +2326,23 @@ class ContinualAnalysisGNN(LightningModule):
             else:
                 valid_label_mask = batch["note"]["valid_label"][:batch_size].bool()
 
-            labels_dict = {k: v[valid_label_mask] for k, v in labels_dict.items()}
-            mask_dict = {k: v[valid_label_mask] for k, v in mask_dict.items()}
-            labels_dict = {k: v[mask_dict[k]] for k, v in labels_dict.items()}
-            labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
-            labels_dict = {k: v for k, v in labels_dict.items() if self._metric_safe_mask(v, k).any()}
+            labels_valid = {k: v[valid_label_mask] for k, v in labels_dict.items()}
+            mask_valid = {k: v[valid_label_mask] for k, v in mask_dict.items()}
+            node_mask_valid = node_mask[valid_label_mask] if node_mask is not None else None
+            labels_dict = {}
+            mask_dict = {}
+            for task, values in labels_valid.items():
+                if task not in mask_valid:
+                    continue
+                task_values = values[mask_valid[task]]
+                if task_values.numel() == 0:
+                    continue
+                if not self._metric_safe_mask(task_values, task).any():
+                    continue
+                labels_dict[task] = task_values
+                mask_dict[task] = mask_valid[task]
             if not labels_dict:
                 continue
-            mask_dict = {k: mask_dict[k] for k in labels_dict.keys()}
 
             logits_dict = self.model(
                     pitch_spelling=pitch_spelling,
@@ -1977,11 +2351,45 @@ class ContinualAnalysisGNN(LightningModule):
                     edge_index_dict=edge_index_dict,
                     batch_dict=batch_dict,
                     batch_size=batch_size,
-                    neighbor_mask_node=num_sampled_nodes_dict, neighbor_mask_edge=num_sampled_edges_dict
+                    neighbor_mask_node=num_sampled_nodes_dict,
+                    neighbor_mask_edge=num_sampled_edges_dict,
+                    label_context=label_context,
                 )
             logits_dict = {k: v[valid_label_mask] for k, v in logits_dict.items()}
             logits_dict = {k: (v[mask_dict[k]] if k in mask_dict.keys() else v) for k, v in logits_dict.items()}
-            loss_dict = self.clf_loss(logits_dict, labels_dict)
+
+            raw_task_node_masks = {}
+            task_loss_masks = {}
+            if node_mask_valid is not None:
+                for task in labels_dict.keys():
+                    raw_task_mask = node_mask_valid[mask_dict[task]]
+                    raw_task_node_masks[task] = raw_task_mask
+                    if self.masked_prediction_train and task in self.masked_tasks:
+                        task_loss_masks[task] = torch.where(
+                            raw_task_mask > 0.9,
+                            torch.ones_like(raw_task_mask),
+                            torch.zeros_like(raw_task_mask),
+                        )
+                    else:
+                        task_loss_masks[task] = raw_task_mask
+                if self.constraint_mode == "hard":
+                    for task in labels_dict.keys():
+                        _, context_indices, _ = split_nodes_by_mask(raw_task_node_masks[task])
+                        if context_indices.numel() == 0:
+                            continue
+                        valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                        context_indices = context_indices[valid_context]
+                        if context_indices.numel() == 0:
+                            continue
+                        logits_dict[task] = clamp_logits_to_labels(
+                            logits_dict[task],
+                            labels_dict[task],
+                            context_indices,
+                            num_classes=self.task_dict.get(task),
+                        )
+
+            node_mask_for_loss = task_loss_masks if task_loss_masks else None
+            loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=node_mask_for_loss)
             total_loss = loss_dict.pop("total") / len(labels_dict.keys())
             accuracy_dict = {}
             f1_dict = {}
@@ -2003,6 +2411,34 @@ class ContinualAnalysisGNN(LightningModule):
                     self.log(f"val/{k}_acc", accuracy_dict[k], batch_size=batch_size)
                 if k in f1_dict:
                     self.log(f"val/{k}_f1", f1_dict[k], batch_size=batch_size)
+            if self.masked_prediction_train:
+                masked_losses = [loss_dict[t] for t in self.masked_tasks if t in loss_dict]
+                if masked_losses:
+                    self.log(
+                        "val/masked_target_total_loss",
+                        torch.stack(masked_losses).mean(),
+                        batch_size=batch_size,
+                    )
+                for task in self.masked_tasks:
+                    if task not in labels_dict:
+                        continue
+                    raw_mask = raw_task_node_masks.get(task)
+                    if raw_mask is None:
+                        continue
+                    target_indices, context_indices, _ = split_nodes_by_mask(raw_mask)
+                    if target_indices.numel() > 0:
+                        target_acc = (
+                            logits_dict[task][target_indices].argmax(-1) == labels_dict[task][target_indices]
+                        ).float().mean()
+                        self.log(f"val/{task}_target_acc", target_acc, batch_size=batch_size)
+                    if context_indices.numel() > 0:
+                        valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                        context_indices = context_indices[valid_context]
+                    if context_indices.numel() > 0:
+                        consistency = (
+                            logits_dict[task][context_indices].argmax(-1) == labels_dict[task][context_indices]
+                        ).float().mean()
+                        self.log(f"val/{task}_known_consistency", consistency, batch_size=batch_size)
 
             # RNA accuracy calculation based on in_label notes only
             if "tpc_in_label" in logits_dict.keys():
@@ -2060,7 +2496,9 @@ class ContinualAnalysisGNN(LightningModule):
                 print("Batch is None")
                 continue
             x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
-            labels_dict = {k: batch["note"][k] for k in self.task_dict.keys() if k in batch["note"].keys()}
+            batch_size = batch["note"].batch_size
+            total_nodes = int(batch["note"].x.size(0))
+            labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
             pitch_spelling = batch["note"].pitch_spelling
             key_signature = batch["note"].key_signature
             # Keep only valid class indices and map everything else to ignore_index (-1).
@@ -2074,19 +2512,53 @@ class ContinualAnalysisGNN(LightningModule):
             }
             edge_index_dict = batch.edge_index_dict
             batch_dict = batch.batch_dict
-            batch_size = batch["note"].batch_size
             num_sampled_edges_dict = batch.num_sampled_edges_dict
             num_sampled_nodes_dict = batch.num_sampled_nodes_dict
+            mask_dict = self.create_mask_dict(labels_dict, batch, batch_size)
+            device = labels_dict[list(labels_dict.keys())[0]].device if labels_dict else batch["note"].x.device
+            node_mask = self._get_node_mask_for_batch(
+                batch=batch,
+                batch_size=batch_size,
+                device=device,
+                allow_sampling=self.masked_prediction_train,
+            )
+            batch_conditioning = self._build_batch_masked_conditioning(
+                labels_dict=labels_dict,
+                node_mask=node_mask,
+                batch_size=batch_size,
+                total_nodes=total_nodes,
+                device=device,
+            )
+            label_context = self._build_model_label_context(
+                conditioning=batch_conditioning,
+                num_nodes=total_nodes,
+                dtype=x_dict["note"].dtype,
+                device=x_dict["note"].device,
+            )
             # NOTE: mask to remove invalid labels
             if "valid_label" not in batch["note"].keys():
                 valid_label_mask = torch.ones_like(batch["note"]["pitch_spelling"][:batch_size]).bool()
             else:
                 valid_label_mask = batch["note"]["valid_label"][:batch_size].bool()
-            labels_dict = {k: v[:batch_size][valid_label_mask] for k, v in labels_dict.items()}
-            labels_dict = {k: v for k, v in labels_dict.items() if v.numel() > 0}
-            labels_dict = {k: v for k, v in labels_dict.items() if self._metric_safe_mask(v, k).any()}
+
+            labels_valid = {k: v[valid_label_mask] for k, v in labels_dict.items()}
+            mask_valid = {k: v[valid_label_mask] for k, v in mask_dict.items()}
+            node_mask_valid = node_mask[valid_label_mask] if node_mask is not None else None
+            labels_dict = {}
+            mask_dict = {}
+            for task, values in labels_valid.items():
+                if task not in mask_valid:
+                    continue
+                task_values = values[mask_valid[task]]
+                if task_values.numel() == 0:
+                    continue
+                if not self._metric_safe_mask(task_values, task).any():
+                    continue
+                labels_dict[task] = task_values
+                mask_dict[task] = mask_valid[task]
             if not labels_dict:
                 continue
+
             logits_dict = self.model(
                 pitch_spelling=pitch_spelling,
                 key_signature=key_signature,
@@ -2094,11 +2566,46 @@ class ContinualAnalysisGNN(LightningModule):
                 edge_index_dict=edge_index_dict,
                 batch_dict=batch_dict,
                 batch_size=batch_size,
-                neighbor_mask_node=num_sampled_nodes_dict, neighbor_mask_edge=num_sampled_edges_dict
+                neighbor_mask_node=num_sampled_nodes_dict,
+                neighbor_mask_edge=num_sampled_edges_dict,
+                label_context=label_context,
             )
-            logits_dict = {k: v[valid_label_mask] for k, v in logits_dict.items() if k in labels_dict}
+            logits_dict = {k: v[valid_label_mask] for k, v in logits_dict.items()}
+            logits_dict = {k: (v[mask_dict[k]] if k in mask_dict.keys() else v) for k, v in logits_dict.items()}
+
+            raw_task_node_masks = {}
+            task_loss_masks = {}
+            if node_mask_valid is not None:
+                for task in labels_dict.keys():
+                    raw_task_mask = node_mask_valid[mask_dict[task]]
+                    raw_task_node_masks[task] = raw_task_mask
+                    if self.masked_prediction_train and task in self.masked_tasks:
+                        task_loss_masks[task] = torch.where(
+                            raw_task_mask > 0.9,
+                            torch.ones_like(raw_task_mask),
+                            torch.zeros_like(raw_task_mask),
+                        )
+                    else:
+                        task_loss_masks[task] = raw_task_mask
+                if self.constraint_mode == "hard":
+                    for task in labels_dict.keys():
+                        _, context_indices, _ = split_nodes_by_mask(raw_task_node_masks[task])
+                        if context_indices.numel() == 0:
+                            continue
+                        valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                        context_indices = context_indices[valid_context]
+                        if context_indices.numel() == 0:
+                            continue
+                        logits_dict[task] = clamp_logits_to_labels(
+                            logits_dict[task],
+                            labels_dict[task],
+                            context_indices,
+                            num_classes=self.task_dict.get(task),
+                        )
+
             logits_softmax_dict = {k: v.softmax(-1) for k, v in logits_dict.items()}
-            loss_dict = self.clf_loss(logits_dict, labels_dict)
+            node_mask_for_loss = task_loss_masks if task_loss_masks else None
+            loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=node_mask_for_loss)
             total_loss = loss_dict.pop("total") / len(labels_dict.keys())
             accuracy_dict = {}
             f1_dict = {}
@@ -2114,6 +2621,46 @@ class ContinualAnalysisGNN(LightningModule):
                     f1_dict[task_name] = f1
 
             self.log("test/total_loss", total_loss.item(), add_dataloader_idx=True, batch_size=batch_size, prog_bar=True)
+            if self.masked_prediction_train:
+                masked_losses = [loss_dict[t] for t in self.masked_tasks if t in loss_dict]
+                if masked_losses:
+                    self.log(
+                        "test/masked_target_total_loss",
+                        torch.stack(masked_losses).mean(),
+                        add_dataloader_idx=True,
+                        batch_size=batch_size,
+                    )
+                for task in self.masked_tasks:
+                    if task not in labels_dict:
+                        continue
+                    raw_mask = raw_task_node_masks.get(task)
+                    if raw_mask is None:
+                        continue
+                    target_indices, context_indices, _ = split_nodes_by_mask(raw_mask)
+                    if target_indices.numel() > 0:
+                        target_acc = (
+                            logits_dict[task][target_indices].argmax(-1) == labels_dict[task][target_indices]
+                        ).float().mean()
+                        self.log(
+                            f"test/{task}_target_acc",
+                            target_acc,
+                            add_dataloader_idx=True,
+                            batch_size=batch_size,
+                        )
+                    if context_indices.numel() > 0:
+                        valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                        context_indices = context_indices[valid_context]
+                    if context_indices.numel() > 0:
+                        consistency = (
+                            logits_dict[task][context_indices].argmax(-1) == labels_dict[task][context_indices]
+                        ).float().mean()
+                        self.log(
+                            f"test/{task}_known_consistency",
+                            consistency,
+                            add_dataloader_idx=True,
+                            batch_size=batch_size,
+                        )
+
             # RNA calculation Onsetwise
             rna_keys = ["quality", "inversion", "degree1", "degree2"] # ["localkey", "quality", "inversion", "degree1", "degree2"]
             if all([k in labels_dict.keys() for k in rna_keys]):
@@ -2454,34 +3001,39 @@ class ContinualAnalysisGNN(LightningModule):
 
         return ewc_penalty
 
-    def predict(self, score, user_edits: Optional[Dict[str, Any]] = None, return_edit_info: bool = False):
+    def predict(
+        self,
+        score,
+        user_edits: Optional[Dict[str, Any]] = None,
+        masked_spec: Optional[Dict[str, Any]] = None,
+        return_edit_info: bool = False,
+    ):
         """Predict analysis for a musical score.
         
         Args:
             score: Path to score file or partitura Score object
             user_edits: Optional user edit spec (see analysisgnn.utils.user_edits)
+            masked_spec: Optional masked conditioning spec (known labels + mask).
             return_edit_info: If True, return (predictions, edit_info)
             
         Returns:
             Dictionary of predictions for each task, or (predictions, edit_info)
         """
-        import tempfile
         import os
         import partitura as pt
         from analysisgnn.descriptors import select_features
         from graphmuse import create_score_graph
         from analysisgnn.utils.music import PitchEncoder, KeySignatureEncoder
+        from analysisgnn.utils.user_edits import normalize_user_edits_to_masked_conditioning
         import numpy as np
         
         # Handle both score objects and file paths
         if isinstance(score, str):
             # It's a file path, load it
             score_obj = pt.load_score(score)
-            score_name = os.path.splitext(os.path.basename(score))[0]
         else:
             # It's already a partitura score object
             score_obj = score
-            score_name = "unknown_score"
         
         # Process the score directly without saving to file
         try:
@@ -2519,16 +3071,13 @@ class ContinualAnalysisGNN(LightningModule):
             batch_size = data["note"].x.size(0)
             data["note"].batch = torch.zeros(batch_size, dtype=torch.long)
 
-            node_mask = None
-            overrides = {}
-            if user_edits:
-                from analysisgnn.utils.user_edits import normalize_user_edits
-                node_mask, overrides = normalize_user_edits(
-                    user_edits,
-                    num_nodes=batch_size,
-                    tasks_num_classes=self.task_dict,
-                    device=self.device,
-                )
+            node_mask, overrides, conditioning = normalize_user_edits_to_masked_conditioning(
+                user_edits=user_edits,
+                num_nodes=batch_size,
+                tasks_num_classes=self.task_dict,
+                device=self.device,
+                masked_spec=masked_spec,
+            )
             
             # Convert to the format expected by the model
             x_dict = data.x_dict
@@ -2541,6 +3090,12 @@ class ContinualAnalysisGNN(LightningModule):
             # For prediction, we don't use sampling, so set to None
             num_sampled_nodes_dict = None
             num_sampled_edges_dict = None
+            label_context = self._build_model_label_context(
+                conditioning=conditioning,
+                num_nodes=batch_size,
+                dtype=x_dict["note"].dtype,
+                device=x_dict["note"].device,
+            )
             
             # Get predictions from the model
             logits_dict = self.model(
@@ -2551,11 +3106,12 @@ class ContinualAnalysisGNN(LightningModule):
                 batch_dict=batch_dict,
                 batch_size=batch_size,
                 neighbor_mask_node=num_sampled_nodes_dict,
-                neighbor_mask_edge=num_sampled_edges_dict
+                neighbor_mask_edge=num_sampled_edges_dict,
+                label_context=label_context,
             )
+            logits_dict = self._apply_known_label_constraints(logits_dict, conditioning)
 
             if overrides:
-                from analysisgnn.utils.node_masking import clamp_logits_to_labels
                 for task, override in overrides.items():
                     if task not in logits_dict:
                         continue
@@ -2583,7 +3139,11 @@ class ContinualAnalysisGNN(LightningModule):
             predictions = measurewise_logit_aggregation(predictions, graph=data, batch_size=batch_size)
             
             if return_edit_info:
-                edit_info = {"node_mask": node_mask, "label_overrides": overrides}
+                edit_info = {
+                    "node_mask": node_mask,
+                    "label_overrides": overrides,
+                    "masked_conditioning": conditioning,
+                }
                 return predictions, edit_info
             return predictions
             

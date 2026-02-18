@@ -135,6 +135,56 @@ def get_parser():
                         help="Enable semi-supervised node masking with random masking during training")
     parser.add_argument("--mask_ratio", type=float, default=0.15,
                         help="Ratio of nodes to mask as context during training (default: 0.15)")
+    parser.add_argument(
+        "--masked_prediction_train",
+        action="store_true",
+        help="Enable label-conditioned masked prediction training mode.",
+    )
+    parser.add_argument(
+        "--masked_tasks",
+        type=str,
+        default="",
+        help="Comma-separated tasks for masked prediction conditioning (required when --masked_prediction_train).",
+    )
+    parser.add_argument(
+        "--known_ratio",
+        type=float,
+        default=None,
+        help="Known-label/context ratio for masked prediction (defaults to mask_ratio when omitted).",
+    )
+    parser.add_argument(
+        "--mask_sampling_policy",
+        type=str,
+        default="hybrid",
+        choices=["random", "span", "hybrid"],
+        help="Sampling policy for context nodes in masked prediction mode.",
+    )
+    parser.add_argument(
+        "--mask_span_min_onsets",
+        type=int,
+        default=2,
+        help="Minimum onset-span length when mask_sampling_policy uses spans.",
+    )
+    parser.add_argument(
+        "--mask_span_max_onsets",
+        type=int,
+        default=8,
+        help="Maximum onset-span length when mask_sampling_policy uses spans.",
+    )
+    parser.add_argument(
+        "--constraint_mode",
+        type=str,
+        default="hard",
+        choices=["hard", "soft"],
+        help="Constraint policy for known labels in masked prediction mode.",
+    )
+    parser.add_argument(
+        "--feedback_mode",
+        type=str,
+        default="single_pass",
+        choices=["single_pass"],
+        help="Feedback loop mode for label conditioning.",
+    )
     parser.add_argument("--use_musicbert", action="store_true", help="Use MusicBERT note encoder")
     parser.add_argument("--musicbert_model_name", type=str, default="manoskary/musicbert-large", help="MusicBERT model name")
     parser.add_argument(
@@ -249,6 +299,7 @@ def main():
 
     args = parser.parse_args()
     args.main_tasks = args.main_tasks.split(",")
+    args.masked_tasks = [t.strip() for t in args.masked_tasks.split(",") if t.strip()]
     args.num_epochs = args.num_epochs.split(",")
     if len(args.num_epochs) == 1:
         args.num_epochs = int(args.num_epochs[0])
@@ -287,6 +338,9 @@ def main():
             if k not in config.keys():
                 config[k] = v
 
+    if isinstance(config.get("masked_tasks", []), str):
+        config["masked_tasks"] = [t.strip() for t in config["masked_tasks"].split(",") if t.strip()]
+
     if config.get("robust_profile", False):
         print("Applying robust profile defaults.")
         config["scheduler_type"] = "cosine_warmup"
@@ -313,6 +367,22 @@ def main():
             "Switching mt_strategy to fixed."
         )
         config["mt_strategy"] = "fixed"
+
+    if config.get("masked_prediction_train", False):
+        if not config.get("masked_tasks"):
+            raise ValueError(
+                "--masked_prediction_train requires --masked_tasks "
+                "(e.g. romanNumeral,localkey,quality,inversion,degree1,degree2)."
+            )
+        unknown_tasks = [t for t in config["masked_tasks"] if t not in TASK_DICT]
+        if unknown_tasks:
+            raise ValueError(f"Unknown masked task(s): {unknown_tasks}")
+        if config.get("feedback_mode", "single_pass") != "single_pass":
+            raise ValueError("Only --feedback_mode single_pass is currently supported.")
+    if config.get("known_ratio") is not None:
+        config["mask_ratio"] = float(config["known_ratio"])
+    else:
+        config["known_ratio"] = float(config.get("mask_ratio", 0.15))
 
     if config.get("use_musicbert", False):
         has_alignments = bool(config.get("musicbert_alignment_dir"))
@@ -444,6 +514,10 @@ def main():
         ckpt = torch.load(config["checkpoint_path"], map_location="cpu")
         ckpt_state = ckpt.get("state_dict", {})
         has_note_encoder = any(key.startswith("note_encoder.") for key in ckpt_state.keys())
+        has_label_conditioning = any(
+            key.startswith("label_condition_embeddings.") or key.startswith("label_condition_fusion.")
+            for key in ckpt_state.keys()
+        )
         if has_note_encoder and note_encoder is None and not config.get("musicbert_use_cached_embeddings", False):
             raise ValueError(
                 "Checkpoint contains MusicBERT note encoder weights, but --use_musicbert "
@@ -453,6 +527,10 @@ def main():
             strict = True
             if config.get("musicbert_use_lora", False) or not has_note_encoder:
                 strict = False
+            if config.get("masked_prediction_train", False) and not has_label_conditioning:
+                strict = False
+            if has_label_conditioning and not config.get("masked_prediction_train", False):
+                strict = False
             model = ContinualAnalysisGNN.load_from_checkpoint(
                 config["checkpoint_path"],
                 hparams=config,
@@ -461,6 +539,10 @@ def main():
             )
         else:
             strict = not has_note_encoder
+            if config.get("masked_prediction_train", False) and not has_label_conditioning:
+                strict = False
+            if has_label_conditioning and not config.get("masked_prediction_train", False):
+                strict = False
             model = ContinualAnalysisGNN.load_from_checkpoint(
                 config["checkpoint_path"],
                 hparams=config,
@@ -507,6 +589,8 @@ def main():
         aug = "aug" if config.get("use_transpositions", True) else "noaug"
         feature_tag = config.get("feature_type", "cadence")
         arch_tag = "no-gnn" if config.get("disable_graph_encoder", False) else "gnn"
+        masked_tag = "masked" if config.get("masked_prediction_train", False) else "nomasked"
+        masked_tasks_tag = "-".join(config.get("masked_tasks", [])) if config.get("masked_prediction_train", False) else "none"
         phase = "train+eval" if args.do_train and args.do_eval else ("train" if args.do_train else ("eval" if args.do_eval else "run"))
         ckpt_tag = ""
         if args.do_eval and not args.do_train and config.get("checkpoint_path"):
@@ -516,19 +600,39 @@ def main():
             f"{phase}-{model_arch}"
             f"-tasks={task_group}"
             f"-feat={feature_tag}"
-            f"-{musicbert_tag}"
-            f"-{arch_tag}"
-            f"-{aug}"
-            f"-sched={config['scheduler_type']}"
-            f"-conf={config['mt_conflict_method']}"
-            f"-ep={config['num_epochs']}"
-            f"-bs={config['batch_size']}"
-            f"-lr={config['lr']}{ckpt_tag}"
+                f"-{musicbert_tag}"
+                f"-{arch_tag}"
+                f"-{aug}"
+                f"-{masked_tag}"
+                f"-mtasks={masked_tasks_tag}"
+                f"-sched={config['scheduler_type']}"
+                f"-conf={config['mt_conflict_method']}"
+                f"-ep={config['num_epochs']}"
+                f"-bs={config['batch_size']}"
+                f"-lr={config['lr']}{ckpt_tag}"
+            )
+        group = (
+            f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-"
+            f"{masked_tag}-{masked_tasks_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
         )
-        group = f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-{config['scheduler_type']}-{config['mt_conflict_method']}"
         job_type = phase
         user_tags = args.tags.split(",") if args.tags != "" else []
-        tags = [t for t in [phase, task_group, feature_tag, musicbert_tag, arch_tag, aug, config["scheduler_type"], config["mt_conflict_method"]] + user_tags if t]
+        tags = [
+            t
+            for t in [
+                phase,
+                task_group,
+                feature_tag,
+                musicbert_tag,
+                arch_tag,
+                aug,
+                masked_tag,
+                masked_tasks_tag,
+                config["scheduler_type"],
+                config["mt_conflict_method"],
+            ] + user_tags
+            if t
+        ]
 
         wandb_logger = WandbLogger(
             config=config,

@@ -60,9 +60,10 @@ class MultiTaskLoss(nn.Module):
         out = {}
         for task in gt.keys():
             task_loss = self.loss_ft[task](pred[task], gt[task])
+            task_node_mask = node_mask.get(task, None) if isinstance(node_mask, dict) else node_mask
             
             # Apply node masking if provided
-            if node_mask is not None:
+            if task_node_mask is not None:
                 # Ensure loss is unreduced (per-sample)
                 if task_loss.dim() == 0:
                     # Loss is already reduced to scalar - need unreduced version
@@ -85,10 +86,20 @@ class MultiTaskLoss(nn.Module):
                         # This is a fallback and may not work for all loss types
                         raise NotImplementedError(f"Node masking not yet supported for {type(loss_fn).__name__} with reduction='mean' or 'sum'")
                 
+                if not isinstance(task_node_mask, torch.Tensor):
+                    task_node_mask = torch.tensor(task_node_mask, device=task_loss.device, dtype=torch.float32)
+                task_node_mask = task_node_mask.to(device=task_loss.device, dtype=torch.float32).reshape(-1)
+                if task_node_mask.numel() != task_loss.numel():
+                    raise ValueError(
+                        f"node_mask size mismatch for task '{task}': "
+                        f"{task_node_mask.numel()} vs {task_loss.numel()}"
+                    )
                 # Apply mask: target nodes (1.0), context nodes (context_weight), unlabeled (0.0)
-                mask_weights = torch.where(node_mask > 0.5, 
-                                          torch.ones_like(node_mask), 
-                                          node_mask * self.context_weight)
+                mask_weights = torch.where(
+                    task_node_mask > 0.5,
+                    torch.ones_like(task_node_mask),
+                    task_node_mask * self.context_weight,
+                )
                 task_loss = (task_loss * mask_weights).sum() / (mask_weights.sum() + 1e-8)
             else:
                 # If no mask and loss is unreduced, reduce it now
