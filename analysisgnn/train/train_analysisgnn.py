@@ -565,6 +565,12 @@ def main():
             )
         )
     manual_optimization = config.get("mt_strategy") == "famo" or config.get("mt_conflict_method") in {"pcgrad", "gradnorm"}
+    if manual_optimization and int(config.get("accumulate_grad_batches", 1)) > 1:
+        print(
+            "Warning: manual optimization (pcgrad/gradnorm/famo) does not support "
+            "Trainer(accumulate_grad_batches>1). Forcing accumulate_grad_batches=1."
+        )
+        config["accumulate_grad_batches"] = 1
     gradient_clip_val = 0.0 if manual_optimization else float(config.get("grad_clip_val", 1.0))
     trainer = Trainer(
         max_epochs=config["num_epochs"], accelerator=accelerator, devices=devices,
