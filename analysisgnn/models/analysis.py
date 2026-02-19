@@ -1864,7 +1864,8 @@ class ContinualAnalysisGNN(LightningModule):
         return input_ids_tensor, attention_mask_tensor, token2note_list, num_notes
 
     def _compute_task_losses(self, batch, force_unmasked_batch: bool = False):
-        x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
+        raw_x_dict = batch.x_dict
+        x_dict = self._maybe_encode_x_dict(batch, raw_x_dict)
         batch_size = batch["note"].batch_size
         total_nodes = int(batch["note"].x.size(0))
         labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
@@ -2029,7 +2030,7 @@ class ContinualAnalysisGNN(LightningModule):
 
         preserve_losses = self._compute_preservation_losses(
             batch=batch,
-            x_dict=x_dict,
+            teacher_source_x_dict=raw_x_dict,
             pitch_spelling=pitch_spelling,
             key_signature=key_signature,
             edge_index_dict=edge_index_dict,
@@ -2339,7 +2340,7 @@ class ContinualAnalysisGNN(LightningModule):
         self,
         *,
         batch,
-        x_dict: Dict[str, torch.Tensor],
+        teacher_source_x_dict: Dict[str, torch.Tensor],
         pitch_spelling: torch.Tensor,
         key_signature: torch.Tensor,
         edge_index_dict: Dict[Any, torch.Tensor],
@@ -2371,7 +2372,7 @@ class ContinualAnalysisGNN(LightningModule):
             return out
 
         with torch.no_grad():
-            teacher_x_dict = self._encode_teacher_x_dict(batch, x_dict)
+            teacher_x_dict = self._encode_teacher_x_dict(batch, teacher_source_x_dict)
             teacher_features = teacher_model.encode(
                 pitch_spelling=pitch_spelling,
                 key_signature=key_signature,
@@ -2965,7 +2966,8 @@ class ContinualAnalysisGNN(LightningModule):
                 continue
             if batch is None:
                 continue
-            x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
+            raw_x_dict = batch.x_dict
+            x_dict = self._maybe_encode_x_dict(batch, raw_x_dict)
             batch_size = batch["note"].batch_size
             total_nodes = int(batch["note"].x.size(0))
             labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
@@ -3079,7 +3081,7 @@ class ContinualAnalysisGNN(LightningModule):
 
             preserve_losses = self._compute_preservation_losses(
                 batch=batch,
-                x_dict=x_dict,
+                teacher_source_x_dict=raw_x_dict,
                 pitch_spelling=pitch_spelling,
                 key_signature=key_signature,
                 edge_index_dict=edge_index_dict,
@@ -3250,7 +3252,8 @@ class ContinualAnalysisGNN(LightningModule):
             if batch is None:
                 print("Batch is None")
                 continue
-            x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
+            raw_x_dict = batch.x_dict
+            x_dict = self._maybe_encode_x_dict(batch, raw_x_dict)
             batch_size = batch["note"].batch_size
             total_nodes = int(batch["note"].x.size(0))
             labels_dict = {k: batch["note"][k][:batch_size] for k in self.task_dict.keys() if k in batch["note"].keys()}
@@ -3362,7 +3365,7 @@ class ContinualAnalysisGNN(LightningModule):
 
             preserve_losses = self._compute_preservation_losses(
                 batch=batch,
-                x_dict=x_dict,
+                teacher_source_x_dict=raw_x_dict,
                 pitch_spelling=pitch_spelling,
                 key_signature=key_signature,
                 edge_index_dict=edge_index_dict,

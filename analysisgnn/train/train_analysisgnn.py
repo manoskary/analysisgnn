@@ -694,6 +694,7 @@ def main():
     model_arch = f"{config['model']}-heads-only" if config.get("disable_graph_encoder", False) else config["model"]
     model_name = f"{model_arch}_{config['num_layers']}x{config['hidden_channels']}-dropout={config['dropout']}-lr={config['lr']}-wd={config['weight_decay']}"
 
+    wandb_logger = None
     if config["use_wandb"]:
 
         task_group = "-".join(config["main_tasks"])
@@ -760,7 +761,7 @@ def main():
             if t
         ]
 
-        wandb_logger = WandbLogger(
+        wandb_logger_kwargs = dict(
             config=config,
             project=config["wandb_project"],
             entity=config["wandb_entity"],
@@ -770,7 +771,31 @@ def main():
             tags=tags,
             log_model=True,
         )
-        wandb_logger.log_hyperparams(args)
+        try:
+            wandb_logger = WandbLogger(**wandb_logger_kwargs)
+            wandb_logger.log_hyperparams(args)
+        except Exception as exc:
+            print(
+                "Warning: W&B logger initialization failed "
+                f"({type(exc).__name__}: {exc}). Retrying in offline mode."
+            )
+            try:
+                if wandb.run is not None:
+                    wandb.finish()
+            except Exception:
+                pass
+            os.environ["WANDB_MODE"] = "offline"
+            try:
+                wandb_logger = WandbLogger(**wandb_logger_kwargs)
+                wandb_logger.log_hyperparams(args)
+                print("W&B offline logging enabled.")
+            except Exception as offline_exc:
+                print(
+                    "Warning: W&B offline fallback failed "
+                    f"({type(offline_exc).__name__}: {offline_exc}). Continuing without W&B logger."
+                )
+                wandb_logger = None
+                config["use_wandb"] = False
 
     monitor_metric = config.get("monitor_metric", "val/total_loss")
     monitor_mode = config.get("monitor_mode", "min")
