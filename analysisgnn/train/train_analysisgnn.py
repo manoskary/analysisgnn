@@ -268,6 +268,89 @@ def get_parser():
     parser.add_argument("--early_stop_min_delta", type=float, default=0.002, help="Early stopping min_delta.")
     parser.add_argument("--optimizer_stats_log_every_n_steps", type=int, default=50,
                         help="Log LR and gradient norms every N optimizer steps.")
+    parser.add_argument(
+        "--preserve_pretrained",
+        action="store_true",
+        help="Enable no-regression preservation losses (teacher KD + feature anchor + L2-SP).",
+    )
+    parser.add_argument(
+        "--preserve_kd_lambda",
+        type=float,
+        default=1.0,
+        help="Lambda for teacher logit distillation loss.",
+    )
+    parser.add_argument(
+        "--preserve_feat_lambda",
+        type=float,
+        default=0.1,
+        help="Lambda for teacher feature-anchor loss.",
+    )
+    parser.add_argument(
+        "--preserve_l2sp_lambda",
+        type=float,
+        default=1e-4,
+        help="Lambda for L2-SP drift penalty against pretrained initialization.",
+    )
+    parser.add_argument(
+        "--preserve_temperature",
+        type=float,
+        default=2.0,
+        help="Distillation temperature for pretrained-preservation KD.",
+    )
+    parser.add_argument(
+        "--preserve_tasks",
+        type=str,
+        default="all_nonmasked",
+        help="Comma-separated tasks for preservation KD, or 'all_nonmasked'.",
+    )
+    parser.add_argument(
+        "--preserve_teacher_checkpoint",
+        type=str,
+        default=None,
+        help="Optional teacher checkpoint path; defaults to checkpoint_path when resuming.",
+    )
+    parser.add_argument(
+        "--unmasked_batch_prob",
+        type=float,
+        default=0.30,
+        help="Probability of running a fully-unmasked supervised batch during masked training.",
+    )
+    parser.add_argument(
+        "--freeze_graph_encoder_stage_epochs",
+        type=int,
+        default=15,
+        help="When preserve_pretrained is enabled, freeze graph encoder for this many initial epochs.",
+    )
+    parser.add_argument(
+        "--preserve_stage_b_epochs",
+        type=int,
+        default=25,
+        help="Epoch count for stage-B LR in preserve_pretrained mode.",
+    )
+    parser.add_argument(
+        "--preserve_stage_a_lr",
+        type=float,
+        default=1e-4,
+        help="Stage-A learning rate (preserve_pretrained).",
+    )
+    parser.add_argument(
+        "--preserve_stage_b_lr",
+        type=float,
+        default=5e-5,
+        help="Stage-B learning rate (preserve_pretrained).",
+    )
+    parser.add_argument(
+        "--preserve_stage_c_lr",
+        type=float,
+        default=2e-5,
+        help="Stage-C learning rate (preserve_pretrained).",
+    )
+    parser.add_argument(
+        "--preserve_max_regression_abs",
+        type=float,
+        default=0.015,
+        help="Maximum allowed absolute drop for val/nonmasked_total_acc vs teacher baseline.",
+    )
     parser.add_argument("--robust_profile", action="store_true",
                         help="Apply robust defaults for augmented multitask runs.")
     parser.add_argument("--early_stopping", dest="early_stopping", action="store_true",
@@ -312,6 +395,7 @@ def main():
     args = parser.parse_args()
     args.main_tasks = args.main_tasks.split(",")
     args.masked_tasks = [t.strip() for t in args.masked_tasks.split(",") if t.strip()]
+    args.preserve_tasks = [t.strip() for t in args.preserve_tasks.split(",") if t.strip()]
     args.num_epochs = args.num_epochs.split(",")
     if len(args.num_epochs) == 1:
         args.num_epochs = int(args.num_epochs[0])
@@ -352,6 +436,10 @@ def main():
 
     if isinstance(config.get("masked_tasks", []), str):
         config["masked_tasks"] = [t.strip() for t in config["masked_tasks"].split(",") if t.strip()]
+    if isinstance(config.get("preserve_tasks", []), str):
+        config["preserve_tasks"] = [t.strip() for t in config["preserve_tasks"].split(",") if t.strip()]
+    if not config.get("preserve_tasks"):
+        config["preserve_tasks"] = ["all_nonmasked"]
 
     if config.get("robust_profile", False):
         print("Applying robust profile defaults.")
@@ -367,6 +455,9 @@ def main():
         config["grad_clip_val"] = 0.5
         if use_cuda and ampere_or_newer:
             config["precision"] = "bf16-mixed" if torch.cuda.is_bf16_supported() else "16-mixed"
+        if config.get("preserve_pretrained", False):
+            # No-regression finetuning should start from conservative rates.
+            config["lr"] = float(config.get("preserve_stage_a_lr", 1e-4))
 
     if config.get("mt_conflict_method") in {"pcgrad", "cagrad", "gradnorm"} and config.get("mt_strategy") == "wloss":
         print(
@@ -392,6 +483,14 @@ def main():
             raise ValueError(f"Unknown masked task(s): {unknown_tasks}")
         if config.get("feedback_mode", "single_pass") != "single_pass":
             raise ValueError("Only --feedback_mode single_pass is currently supported.")
+    if config.get("preserve_pretrained", False):
+        if not config.get("masked_prediction_train", False):
+            print(
+                "Warning: --preserve_pretrained is enabled without --masked_prediction_train. "
+                "Preservation losses will still run, but mixed masked/unmasked sampling is inactive."
+            )
+        if not (0.0 <= float(config.get("unmasked_batch_prob", 0.30)) <= 1.0):
+            raise ValueError("--unmasked_batch_prob must be in [0, 1].")
     if config.get("known_ratio") is not None:
         config["mask_ratio"] = float(config["known_ratio"])
     else:
@@ -434,6 +533,9 @@ def main():
         config["musicbert_require_cached_embeddings"] = True
         print("Enabling strict cached-embedding mode (all graphs must have cached MusicBERT embeddings).")
     config["musicbert_use_cached_embeddings"] = use_cached_embeddings
+    if config.get("preserve_pretrained", False) and config.get("preserve_teacher_checkpoint") is None:
+        if config.get("load_from_checkpoint", False) and config.get("checkpoint_path"):
+            config["preserve_teacher_checkpoint"] = config["checkpoint_path"]
 
     if config["gpus"] == "-1":
         devices = 1
@@ -524,6 +626,14 @@ def main():
                 raise ValueError(f"Checkpoint path {config['checkpoint_path']} does not exist!")
         # Load model from checkpoint
         print(f"Loading model from checkpoint {config['checkpoint_path']}")
+        if (
+            config.get("preserve_pretrained", False)
+            and (
+                not config.get("preserve_teacher_checkpoint")
+                or not os.path.exists(config.get("preserve_teacher_checkpoint"))
+            )
+        ):
+            config["preserve_teacher_checkpoint"] = config["checkpoint_path"]
         ckpt = torch.load(config["checkpoint_path"], map_location="cpu")
         ckpt_state = ckpt.get("state_dict", {})
         has_note_encoder = any(key.startswith("note_encoder.") for key in ckpt_state.keys())
@@ -604,6 +714,7 @@ def main():
         arch_tag = "no-gnn" if config.get("disable_graph_encoder", False) else "gnn"
         masked_tag = "masked" if config.get("masked_prediction_train", False) else "nomasked"
         masked_tasks_tag = "-".join(config.get("masked_tasks", [])) if config.get("masked_prediction_train", False) else "none"
+        preserve_tag = "preserve" if config.get("preserve_pretrained", False) else "nopreserve"
         phase = "train+eval" if args.do_train and args.do_eval else ("train" if args.do_train else ("eval" if args.do_eval else "run"))
         ckpt_tag = ""
         if args.do_eval and not args.do_train and config.get("checkpoint_path"):
@@ -618,6 +729,7 @@ def main():
                 f"-{aug}"
                 f"-{masked_tag}"
                 f"-mtasks={masked_tasks_tag}"
+                f"-{preserve_tag}"
                 f"-sched={config['scheduler_type']}"
                 f"-conf={config['mt_conflict_method']}"
                 f"-ep={config['num_epochs']}"
@@ -626,7 +738,7 @@ def main():
             )
         group = (
             f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-"
-            f"{masked_tag}-{masked_tasks_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
+            f"{masked_tag}-{masked_tasks_tag}-{preserve_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
         )
         job_type = phase
         user_tags = args.tags.split(",") if args.tags != "" else []
@@ -641,6 +753,7 @@ def main():
                 aug,
                 masked_tag,
                 masked_tasks_tag,
+                preserve_tag,
                 config["scheduler_type"],
                 config["mt_conflict_method"],
             ] + user_tags

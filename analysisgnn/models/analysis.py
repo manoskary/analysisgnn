@@ -3,6 +3,7 @@ from torchmetrics import Accuracy, F1Score
 from pytorch_lightning.utilities.types import STEP_OUTPUT, OptimizerLRScheduler
 import torch
 from copy import deepcopy
+import os
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.nn import functional as F
@@ -1398,6 +1399,46 @@ class ContinualAnalysisGNN(LightningModule):
         self.label_condition_fusion = None
         if self.masked_tasks:
             self._init_label_conditioning_modules(self.masked_tasks)
+
+        # Pretrained-preservation settings for masked finetuning.
+        self.preserve_pretrained = bool(hparams.get("preserve_pretrained", False))
+        preserve_tasks_cfg = hparams.get("preserve_tasks", ["all_nonmasked"])
+        if isinstance(preserve_tasks_cfg, str):
+            preserve_tasks_cfg = [t.strip() for t in preserve_tasks_cfg.split(",") if t.strip()]
+        self.preserve_tasks = preserve_tasks_cfg if preserve_tasks_cfg else ["all_nonmasked"]
+        self.preserve_kd_lambda = float(hparams.get("preserve_kd_lambda", 1.0))
+        self.preserve_feat_lambda = float(hparams.get("preserve_feat_lambda", 0.1))
+        self.preserve_l2sp_lambda = float(hparams.get("preserve_l2sp_lambda", 1e-4))
+        self.preserve_temperature = float(hparams.get("preserve_temperature", 2.0))
+        self.unmasked_batch_prob = float(hparams.get("unmasked_batch_prob", 0.30))
+        self.freeze_graph_encoder_stage_epochs = int(hparams.get("freeze_graph_encoder_stage_epochs", 15))
+        self.preserve_stage_b_epochs = int(hparams.get("preserve_stage_b_epochs", 25))
+        self.preserve_stage_a_lr = float(hparams.get("preserve_stage_a_lr", 1e-4))
+        self.preserve_stage_b_lr = float(hparams.get("preserve_stage_b_lr", 5e-5))
+        self.preserve_stage_c_lr = float(hparams.get("preserve_stage_c_lr", 2e-5))
+        self.preserve_max_regression_abs = float(hparams.get("preserve_max_regression_abs", 0.015))
+        self.preserve_teacher_checkpoint = hparams.get("preserve_teacher_checkpoint", None)
+        if self.preserve_pretrained and self.unmasked_batch_prob < 0:
+            self.unmasked_batch_prob = 0.0
+        if self.preserve_pretrained and self.unmasked_batch_prob > 1:
+            self.unmasked_batch_prob = 1.0
+        if self.preserve_pretrained and self.note_encoder is not None and not self.musicbert_use_cached_embeddings:
+            has_trainable_note_encoder = any(p.requires_grad for p in self.note_encoder.parameters())
+            if has_trainable_note_encoder:
+                warnings.warn(
+                    "preserve_pretrained is enabled with a trainable runtime note encoder; "
+                    "teacher preservation will anchor graph/head behavior but not a separate frozen "
+                    "MusicBERT forward path. Prefer frozen/cached MusicBERT for strict no-regression.",
+                    RuntimeWarning,
+                )
+
+        # Non-registered teacher references (kept out of checkpoints/optimizers).
+        self.__dict__["_preserve_teacher_model"] = None
+        self.__dict__["_preserve_teacher_musicbert_proj"] = None
+        self.__dict__["_preserve_teacher_musicbert_gate"] = None
+        self._preserve_l2sp_anchor_ready = False
+        self._preserve_l2sp_anchor_params: Dict[str, torch.Tensor] = {}
+        self._graph_encoder_frozen_state: Optional[bool] = None
         
         self.current_task = self.main_tasks[0] if self.cl_training else self.main_tasks
         self.current_val_tasks = [self.main_tasks[0]] if self.cl_training else self.main_tasks
@@ -1822,7 +1863,7 @@ class ContinualAnalysisGNN(LightningModule):
 
         return input_ids_tensor, attention_mask_tensor, token2note_list, num_notes
 
-    def _compute_task_losses(self, batch):
+    def _compute_task_losses(self, batch, force_unmasked_batch: bool = False):
         x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
         batch_size = batch["note"].batch_size
         total_nodes = int(batch["note"].x.size(0))
@@ -1848,15 +1889,17 @@ class ContinualAnalysisGNN(LightningModule):
             batch=batch,
             batch_size=batch_size,
             device=device,
-            allow_sampling=True,
+            allow_sampling=not force_unmasked_batch,
         )
-        batch_conditioning = self._build_batch_masked_conditioning(
-            labels_dict=labels_dict,
-            node_mask=node_mask,
-            batch_size=batch_size,
-            total_nodes=total_nodes,
-            device=device,
-        )
+        batch_conditioning = None
+        if self.masked_prediction_train and not force_unmasked_batch:
+            batch_conditioning = self._build_batch_masked_conditioning(
+                labels_dict=labels_dict,
+                node_mask=node_mask,
+                batch_size=batch_size,
+                total_nodes=total_nodes,
+                device=device,
+            )
         label_context = self._build_model_label_context(
             conditioning=batch_conditioning,
             num_nodes=total_nodes,
@@ -1886,7 +1929,14 @@ class ContinualAnalysisGNN(LightningModule):
             mask_dict[task] = mask_valid[task]
         if not labels_dict:
             zero = torch.tensor(0.0, device=batch["note"].x.device)
-            return {}, zero, zero, zero
+            preserve_zero = {
+                "kd_loss": zero,
+                "feat_loss": zero,
+                "l2sp_loss": zero,
+                "student_nonmasked_acc": None,
+                "teacher_nonmasked_acc": None,
+            }
+            return {}, zero, zero, zero, preserve_zero
 
         x = self.model.encode(
             pitch_spelling=pitch_spelling,
@@ -1945,6 +1995,7 @@ class ContinualAnalysisGNN(LightningModule):
 
         logits_dict = self.model.forward_clf(x)
         logits_dict = {k: logits_dict[k][mask_dict[k]] for k in labels_dict.keys()}
+        logits_for_preserve = {k: v for k, v in logits_dict.items()}
 
         raw_task_node_masks = {}
         task_loss_masks = {}
@@ -1976,6 +2027,24 @@ class ContinualAnalysisGNN(LightningModule):
                         num_classes=self.task_dict.get(task),
                     )
 
+        preserve_losses = self._compute_preservation_losses(
+            batch=batch,
+            x_dict=x_dict,
+            pitch_spelling=pitch_spelling,
+            key_signature=key_signature,
+            edge_index_dict=edge_index_dict,
+            batch_dict=batch_dict,
+            batch_size=batch_size,
+            num_sampled_nodes_dict=num_sampled_nodes_dict,
+            num_sampled_edges_dict=num_sampled_edges_dict,
+            valid_label_mask=valid_label_mask,
+            labels_dict=labels_dict,
+            mask_dict=mask_dict,
+            raw_task_node_masks=raw_task_node_masks,
+            student_features=x,
+            student_logits=logits_for_preserve,
+        )
+
         node_mask_for_loss = task_loss_masks if task_loss_masks else None
         loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=node_mask_for_loss)
         task_losses = {k: loss_dict[k] for k in labels_dict.keys()}
@@ -2003,8 +2072,12 @@ class ContinualAnalysisGNN(LightningModule):
                 if context_indices.numel() > 0:
                     consistency = (task_logits[context_indices].argmax(-1) == task_labels[context_indices]).float().mean()
                     self.log(f"train/{task}_known_consistency", consistency, prog_bar=False)
+        if force_unmasked_batch:
+            self.log("train/unmasked_batch", 1.0, on_step=True, on_epoch=False, logger=True)
+        elif self.preserve_pretrained and self.masked_prediction_train:
+            self.log("train/unmasked_batch", 0.0, on_step=True, on_epoch=False, logger=True)
 
-        memory_loss = 0.0
+        memory_loss = torch.tensor(0.0, device=x.device)
         if len(self.previous_tasks) > 0:
             if self.lambda_dctn > 0:
                 x_mem = self.memory_model.encode(
@@ -2037,9 +2110,22 @@ class ContinualAnalysisGNN(LightningModule):
                 memory_loss += self.lambda_ewc * ewc_loss
 
         lambda_edge = self.hparams.get("lambda_edge", 0.05)
-        aux_loss = memory_loss + feature_loss * self.lambda_featl + edge_loss * lambda_edge
+        preserve_aux = torch.tensor(0.0, device=x.device)
+        if self.preserve_pretrained:
+            if self.preserve_kd_lambda > 0:
+                preserve_aux = preserve_aux + self.preserve_kd_lambda * preserve_losses["kd_loss"]
+            if self.preserve_feat_lambda > 0:
+                preserve_aux = preserve_aux + self.preserve_feat_lambda * preserve_losses["feat_loss"]
+            if self.preserve_l2sp_lambda > 0:
+                preserve_aux = preserve_aux + self.preserve_l2sp_lambda * preserve_losses["l2sp_loss"]
+            self.log("train/preserve_kd_loss", preserve_losses["kd_loss"], prog_bar=False)
+            self.log("train/preserve_feat_loss", preserve_losses["feat_loss"], prog_bar=False)
+            self.log("train/preserve_l2sp_loss", preserve_losses["l2sp_loss"], prog_bar=False)
+            if preserve_losses["student_nonmasked_acc"] is not None:
+                self.log("train/nonmasked_total_acc", preserve_losses["student_nonmasked_acc"], prog_bar=False)
+        aux_loss = memory_loss + feature_loss * self.lambda_featl + edge_loss * lambda_edge + preserve_aux
 
-        return task_losses, total_task_loss, aux_loss, feature_loss
+        return task_losses, total_task_loss, aux_loss, feature_loss, preserve_losses
 
     def _metric_safe_mask(self, labels: torch.Tensor, task_name: str) -> torch.Tensor:
         num_classes = self.task_dict[task_name]
@@ -2056,6 +2142,375 @@ class ContinualAnalysisGNN(LightningModule):
         if not torch.any(valid_mask):
             return None
         return metric(logits[valid_mask], labels[valid_mask])
+
+    def _should_use_unmasked_batch(self) -> bool:
+        if not self.training:
+            return False
+        if not self.preserve_pretrained:
+            return False
+        if not self.masked_prediction_train:
+            return False
+        if self.unmasked_batch_prob <= 0:
+            return False
+        if self.unmasked_batch_prob >= 1:
+            return True
+        return bool(torch.rand(1, device=self.device).item() < self.unmasked_batch_prob)
+
+    def _iter_l2sp_named_params(self):
+        for name, param in self.model.named_parameters():
+            yield f"model.{name}", param
+        if self.musicbert_proj is not None:
+            for name, param in self.musicbert_proj.named_parameters():
+                yield f"musicbert_proj.{name}", param
+        if self.musicbert_gate is not None:
+            for name, param in self.musicbert_gate.named_parameters():
+                yield f"musicbert_gate.{name}", param
+
+    def _init_l2sp_anchor_if_needed(self) -> None:
+        if not self.preserve_pretrained:
+            return
+        if self._preserve_l2sp_anchor_ready:
+            return
+        anchors: Dict[str, torch.Tensor] = {}
+        for name, param in self._iter_l2sp_named_params():
+            anchors[name] = param.detach().clone()
+        self._preserve_l2sp_anchor_params = anchors
+        self._preserve_l2sp_anchor_ready = True
+
+    def _compute_l2sp_penalty(self, device: torch.device) -> torch.Tensor:
+        if not self.preserve_pretrained or self.preserve_l2sp_lambda <= 0:
+            return torch.tensor(0.0, device=device)
+        self._init_l2sp_anchor_if_needed()
+        penalty = torch.tensor(0.0, device=device)
+        denom = 0
+        for name, param in self._iter_l2sp_named_params():
+            if not param.requires_grad:
+                continue
+            anchor = self._preserve_l2sp_anchor_params.get(name)
+            if anchor is None:
+                continue
+            if anchor.device != param.device:
+                anchor = anchor.to(param.device)
+                self._preserve_l2sp_anchor_params[name] = anchor
+            penalty = penalty + torch.sum((param - anchor) ** 2)
+            denom += int(param.numel())
+        if denom == 0:
+            return torch.tensor(0.0, device=device)
+        return penalty / float(denom)
+
+    @staticmethod
+    def _freeze_module_inplace(module: Optional[nn.Module]) -> None:
+        if module is None:
+            return
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+
+    @staticmethod
+    def _extract_prefixed_state_dict(state_dict: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        plen = len(prefix)
+        for key, value in state_dict.items():
+            if key.startswith(prefix):
+                out[key[plen:]] = value
+        return out
+
+    def _ensure_preservation_teacher_ready(self) -> None:
+        if not self.preserve_pretrained:
+            return
+        teacher_model = self.__dict__.get("_preserve_teacher_model", None)
+        if teacher_model is not None:
+            return
+
+        teacher_model = deepcopy(self.model)
+        teacher_musicbert_proj = deepcopy(self.musicbert_proj) if self.musicbert_proj is not None else None
+        teacher_musicbert_gate = deepcopy(self.musicbert_gate) if self.musicbert_gate is not None else None
+
+        teacher_ckpt = self.preserve_teacher_checkpoint
+        if teacher_ckpt:
+            if os.path.exists(teacher_ckpt):
+                try:
+                    checkpoint = torch.load(teacher_ckpt, map_location="cpu")
+                    ckpt_state = checkpoint.get("state_dict", checkpoint)
+                    model_state = self._extract_prefixed_state_dict(ckpt_state, "model.")
+                    if model_state:
+                        teacher_model.load_state_dict(model_state, strict=False)
+                    proj_state = self._extract_prefixed_state_dict(ckpt_state, "musicbert_proj.")
+                    if teacher_musicbert_proj is not None and proj_state:
+                        teacher_musicbert_proj.load_state_dict(proj_state, strict=False)
+                    gate_state = self._extract_prefixed_state_dict(ckpt_state, "musicbert_gate.")
+                    if teacher_musicbert_gate is not None and gate_state:
+                        teacher_musicbert_gate.load_state_dict(gate_state, strict=False)
+                except Exception as exc:
+                    warnings.warn(
+                        f"Failed to load preserve teacher checkpoint '{teacher_ckpt}': {exc}. "
+                        "Falling back to current student snapshot.",
+                        RuntimeWarning,
+                    )
+            else:
+                warnings.warn(
+                    f"preserve_teacher_checkpoint was set but path does not exist: {teacher_ckpt}. "
+                    "Using in-memory student snapshot as teacher.",
+                    RuntimeWarning,
+                )
+
+        self._freeze_module_inplace(teacher_model)
+        self._freeze_module_inplace(teacher_musicbert_proj)
+        self._freeze_module_inplace(teacher_musicbert_gate)
+
+        self.__dict__["_preserve_teacher_model"] = teacher_model
+        self.__dict__["_preserve_teacher_musicbert_proj"] = teacher_musicbert_proj
+        self.__dict__["_preserve_teacher_musicbert_gate"] = teacher_musicbert_gate
+
+    def _apply_teacher_musicbert_fusion(
+        self,
+        note_features: Optional[torch.Tensor],
+        note_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        teacher_proj = self.__dict__.get("_preserve_teacher_musicbert_proj", None)
+        teacher_gate = self.__dict__.get("_preserve_teacher_musicbert_gate", None)
+        if note_features is not None and note_embeddings.dtype != note_features.dtype:
+            note_embeddings = note_embeddings.to(note_features.dtype)
+        elif note_features is None:
+            note_dtype = self.model.project_dict["note"][0].weight.dtype
+            if note_embeddings.dtype != note_dtype:
+                note_embeddings = note_embeddings.to(note_dtype)
+        if note_features is None or self.musicbert_fusion == "replace":
+            return note_embeddings
+        if self.musicbert_fusion == "concat":
+            return torch.cat([note_features, note_embeddings], dim=-1)
+        if self.musicbert_fusion == "gate":
+            if teacher_proj is None or teacher_gate is None:
+                return note_embeddings
+            projected = teacher_proj(note_embeddings)
+            gate = teacher_gate(torch.cat([note_features, projected], dim=-1))
+            return gate * projected + (1.0 - gate) * note_features
+        return note_embeddings
+
+    def _encode_teacher_x_dict(self, batch, x_dict):
+        teacher_model = self.__dict__.get("_preserve_teacher_model", None)
+        if teacher_model is None:
+            return x_dict
+        if self.note_encoder is None and not self.musicbert_use_cached_embeddings:
+            return x_dict
+        note_embeddings = self._encode_notes_with_musicbert(batch)
+        note_features = x_dict.get("note") if isinstance(x_dict, dict) else None
+        fused = self._apply_teacher_musicbert_fusion(note_features, note_embeddings)
+        out = dict(x_dict)
+        out["note"] = fused
+        return out
+
+    def _resolve_preserve_tasks(self, labels_dict: Dict[str, torch.Tensor]) -> List[str]:
+        if not labels_dict:
+            return []
+        # Preserve masked tasks on non-target nodes, plus requested non-masked tasks.
+        tasks = []
+        cfg = [t for t in self.preserve_tasks if t]
+        if "all_nonmasked" in cfg:
+            tasks.extend([t for t in labels_dict.keys() if t not in self.masked_tasks])
+        else:
+            tasks.extend([t for t in cfg if t in labels_dict and t not in self.masked_tasks])
+        tasks.extend([t for t in self.masked_tasks if t in labels_dict])
+        dedup = []
+        seen = set()
+        for task in tasks:
+            if task in seen:
+                continue
+            seen.add(task)
+            dedup.append(task)
+        return dedup
+
+    def _build_kd_task_mask(
+        self,
+        task: str,
+        task_labels: torch.Tensor,
+        raw_task_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        valid = self._metric_safe_mask(task_labels, task)
+        if task not in self.masked_tasks:
+            return valid
+        # In masked mode, preserve masked-task behavior on non-target nodes only.
+        if raw_task_mask is None:
+            return valid
+        non_target = raw_task_mask < 0.9
+        return valid & non_target
+
+    def _compute_preservation_losses(
+        self,
+        *,
+        batch,
+        x_dict: Dict[str, torch.Tensor],
+        pitch_spelling: torch.Tensor,
+        key_signature: torch.Tensor,
+        edge_index_dict: Dict[Any, torch.Tensor],
+        batch_dict: Dict[str, torch.Tensor],
+        batch_size: int,
+        num_sampled_nodes_dict: Optional[Dict[str, torch.Tensor]],
+        num_sampled_edges_dict: Optional[Dict[str, torch.Tensor]],
+        valid_label_mask: torch.Tensor,
+        labels_dict: Dict[str, torch.Tensor],
+        mask_dict: Dict[str, torch.Tensor],
+        raw_task_node_masks: Dict[str, torch.Tensor],
+        student_features: torch.Tensor,
+        student_logits: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        device = student_features.device
+        zero = torch.tensor(0.0, device=device)
+        out = {
+            "kd_loss": zero,
+            "feat_loss": zero,
+            "l2sp_loss": zero,
+            "student_nonmasked_acc": None,
+            "teacher_nonmasked_acc": None,
+        }
+        if not self.preserve_pretrained:
+            return out
+        self._ensure_preservation_teacher_ready()
+        teacher_model = self.__dict__.get("_preserve_teacher_model", None)
+        if teacher_model is None:
+            return out
+
+        with torch.no_grad():
+            teacher_x_dict = self._encode_teacher_x_dict(batch, x_dict)
+            teacher_features = teacher_model.encode(
+                pitch_spelling=pitch_spelling,
+                key_signature=key_signature,
+                x_dict=teacher_x_dict,
+                edge_index_dict=edge_index_dict,
+                batch_dict=batch_dict,
+                batch_size=batch_size,
+                neighbor_mask_node=num_sampled_nodes_dict,
+                neighbor_mask_edge=num_sampled_edges_dict,
+                label_context=None,
+            )
+            teacher_features = teacher_features[valid_label_mask]
+            teacher_logits_all = teacher_model.forward_clf(teacher_features)
+            teacher_logits = {
+                task: teacher_logits_all[task][mask_dict[task]]
+                for task in labels_dict.keys()
+                if task in teacher_logits_all and task in mask_dict
+            }
+
+        if student_features.numel() > 0 and teacher_features.numel() > 0:
+            feat_n = min(student_features.size(0), teacher_features.size(0))
+            feat_c = min(student_features.size(1), teacher_features.size(1))
+            if feat_n > 0 and feat_c > 0:
+                out["feat_loss"] = F.mse_loss(
+                    student_features[:feat_n, :feat_c],
+                    teacher_features[:feat_n, :feat_c],
+                )
+
+        kd_terms = []
+        student_nonmasked_acc = []
+        teacher_nonmasked_acc = []
+        kd_tasks = self._resolve_preserve_tasks(labels_dict)
+        temp = max(self.preserve_temperature, 1e-6)
+        for task in kd_tasks:
+            if task not in student_logits or task not in teacher_logits or task not in labels_dict:
+                continue
+            if student_logits[task].shape != teacher_logits[task].shape:
+                continue
+            kd_mask = self._build_kd_task_mask(
+                task=task,
+                task_labels=labels_dict[task],
+                raw_task_mask=raw_task_node_masks.get(task),
+            )
+            if not torch.any(kd_mask):
+                continue
+            s_logits = student_logits[task][kd_mask]
+            t_logits = teacher_logits[task][kd_mask]
+            s_log_probs = F.log_softmax(s_logits / temp, dim=-1)
+            t_probs = F.softmax(t_logits / temp, dim=-1)
+            kd_term = F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (temp ** 2)
+            kd_terms.append(kd_term)
+
+            if task not in self.masked_tasks and task in self.accuracy_dict:
+                task_labels = labels_dict[task][kd_mask]
+                valid = self._metric_safe_mask(task_labels, task)
+                if torch.any(valid):
+                    student_nonmasked_acc.append(
+                        (s_logits[valid].argmax(-1) == task_labels[valid]).float().mean()
+                    )
+                    teacher_nonmasked_acc.append(
+                        (t_logits[valid].argmax(-1) == task_labels[valid]).float().mean()
+                    )
+
+        if kd_terms:
+            out["kd_loss"] = torch.stack(kd_terms).mean()
+        if student_nonmasked_acc:
+            out["student_nonmasked_acc"] = torch.stack(student_nonmasked_acc).mean()
+        if teacher_nonmasked_acc:
+            out["teacher_nonmasked_acc"] = torch.stack(teacher_nonmasked_acc).mean()
+        out["l2sp_loss"] = self._compute_l2sp_penalty(device=device)
+        return out
+
+    def _set_graph_encoder_trainable(self, trainable: bool) -> None:
+        modules = [
+            getattr(self.model, "pitch_embedding", None),
+            getattr(self.model, "key_embedding", None),
+            getattr(self.model, "project_dict", None),
+            getattr(self.model, "encoder", None),
+            getattr(self.model, "project_enc", None),
+            getattr(self.model, "no_gnn_note_mlp", None),
+            self.musicbert_proj,
+            self.musicbert_gate,
+        ]
+        for module in modules:
+            if module is None:
+                continue
+            for param in module.parameters():
+                param.requires_grad = trainable
+        self._pcgrad_shared_params_cache = None
+        self._pcgrad_head_params_cache = None
+
+    def _maybe_update_stage_freezing_and_lr(self) -> None:
+        if not self.preserve_pretrained:
+            return
+        epoch = int(self.current_epoch)
+        freeze_stage = max(int(self.freeze_graph_encoder_stage_epochs), 0)
+        freeze_now = freeze_stage > 0 and epoch < freeze_stage
+        if self._graph_encoder_frozen_state is None or self._graph_encoder_frozen_state != freeze_now:
+            self._set_graph_encoder_trainable(not freeze_now)
+            self._graph_encoder_frozen_state = freeze_now
+            if freeze_now:
+                print(
+                    f"[preserve_pretrained] Stage A active (epoch {epoch}): "
+                    "graph encoder frozen, training label-conditioning + heads."
+                )
+            else:
+                print(f"[preserve_pretrained] Graph encoder unfrozen at epoch {epoch}.")
+
+        # Optional staged LR override for preserve mode.
+        stage_b_end = freeze_stage + max(int(self.preserve_stage_b_epochs), 0)
+        if epoch < freeze_stage:
+            stage_lr = float(self.preserve_stage_a_lr)
+        elif epoch < stage_b_end:
+            stage_lr = float(self.preserve_stage_b_lr)
+        else:
+            stage_lr = float(self.preserve_stage_c_lr)
+        try:
+            optimizer = self.optimizers()
+        except Exception:
+            optimizer = None
+        if isinstance(optimizer, (list, tuple)):
+            optimizer = optimizer[0] if optimizer else None
+        if optimizer is not None:
+            for group in optimizer.param_groups:
+                group["lr"] = stage_lr
+            self.log("train/stage_lr", stage_lr, on_step=False, on_epoch=True, logger=True)
+
+    def on_fit_start(self) -> None:
+        self._init_l2sp_anchor_if_needed()
+        self._ensure_preservation_teacher_ready()
+
+    def on_train_epoch_start(self) -> None:
+        self._maybe_update_stage_freezing_and_lr()
+
+    def on_validation_start(self) -> None:
+        self._ensure_preservation_teacher_ready()
+
+    def on_test_start(self) -> None:
+        self._ensure_preservation_teacher_ready()
 
     def _gradnorm_shared_params(self):
         if hasattr(self.model, "project_dict") and "note" in self.model.project_dict:
@@ -2378,7 +2833,11 @@ class ContinualAnalysisGNN(LightningModule):
             self._manual_scheduler_step("step")
 
     def common_step(self, batch):
-        task_losses, total_task_loss, aux_loss, feature_loss = self._compute_task_losses(batch)
+        force_unmasked_batch = self._should_use_unmasked_batch()
+        task_losses, total_task_loss, aux_loss, feature_loss, _ = self._compute_task_losses(
+            batch,
+            force_unmasked_batch=force_unmasked_batch,
+        )
         if not task_losses:
             return torch.tensor(0.0, device=batch["note"].x.device)
         total_loss = total_task_loss + aux_loss
@@ -2430,7 +2889,11 @@ class ContinualAnalysisGNN(LightningModule):
             self._log_optimizer_stats(optimizer)
 
     def _training_step_conflict(self, batch):
-        task_losses, total_task_loss, aux_loss, feature_loss = self._compute_task_losses(batch)
+        force_unmasked_batch = self._should_use_unmasked_batch()
+        task_losses, total_task_loss, aux_loss, feature_loss, _ = self._compute_task_losses(
+            batch,
+            force_unmasked_batch=force_unmasked_batch,
+        )
         if not task_losses:
             return torch.tensor(0.0, device=batch["note"].x.device)
 
@@ -2461,7 +2924,11 @@ class ContinualAnalysisGNN(LightningModule):
         for _, batch in combined_batch.items():
             if batch is None:
                 continue
-            task_losses, _, aux_loss, feature_loss = self._compute_task_losses(batch)
+            force_unmasked_batch = self._should_use_unmasked_batch()
+            task_losses, _, aux_loss, feature_loss, _ = self._compute_task_losses(
+                batch,
+                force_unmasked_batch=force_unmasked_batch,
+            )
             if not task_losses:
                 continue
 
@@ -2564,19 +3031,21 @@ class ContinualAnalysisGNN(LightningModule):
             if not labels_dict:
                 continue
 
-            logits_dict = self.model(
-                    pitch_spelling=pitch_spelling,
-                    key_signature=key_signature,
-                    x_dict=x_dict,
-                    edge_index_dict=edge_index_dict,
-                    batch_dict=batch_dict,
-                    batch_size=batch_size,
-                    neighbor_mask_node=num_sampled_nodes_dict,
-                    neighbor_mask_edge=num_sampled_edges_dict,
-                    label_context=label_context,
-                )
-            logits_dict = {k: v[valid_label_mask] for k, v in logits_dict.items()}
+            x = self.model.encode(
+                pitch_spelling=pitch_spelling,
+                key_signature=key_signature,
+                x_dict=x_dict,
+                edge_index_dict=edge_index_dict,
+                batch_dict=batch_dict,
+                batch_size=batch_size,
+                neighbor_mask_node=num_sampled_nodes_dict,
+                neighbor_mask_edge=num_sampled_edges_dict,
+                label_context=label_context,
+            )
+            x = x[valid_label_mask]
+            logits_dict = self.model.forward_clf(x)
             logits_dict = {k: (v[mask_dict[k]] if k in mask_dict.keys() else v) for k, v in logits_dict.items()}
+            logits_for_preserve = {k: v for k, v in logits_dict.items()}
 
             raw_task_node_masks = {}
             task_loss_masks = {}
@@ -2608,6 +3077,23 @@ class ContinualAnalysisGNN(LightningModule):
                             num_classes=self.task_dict.get(task),
                         )
 
+            preserve_losses = self._compute_preservation_losses(
+                batch=batch,
+                x_dict=x_dict,
+                pitch_spelling=pitch_spelling,
+                key_signature=key_signature,
+                edge_index_dict=edge_index_dict,
+                batch_dict=batch_dict,
+                batch_size=batch_size,
+                num_sampled_nodes_dict=num_sampled_nodes_dict,
+                num_sampled_edges_dict=num_sampled_edges_dict,
+                valid_label_mask=valid_label_mask,
+                labels_dict=labels_dict,
+                mask_dict=mask_dict,
+                raw_task_node_masks=raw_task_node_masks,
+                student_features=x,
+                student_logits=logits_for_preserve,
+            )
             node_mask_for_loss = task_loss_masks if task_loss_masks else None
             loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=node_mask_for_loss)
             total_loss = loss_dict.pop("total") / len(labels_dict.keys())
@@ -2631,6 +3117,27 @@ class ContinualAnalysisGNN(LightningModule):
                     self.log(f"val/{k}_acc", accuracy_dict[k], batch_size=batch_size)
                 if k in f1_dict:
                     self.log(f"val/{k}_f1", f1_dict[k], batch_size=batch_size)
+            nonmasked_acc_values = [
+                accuracy_dict[t]
+                for t in labels_dict.keys()
+                if t in accuracy_dict and t not in self.masked_tasks
+            ]
+            if nonmasked_acc_values:
+                self.log(
+                    "val/nonmasked_total_acc",
+                    torch.stack(nonmasked_acc_values).mean(),
+                    batch_size=batch_size,
+                )
+            if self.preserve_pretrained:
+                self.log("val/preserve_kd_loss", preserve_losses["kd_loss"], batch_size=batch_size)
+                self.log("val/preserve_feat_loss", preserve_losses["feat_loss"], batch_size=batch_size)
+                self.log("val/preserve_l2sp_loss", preserve_losses["l2sp_loss"], batch_size=batch_size)
+                if preserve_losses["teacher_nonmasked_acc"] is not None:
+                    self.log(
+                        "val/nonmasked_teacher_total_acc",
+                        preserve_losses["teacher_nonmasked_acc"],
+                        batch_size=batch_size,
+                    )
             if self.masked_prediction_train:
                 masked_losses = [loss_dict[t] for t in self.masked_tasks if t in loss_dict]
                 if masked_losses:
@@ -2710,6 +3217,34 @@ class ContinualAnalysisGNN(LightningModule):
                     metric = float(metric)
                 self._manual_scheduler_step("epoch", metric=metric)
 
+        if self.preserve_pretrained:
+            student_acc = self.trainer.callback_metrics.get("val/nonmasked_total_acc", None)
+            teacher_acc = self.trainer.callback_metrics.get("val/nonmasked_teacher_total_acc", None)
+            if student_acc is not None and teacher_acc is not None:
+                if isinstance(student_acc, torch.Tensor):
+                    student_acc = float(student_acc.detach().cpu().item())
+                else:
+                    student_acc = float(student_acc)
+                if isinstance(teacher_acc, torch.Tensor):
+                    teacher_acc = float(teacher_acc.detach().cpu().item())
+                else:
+                    teacher_acc = float(teacher_acc)
+                regression = teacher_acc - student_acc
+                self.log(
+                    "val/nonmasked_acc_regression",
+                    regression,
+                    prog_bar=False,
+                    logger=True,
+                )
+                if regression > self.preserve_max_regression_abs:
+                    self.log("val/preserve_gate_failed", 1.0, prog_bar=True, logger=True)
+                    if self.trainer is not None:
+                        self.trainer.should_stop = True
+                    print(
+                        "[preserve_pretrained] stopping run: non-masked validation regression "
+                        f"{regression:.4f} exceeds threshold {self.preserve_max_regression_abs:.4f}."
+                    )
+
     def test_step(self, combined_batch, batch_idx) -> STEP_OUTPUT:
         for gtask_key, batch in combined_batch.items():
             if batch is None:
@@ -2779,7 +3314,7 @@ class ContinualAnalysisGNN(LightningModule):
             if not labels_dict:
                 continue
 
-            logits_dict = self.model(
+            x = self.model.encode(
                 pitch_spelling=pitch_spelling,
                 key_signature=key_signature,
                 x_dict=x_dict,
@@ -2790,8 +3325,10 @@ class ContinualAnalysisGNN(LightningModule):
                 neighbor_mask_edge=num_sampled_edges_dict,
                 label_context=label_context,
             )
-            logits_dict = {k: v[valid_label_mask] for k, v in logits_dict.items()}
+            x = x[valid_label_mask]
+            logits_dict = self.model.forward_clf(x)
             logits_dict = {k: (v[mask_dict[k]] if k in mask_dict.keys() else v) for k, v in logits_dict.items()}
+            logits_for_preserve = {k: v for k, v in logits_dict.items()}
 
             raw_task_node_masks = {}
             task_loss_masks = {}
@@ -2823,6 +3360,23 @@ class ContinualAnalysisGNN(LightningModule):
                             num_classes=self.task_dict.get(task),
                         )
 
+            preserve_losses = self._compute_preservation_losses(
+                batch=batch,
+                x_dict=x_dict,
+                pitch_spelling=pitch_spelling,
+                key_signature=key_signature,
+                edge_index_dict=edge_index_dict,
+                batch_dict=batch_dict,
+                batch_size=batch_size,
+                num_sampled_nodes_dict=num_sampled_nodes_dict,
+                num_sampled_edges_dict=num_sampled_edges_dict,
+                valid_label_mask=valid_label_mask,
+                labels_dict=labels_dict,
+                mask_dict=mask_dict,
+                raw_task_node_masks=raw_task_node_masks,
+                student_features=x,
+                student_logits=logits_for_preserve,
+            )
             logits_softmax_dict = {k: v.softmax(-1) for k, v in logits_dict.items()}
             node_mask_for_loss = task_loss_masks if task_loss_masks else None
             loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=node_mask_for_loss)
@@ -2841,6 +3395,25 @@ class ContinualAnalysisGNN(LightningModule):
                     f1_dict[task_name] = f1
 
             self.log("test/total_loss", total_loss.item(), add_dataloader_idx=True, batch_size=batch_size, prog_bar=True)
+            nonmasked_acc_values = [
+                accuracy_dict[t]
+                for t in labels_dict.keys()
+                if t in accuracy_dict and t not in self.masked_tasks
+            ]
+            if nonmasked_acc_values:
+                self.log(
+                    f"test/nonmasked_total_acc_{gtask_key}",
+                    torch.stack(nonmasked_acc_values).mean(),
+                    add_dataloader_idx=True,
+                    batch_size=batch_size,
+                )
+            if self.preserve_pretrained:
+                self.log(
+                    "test/preserve_kd_loss",
+                    preserve_losses["kd_loss"],
+                    add_dataloader_idx=True,
+                    batch_size=batch_size,
+                )
             if self.masked_prediction_train:
                 masked_losses = [loss_dict[t] for t in self.masked_tasks if t in loss_dict]
                 if masked_losses:
