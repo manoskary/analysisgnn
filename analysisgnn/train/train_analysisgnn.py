@@ -227,8 +227,20 @@ def get_parser():
         "--mt_conflict_method",
         type=str,
         default="pcgrad",
-        choices=["none", "pcgrad", "gradnorm"],
+        choices=["none", "pcgrad", "cagrad", "gradnorm"],
         help="Conflict mitigation for multitask losses.",
+    )
+    parser.add_argument(
+        "--cagrad_c",
+        type=float,
+        default=0.4,
+        help="CAGrad conflict-aversion strength (only used when mt_conflict_method=cagrad).",
+    )
+    parser.add_argument(
+        "--cagrad_max_iter",
+        type=int,
+        default=25,
+        help="Max simplex optimization steps for CAGrad (only used when mt_conflict_method=cagrad).",
     )
     parser.add_argument(
         "--gradnorm_alpha",
@@ -344,7 +356,8 @@ def main():
     if config.get("robust_profile", False):
         print("Applying robust profile defaults.")
         config["scheduler_type"] = "cosine_warmup"
-        config["mt_conflict_method"] = "pcgrad"
+        if config.get("mt_conflict_method", "none") == "none":
+            config["mt_conflict_method"] = "pcgrad"
         config["monitor_metric"] = "val/total_loss"
         config["monitor_mode"] = "min"
         config["early_stopping"] = True
@@ -355,13 +368,13 @@ def main():
         if use_cuda and ampere_or_newer:
             config["precision"] = "bf16-mixed" if torch.cuda.is_bf16_supported() else "16-mixed"
 
-    if config.get("mt_conflict_method") in {"pcgrad", "gradnorm"} and config.get("mt_strategy") == "wloss":
+    if config.get("mt_conflict_method") in {"pcgrad", "cagrad", "gradnorm"} and config.get("mt_strategy") == "wloss":
         print(
             "Warning: mt_conflict_method with mt_strategy=wloss is not supported cleanly. "
             "Switching mt_strategy to fixed (non-learned task weights)."
         )
         config["mt_strategy"] = "fixed"
-    if config.get("mt_conflict_method") in {"pcgrad", "gradnorm"} and config.get("mt_strategy") == "famo":
+    if config.get("mt_conflict_method") in {"pcgrad", "cagrad", "gradnorm"} and config.get("mt_strategy") == "famo":
         print(
             "Warning: mt_conflict_method and mt_strategy=famo are incompatible. "
             "Switching mt_strategy to fixed."
@@ -668,10 +681,10 @@ def main():
                 strict=False,
             )
         )
-    manual_optimization = config.get("mt_strategy") == "famo" or config.get("mt_conflict_method") in {"pcgrad", "gradnorm"}
+    manual_optimization = config.get("mt_strategy") == "famo" or config.get("mt_conflict_method") in {"pcgrad", "cagrad", "gradnorm"}
     if manual_optimization and int(config.get("accumulate_grad_batches", 1)) > 1:
         print(
-            "Warning: manual optimization (pcgrad/gradnorm/famo) does not support "
+            "Warning: manual optimization (pcgrad/cagrad/gradnorm/famo) does not support "
             "Trainer(accumulate_grad_batches>1). Forcing accumulate_grad_batches=1."
         )
         config["accumulate_grad_batches"] = 1

@@ -133,6 +133,152 @@ class PCGrad:
                 p.grad = p.grad + g.detach()
 
 
+class CAGrad:
+    """Conflict-Averse Gradient Descent (CAGrad) helper."""
+
+    def __init__(
+        self,
+        c: float = 0.4,
+        max_iter: int = 25,
+        eps: float = 1e-12,
+    ) -> None:
+        self.c = float(c)
+        self.max_iter = int(max_iter)
+        self.eps = float(eps)
+
+    @staticmethod
+    def _grads_dot(
+        grads_a: List[Optional[torch.Tensor]],
+        grads_b: List[Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        dot = None
+        for ga, gb in zip(grads_a, grads_b):
+            if ga is None or gb is None:
+                continue
+            term = (ga.float() * gb.float()).sum()
+            dot = term if dot is None else (dot + term)
+        if dot is None:
+            device = None
+            for g in grads_a + grads_b:
+                if g is not None:
+                    device = g.device
+                    break
+            if device is None:
+                device = torch.device("cpu")
+            return torch.tensor(0.0, device=device)
+        return dot
+
+    @staticmethod
+    def _project_simplex(v: torch.Tensor) -> torch.Tensor:
+        """Euclidean projection onto the probability simplex."""
+        if v.numel() == 1:
+            return torch.ones_like(v)
+        u, _ = torch.sort(v, descending=True)
+        cssv = torch.cumsum(u, dim=0) - 1.0
+        ind = torch.arange(1, v.numel() + 1, device=v.device, dtype=v.dtype)
+        cond = u - cssv / ind > 0
+        if not torch.any(cond):
+            return torch.full_like(v, 1.0 / float(v.numel()))
+        rho = int(torch.nonzero(cond, as_tuple=False)[-1].item())
+        theta = cssv[rho] / float(rho + 1)
+        w = torch.clamp(v - theta, min=0.0)
+        return w / (w.sum() + 1e-12)
+
+    def _solve_weights(self, gram: torch.Tensor) -> torch.Tensor:
+        """Solve min_w g0^T(Gw) + c||g0||||Gw|| s.t. w on simplex."""
+        n_tasks = gram.shape[0]
+        if n_tasks == 1:
+            return torch.ones(1, device=gram.device, dtype=gram.dtype)
+
+        with torch.no_grad():
+            b = torch.full((n_tasks,), 1.0 / float(n_tasks), device=gram.device, dtype=gram.dtype)
+            Ab = gram @ b
+            g0_norm = torch.sqrt(torch.clamp((b @ Ab), min=self.eps))
+            w = b.clone()
+
+            def _obj(x: torch.Tensor) -> torch.Tensor:
+                Ax = gram @ x
+                quad = torch.clamp(x @ Ax, min=self.eps)
+                return (Ab @ x) + self.c * g0_norm * torch.sqrt(quad)
+
+            for _ in range(self.max_iter):
+                Aw = gram @ w
+                gw_norm = torch.sqrt(torch.clamp((w @ Aw), min=self.eps))
+                grad = Ab + self.c * g0_norm * (Aw / (gw_norm + self.eps))
+                obj_curr = _obj(w)
+                step = 1.0
+                updated = False
+                for _ in range(20):
+                    cand = self._project_simplex(w - step * grad)
+                    if _obj(cand) <= obj_curr + 1e-12:
+                        w = cand
+                        updated = True
+                        break
+                    step *= 0.5
+                if not updated:
+                    break
+            return w
+
+    def combine_task_grads(
+        self,
+        task_grads: List[List[Optional[torch.Tensor]]],
+    ) -> List[Optional[torch.Tensor]]:
+        if not task_grads:
+            return []
+        if len(task_grads) == 1:
+            return task_grads[0]
+
+        n_tasks = len(task_grads)
+        device = None
+        dtype = None
+        for grads in task_grads:
+            for g in grads:
+                if g is not None:
+                    device = g.device
+                    dtype = torch.float32
+                    break
+            if device is not None:
+                break
+        if device is None:
+            return [None for _ in task_grads[0]]
+
+        gram = torch.zeros((n_tasks, n_tasks), device=device, dtype=dtype)
+        for i in range(n_tasks):
+            for j in range(i, n_tasks):
+                val = self._grads_dot(task_grads[i], task_grads[j]).to(dtype=dtype)
+                gram[i, j] = val
+                gram[j, i] = val
+
+        w = self._solve_weights(gram)
+        b = torch.full((n_tasks,), 1.0 / float(n_tasks), device=gram.device, dtype=gram.dtype)
+        g0_norm = torch.sqrt(torch.clamp((b @ gram @ b), min=self.eps))
+        gw_norm = torch.sqrt(torch.clamp((w @ gram @ w), min=self.eps))
+        lamb = self.c * g0_norm / (gw_norm + self.eps)
+
+        combined: List[Optional[torch.Tensor]] = []
+        n_params = len(task_grads[0])
+        for p_idx in range(n_params):
+            g0 = None
+            gw = None
+            for t in range(n_tasks):
+                gt = task_grads[t][p_idx]
+                if gt is None:
+                    continue
+                g0_term = gt / float(n_tasks)
+                gw_term = gt * w[t].to(dtype=gt.dtype)
+                g0 = g0_term if g0 is None else (g0 + g0_term)
+                gw = gw_term if gw is None else (gw + gw_term)
+            if g0 is None and gw is None:
+                combined.append(None)
+                continue
+            if g0 is None:
+                g0 = torch.zeros_like(gw)
+            if gw is None:
+                gw = torch.zeros_like(g0)
+            combined.append(g0 + lamb.to(dtype=g0.dtype) * gw)
+        return combined
+
+
 def onsetwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["cadence", "phrase", "root", "localkey", "quality", "inversion", "degree1", "degree2", "romanNumeral", "section"]):        
     if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
         batch_size = len(graph["note"].x) if batch_size is None else batch_size
@@ -1198,6 +1344,8 @@ class ContinualAnalysisGNN(LightningModule):
 
         self.mt_conflict_method = hparams.get("mt_conflict_method", "none")
         self.gradnorm_alpha = hparams.get("gradnorm_alpha", 1.5)
+        self.cagrad_c = float(hparams.get("cagrad_c", 0.4))
+        self.cagrad_max_iter = int(hparams.get("cagrad_max_iter", 25))
         self.grad_clip_val = float(hparams.get("grad_clip_val", 0.0))
         self.optimizer_stats_log_every_n_steps = int(hparams.get("optimizer_stats_log_every_n_steps", 50))
         self.monitor_metric = hparams.get("monitor_metric", "val/total_loss")
@@ -1214,7 +1362,7 @@ class ContinualAnalysisGNN(LightningModule):
         self.initial_task_losses = {}
         self._pcgrad_shared_params_cache: Optional[List[torch.nn.Parameter]] = None
         self._pcgrad_head_params_cache: Optional[List[torch.nn.Parameter]] = None
-        if self.mt_conflict_method in {"pcgrad", "gradnorm"} and self.mt_strategy != "famo":
+        if self.mt_conflict_method in {"pcgrad", "cagrad", "gradnorm"} and self.mt_strategy != "famo":
             self.automatic_optimization = False
             if self.mt_conflict_method == "gradnorm":
                 self.gradnorm_weights = nn.Parameter(torch.ones(len(self.task_list)))
@@ -2112,6 +2260,72 @@ class ContinualAnalysisGNN(LightningModule):
             opt.zero_grad()
             self._manual_scheduler_step("step")
 
+    def _apply_cagrad(self, task_losses: Union[Dict[str, torch.Tensor], List[torch.Tensor]], aux_loss: torch.Tensor):
+        opt = self.optimizers()
+        if opt is None:
+            return
+        should_step = self._should_step_optimizer()
+        losses = list(task_losses.values()) if isinstance(task_losses, dict) else list(task_losses)
+        losses = [loss for loss in losses if loss is not None]
+        if not losses:
+            return
+        aux_requires_grad = aux_loss is not None and getattr(aux_loss, "requires_grad", False)
+
+        shared_params, head_params = self._pcgrad_param_groups()
+        head_requires_grad = len(head_params) > 0
+
+        if not shared_params and not head_params:
+            loss_mean = torch.stack(losses).mean()
+            if aux_requires_grad:
+                self.manual_backward(loss_mean + aux_loss)
+            else:
+                self.manual_backward(loss_mean)
+        else:
+            if shared_params:
+                retain_for_heads = head_requires_grad or aux_requires_grad
+                if len(losses) == 1:
+                    grads = torch.autograd.grad(
+                        losses[0],
+                        shared_params,
+                        retain_graph=retain_for_heads,
+                        allow_unused=True,
+                    )
+                    self._accumulate_param_grads(shared_params, list(grads))
+                else:
+                    task_grads: List[List[Optional[torch.Tensor]]] = []
+                    for i, loss in enumerate(losses):
+                        keep_graph = retain_for_heads or (i < len(losses) - 1)
+                        grads = torch.autograd.grad(
+                            loss,
+                            shared_params,
+                            retain_graph=keep_graph,
+                            allow_unused=True,
+                        )
+                        task_grads.append([g for g in grads])
+                    cagrad = CAGrad(c=self.cagrad_c, max_iter=self.cagrad_max_iter)
+                    cagrad_grads = cagrad.combine_task_grads(task_grads)
+                    self._accumulate_param_grads(shared_params, cagrad_grads)
+
+            if head_params:
+                loss_mean = torch.stack(losses).mean()
+                head_grads = torch.autograd.grad(
+                    loss_mean,
+                    head_params,
+                    retain_graph=aux_requires_grad,
+                    allow_unused=True,
+                )
+                self._accumulate_param_grads(head_params, list(head_grads))
+
+            if aux_requires_grad:
+                self.manual_backward(aux_loss)
+
+        if should_step:
+            self._manual_clip_gradients(opt)
+            self._log_optimizer_stats(opt)
+            opt.step()
+            opt.zero_grad()
+            self._manual_scheduler_step("step")
+
     def _apply_gradnorm(self, task_losses: Dict[str, torch.Tensor], aux_loss: torch.Tensor):
         opt = self.optimizers()
         if opt is None:
@@ -2199,7 +2413,7 @@ class ContinualAnalysisGNN(LightningModule):
             return self.common_step(batch)
 
         if isinstance(batch, dict):
-            if self.mt_conflict_method == "pcgrad":
+            if self.mt_conflict_method in {"pcgrad", "cagrad"}:
                 return self._training_step_conflict_combined_pcgrad(batch)
             losses = []
             for _, bt in batch.items():
@@ -2222,6 +2436,9 @@ class ContinualAnalysisGNN(LightningModule):
 
         if self.mt_conflict_method == "pcgrad":
             self._apply_pcgrad(task_losses, aux_loss)
+            total_loss = (sum(task_losses.values()) / len(task_losses)) + aux_loss
+        elif self.mt_conflict_method == "cagrad":
+            self._apply_cagrad(task_losses, aux_loss)
             total_loss = (sum(task_losses.values()) / len(task_losses)) + aux_loss
         elif self.mt_conflict_method == "gradnorm":
             self._apply_gradnorm(task_losses, aux_loss)
@@ -2260,7 +2477,10 @@ class ContinualAnalysisGNN(LightningModule):
         if aux_total is None:
             aux_total = torch.tensor(0.0, device=task_loss_terms[0].device)
 
-        self._apply_pcgrad(task_loss_terms, aux_total)
+        if self.mt_conflict_method == "cagrad":
+            self._apply_cagrad(task_loss_terms, aux_total)
+        else:
+            self._apply_pcgrad(task_loss_terms, aux_total)
         task_loss_mean = torch.stack(task_loss_terms).mean()
         total_loss = task_loss_mean + aux_total
 
