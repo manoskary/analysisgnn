@@ -43,9 +43,15 @@ def resolve_device(device: str = "auto") -> torch.device:
     """Resolve a user-facing device string to a torch device."""
     value = (device or "auto").strip().lower()
     if value == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if value == "cuda" and not torch.cuda.is_available():
-        return torch.device("cpu")
+        value = "cuda" if torch.cuda.is_available() else "cpu"
+    if value == "cuda":
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        try:
+            _ = torch.zeros(1, device="cuda")
+            return torch.device("cuda")
+        except Exception:
+            return torch.device("cpu")
     return torch.device(value)
 
 

@@ -32,8 +32,15 @@ from analysisgnn.inference.hybrid_predictor import (
 )
 
 
-DEFAULT_FULL_CKPT = os.environ.get("ANALYSISGNN_FULL_CKPT", "")
-DEFAULT_MASKED_CKPT = os.environ.get("ANALYSISGNN_MASKED_CKPT", "")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_FULL_CKPT = os.environ.get(
+    "ANALYSISGNN_FULL_CKPT",
+    str(REPO_ROOT / "artifacts" / "gradio_checkpoints" / "uocj8f6y_full_last.ckpt"),
+)
+DEFAULT_MASKED_CKPT = os.environ.get(
+    "ANALYSISGNN_MASKED_CKPT",
+    str(REPO_ROOT / "artifacts" / "gradio_checkpoints" / "t7pxcwri_masked_last.ckpt"),
+)
 DEFAULT_TASKS = ",".join(DEFAULT_EDITABLE_TASKS)
 
 _PREDICTOR_CACHE: Dict[Tuple[str, str, str], HybridAnalysisPredictor] = {}

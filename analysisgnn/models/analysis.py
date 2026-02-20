@@ -3831,26 +3831,82 @@ class ContinualAnalysisGNN(LightningModule):
             # It's already a partitura score object
             score_obj = score
         
+        def _expected_note_input_dim() -> Optional[int]:
+            try:
+                note_proj = self.model.project_dict["note"][0]
+                if isinstance(note_proj, nn.Linear):
+                    return int(note_proj.in_features - 128)
+            except Exception:
+                return None
+            return None
+
+        def _align_note_feature_dim(x_note: torch.Tensor) -> torch.Tensor:
+            expected_dim = _expected_note_input_dim()
+            if expected_dim is None:
+                return x_note
+            current_dim = int(x_note.size(-1))
+            if current_dim == expected_dim:
+                return x_note
+            if current_dim > expected_dim:
+                warnings.warn(
+                    f"Inference note features ({current_dim}) exceed expected ({expected_dim}); truncating.",
+                    RuntimeWarning,
+                )
+                return x_note[..., :expected_dim]
+            warnings.warn(
+                f"Inference note features ({current_dim}) below expected ({expected_dim}); padding zeros.",
+                RuntimeWarning,
+            )
+            pad = torch.zeros(
+                (x_note.size(0), expected_dim - current_dim),
+                dtype=x_note.dtype,
+                device=x_note.device,
+            )
+            return torch.cat([x_note, pad], dim=-1)
+
         # Process the score directly without saving to file
         try:
             # Get the note array with all required features
-            note_array = score_obj.note_array(
+            note_array_raw = score_obj.note_array(
                 include_time_signature=True, 
                 include_pitch_spelling=True,
                 include_key_signature=True, 
                 include_staff=True, 
                 include_metrical_position=True
             )
-            note_array = np.sort(note_array, order=["onset_div", "pitch"])
+            sort_idx = np.argsort(note_array_raw, order=["onset_div", "pitch"])
+            note_array = note_array_raw[sort_idx]
             
             # Get measures and part
             measures = score_obj[-1].measures            
             
-            # Select features (using default "voice" feature type)
-            note_features = select_features(note_array, "voice")
+            # Select features using the training feature type when available.
+            feature_type = "simple"
+            try:
+                feature_type = str(self.hparams.get("feature_type", "simple"))
+            except Exception:
+                feature_type = "simple"
+            try:
+                note_features = select_features(score_obj, feature_type)
+                if not isinstance(note_features, np.ndarray):
+                    note_features = np.asarray(note_features)
+                if len(note_features) != len(note_array_raw):
+                    raise ValueError(
+                        f"Feature extractor produced {len(note_features)} rows for {len(note_array_raw)} notes "
+                        f"(feature_type='{feature_type}')."
+                    )
+                note_features = note_features[sort_idx]
+            except Exception as feature_exc:
+                warnings.warn(
+                    f"Feature extraction with feature_type='{feature_type}' failed ({feature_exc}); "
+                    "falling back to voice features.",
+                    RuntimeWarning,
+                )
+                note_features = select_features(note_array, "voice")
             
             # Create graph data
             data = create_score_graph(note_features, note_array, measures=measures, add_beats=True, labels=None)
+            data = data.to(self.device)
             
             # Add pitch spelling and key signature encodings
             pitch_encoder = PitchEncoder()
@@ -3858,14 +3914,14 @@ class ContinualAnalysisGNN(LightningModule):
             labels_ps = pitch_encoder.encode(note_array)
             labels_ks = ks_encoder.encode(note_array)
             
-            data["note"].pitch_spelling = torch.from_numpy(labels_ps).long()
-            data["note"].key_signature = torch.from_numpy(labels_ks).long()
-            data["note"].voice = torch.from_numpy(note_array["voice"]).long()
-            data["note"].staff = torch.from_numpy(note_array["staff"]).long()
+            data["note"].pitch_spelling = torch.from_numpy(labels_ps).long().to(self.device)
+            data["note"].key_signature = torch.from_numpy(labels_ks).long().to(self.device)
+            data["note"].voice = torch.from_numpy(note_array["voice"]).long().to(self.device)
+            data["note"].staff = torch.from_numpy(note_array["staff"]).long().to(self.device)
             
             # Add batch information for single score (all nodes belong to batch 0)
             batch_size = data["note"].x.size(0)
-            data["note"].batch = torch.zeros(batch_size, dtype=torch.long)
+            data["note"].batch = torch.zeros(batch_size, dtype=torch.long, device=self.device)
 
             node_mask, overrides, conditioning = normalize_user_edits_to_masked_conditioning(
                 user_edits=user_edits,
@@ -3879,6 +3935,7 @@ class ContinualAnalysisGNN(LightningModule):
             x_dict = data.x_dict
             edge_index_dict = data.edge_index_dict
             batch_dict = data.batch_dict
+            x_dict["note"] = _align_note_feature_dim(x_dict["note"])
             pitch_spelling = data["note"].pitch_spelling
             key_signature = data["note"].key_signature
             
