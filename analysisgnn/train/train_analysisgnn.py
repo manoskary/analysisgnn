@@ -870,9 +870,19 @@ def main():
             require_cached_embeddings=config.get("musicbert_require_cached_embeddings", False),
         )
         datamodule.setup()
-        # Test on best model
-        if config["load_from_checkpoint"] and config["checkpoint_path"] is not None:
-            trainer.test(model, datamodule=datamodule, ckpt_path=config["checkpoint_path"])
+        # Test on the checkpoint produced by the current run when training happened in this process.
+        if args.do_train:
+            ckpt_path = checkpoint_callback.best_model_path
+            if not ckpt_path:
+                ckpt_path = checkpoint_callback.last_model_path or "last"
+            trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
+        elif config["load_from_checkpoint"] and config["checkpoint_path"] is not None:
+            # For eval-only with masked conditioning enabled, keep the in-memory model loaded
+            # with strict=False compatibility instead of forcing strict checkpoint restore.
+            if config.get("masked_prediction_train", False):
+                trainer.test(model, datamodule=datamodule, ckpt_path=None)
+            else:
+                trainer.test(model, datamodule=datamodule, ckpt_path=config["checkpoint_path"])
         else:
             ckpt_path = checkpoint_callback.best_model_path if checkpoint_callback.best_model_path else "last"
             trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path)
