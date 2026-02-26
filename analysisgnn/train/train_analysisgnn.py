@@ -371,6 +371,51 @@ def _get_primary_cuda_major() -> int:
         return 0
 
 
+def _validate_selected_cuda_devices(gpus_arg: str) -> None:
+    if gpus_arg == "-1" or not torch.cuda.is_available():
+        return
+    try:
+        device_ids = [int(eval(gpu)) for gpu in gpus_arg.split(",")]
+    except Exception as exc:
+        raise ValueError(f"Invalid --gpus value '{gpus_arg}'. Expected '-1' or comma-separated integers.") from exc
+    device_count = torch.cuda.device_count()
+    for device_id in device_ids:
+        if device_id < 0 or device_id >= device_count:
+            raise ValueError(
+                f"Requested CUDA device index {device_id} is out of range for visible device count={device_count}. "
+                "If you are using CUDA_VISIBLE_DEVICES, --gpus indices are relative to the visible subset."
+            )
+    supported_arches = set(torch.cuda.get_arch_list())
+    supported_sms = []
+    for arch in supported_arches:
+        if not arch.startswith("sm_"):
+            continue
+        try:
+            supported_sms.append(int(arch.split("_", 1)[1]))
+        except ValueError:
+            continue
+    supported_majors = {sm // 10 for sm in supported_sms}
+    max_supported_major = max(supported_majors) if supported_majors else None
+    unsupported = []
+    for device_id in device_ids:
+        major, minor = torch.cuda.get_device_capability(device_id)
+        sm = f"sm_{major}{minor}"
+        # Be tolerant of minor revisions (e.g., sm_89 vs sm_90) as long as major arch
+        # is known/supported by the build. Hard-fail only on truly new major arches.
+        if max_supported_major is None or major not in supported_majors or major > max_supported_major:
+            unsupported.append((device_id, torch.cuda.get_device_name(device_id), sm))
+    if unsupported:
+        unsupported_desc = ", ".join(
+            f"index={idx} name='{name}' capability={sm}" for idx, name, sm in unsupported
+        )
+        raise RuntimeError(
+            "Selected CUDA device is not supported by this PyTorch build. "
+            f"Unsupported device(s): {unsupported_desc}. "
+            f"PyTorch supports: {sorted(supported_arches)}. "
+            "Pick a different GPU, or install a PyTorch build that supports your GPU architecture."
+        )
+
+
 def _infer_cached_embedding_dim(cache_dir: str) -> int:
     cache_path = Path(cache_dir)
     if not cache_path.exists():
@@ -407,6 +452,7 @@ def main():
     config = vars(args)
     config["task_dict"] = TASK_DICT
     config["use_edge_loss"] = config.get("use_edge_loss", False)
+    _validate_selected_cuda_devices(config["gpus"])
     use_cuda = config["gpus"] != "-1" and torch.cuda.is_available()
     cuda_major = _get_primary_cuda_major() if use_cuda else 0
     ampere_or_newer = cuda_major >= 8
@@ -636,11 +682,27 @@ def main():
             config["preserve_teacher_checkpoint"] = config["checkpoint_path"]
         ckpt = torch.load(config["checkpoint_path"], map_location="cpu")
         ckpt_state = ckpt.get("state_dict", {})
+        ckpt_hparams = ckpt.get("hyper_parameters", {}) if isinstance(ckpt, dict) else {}
         has_note_encoder = any(key.startswith("note_encoder.") for key in ckpt_state.keys())
         has_label_conditioning = any(
             key.startswith("label_condition_embeddings.") or key.startswith("label_condition_fusion.")
             for key in ckpt_state.keys()
         )
+        has_wloss_params = any(key == "clf_loss.params" or key.startswith("clf_loss.params.") for key in ckpt_state.keys())
+        ckpt_mt_strategy = ckpt_hparams.get("mt_strategy", None)
+        current_mt_strategy = config.get("mt_strategy", None)
+        mt_strategy_mismatch = (
+            (current_mt_strategy == "wloss" and not has_wloss_params)
+            or (current_mt_strategy != "wloss" and has_wloss_params)
+            or (ckpt_mt_strategy is not None and ckpt_mt_strategy != current_mt_strategy)
+        )
+        if mt_strategy_mismatch:
+            print(
+                "Warning: checkpoint/model mt_strategy mismatch "
+                f"(checkpoint={ckpt_mt_strategy}, current={current_mt_strategy}, "
+                f"checkpoint_has_wloss_params={has_wloss_params}). "
+                "Loading with strict=False."
+            )
         if has_note_encoder and note_encoder is None and not config.get("musicbert_use_cached_embeddings", False):
             raise ValueError(
                 "Checkpoint contains MusicBERT note encoder weights, but --use_musicbert "
@@ -654,6 +716,8 @@ def main():
                 strict = False
             if has_label_conditioning and not config.get("masked_prediction_train", False):
                 strict = False
+            if mt_strategy_mismatch:
+                strict = False
             model = ContinualAnalysisGNN.load_from_checkpoint(
                 config["checkpoint_path"],
                 hparams=config,
@@ -665,6 +729,8 @@ def main():
             if config.get("masked_prediction_train", False) and not has_label_conditioning:
                 strict = False
             if has_label_conditioning and not config.get("masked_prediction_train", False):
+                strict = False
+            if mt_strategy_mismatch:
                 strict = False
             model = ContinualAnalysisGNN.load_from_checkpoint(
                 config["checkpoint_path"],
