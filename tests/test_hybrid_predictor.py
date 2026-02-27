@@ -54,3 +54,37 @@ def test_build_mask_inputs_from_table_edits():
     assert user_edits["node_mask"]["targets"] == [1]
     assert "romanNumeral" in user_edits["label_overrides"]
     assert user_edits["label_overrides"]["romanNumeral"]["indices"] == [0, 2]
+
+
+def test_hybrid_predictor_passes_iterative_args(monkeypatch):
+    class _DummyModel:
+        def __init__(self):
+            self.kwargs = None
+
+        def eval(self):
+            return self
+
+        def to(self, device):
+            return self
+
+        def predict(self, score, **kwargs):
+            self.kwargs = kwargs
+            return {"romanNumeral": score}
+
+    dummy = _DummyModel()
+    monkeypatch.setattr(HybridAnalysisPredictor, "_load_checkpoint", lambda self, path: dummy)
+
+    predictor = HybridAnalysisPredictor(
+        full_checkpoint_path=__file__,
+        masked_checkpoint_path=__file__,
+        device="cpu",
+    )
+    out = predictor.predict(
+        score="ok",
+        iterative_spec={"enabled": True, "steps": 2},
+        return_iterative_trace=True,
+    )
+    assert out == {"romanNumeral": "ok"}
+    assert dummy.kwargs is not None
+    assert dummy.kwargs["iterative_spec"]["enabled"] is True
+    assert dummy.kwargs["return_iterative_trace"] is True

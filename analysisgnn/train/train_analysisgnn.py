@@ -185,6 +185,58 @@ def get_parser():
         choices=["single_pass"],
         help="Feedback loop mode for label conditioning.",
     )
+    parser.add_argument(
+        "--iterative_refine_train",
+        action="store_true",
+        help="Enable 2-step self-conditioning refinement during masked-prediction training.",
+    )
+    parser.add_argument(
+        "--iterative_train_steps",
+        type=int,
+        default=2,
+        help="Number of refinement passes during training (v1 supports up to 2).",
+    )
+    parser.add_argument(
+        "--iterative_train_keep_ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of highest-confidence target nodes frozen as pseudo-known for pass-2.",
+    )
+    parser.add_argument(
+        "--iterative_train_pass2_weight",
+        type=float,
+        default=1.0,
+        help="Loss weight for pass-2 masked loss.",
+    )
+    parser.add_argument(
+        "--iterative_train_consistency_lambda",
+        type=float,
+        default=0.1,
+        help="KL consistency weight between pass-1 and pass-2 on pseudo-frozen nodes.",
+    )
+    parser.add_argument(
+        "--iterative_eval",
+        action="store_true",
+        help="Enable LLaDA-style iterative refinement during validation/test (no known labels at step 1).",
+    )
+    parser.add_argument(
+        "--iterative_eval_steps",
+        type=int,
+        default=10,
+        help="Number of refinement steps for iterative evaluation.",
+    )
+    parser.add_argument(
+        "--iterative_eval_keep_percentile",
+        type=float,
+        default=10.0,
+        help="Percentile of highest-confidence remaining nodes to freeze per step in iterative evaluation.",
+    )
+    parser.add_argument(
+        "--iterative_eval_tasks",
+        type=str,
+        default="",
+        help="Comma-separated task list for iterative evaluation refinement; defaults to masked_tasks or all available.",
+    )
     parser.add_argument("--use_musicbert", action="store_true", help="Use MusicBERT note encoder")
     parser.add_argument("--musicbert_model_name", type=str, default="manoskary/musicbert-large", help="MusicBERT model name")
     parser.add_argument(
@@ -440,6 +492,7 @@ def main():
     args = parser.parse_args()
     args.main_tasks = args.main_tasks.split(",")
     args.masked_tasks = [t.strip() for t in args.masked_tasks.split(",") if t.strip()]
+    args.iterative_eval_tasks = [t.strip() for t in args.iterative_eval_tasks.split(",") if t.strip()]
     args.preserve_tasks = [t.strip() for t in args.preserve_tasks.split(",") if t.strip()]
     args.num_epochs = args.num_epochs.split(",")
     if len(args.num_epochs) == 1:
@@ -482,6 +535,10 @@ def main():
 
     if isinstance(config.get("masked_tasks", []), str):
         config["masked_tasks"] = [t.strip() for t in config["masked_tasks"].split(",") if t.strip()]
+    if isinstance(config.get("iterative_eval_tasks", []), str):
+        config["iterative_eval_tasks"] = [
+            t.strip() for t in config["iterative_eval_tasks"].split(",") if t.strip()
+        ]
     if isinstance(config.get("preserve_tasks", []), str):
         config["preserve_tasks"] = [t.strip() for t in config["preserve_tasks"].split(",") if t.strip()]
     if not config.get("preserve_tasks"):
@@ -529,6 +586,29 @@ def main():
             raise ValueError(f"Unknown masked task(s): {unknown_tasks}")
         if config.get("feedback_mode", "single_pass") != "single_pass":
             raise ValueError("Only --feedback_mode single_pass is currently supported.")
+    if config.get("iterative_refine_train", False):
+        steps = int(config.get("iterative_train_steps", 2))
+        if steps < 1:
+            raise ValueError("--iterative_train_steps must be >= 1.")
+        if steps > 2:
+            print("Warning: iterative_train_steps>2 not supported in v1; clamping to 2.")
+            config["iterative_train_steps"] = 2
+        keep_ratio = float(config.get("iterative_train_keep_ratio", 0.5))
+        if keep_ratio < 0 or keep_ratio > 1:
+            raise ValueError("--iterative_train_keep_ratio must be in [0, 1].")
+        if not config.get("masked_prediction_train", False):
+            print("Warning: --iterative_refine_train requires masked prediction; disabling iterative refine train.")
+            config["iterative_refine_train"] = False
+    if config.get("iterative_eval", False):
+        eval_steps = int(config.get("iterative_eval_steps", 10))
+        if eval_steps < 1:
+            raise ValueError("--iterative_eval_steps must be >= 1.")
+        keep_pct = float(config.get("iterative_eval_keep_percentile", 10.0))
+        if keep_pct < 0 or keep_pct > 100:
+            raise ValueError("--iterative_eval_keep_percentile must be in [0, 100].")
+        unknown_eval_tasks = [t for t in config.get("iterative_eval_tasks", []) if t not in TASK_DICT]
+        if unknown_eval_tasks:
+            raise ValueError(f"Unknown iterative eval task(s): {unknown_eval_tasks}")
     if config.get("preserve_pretrained", False):
         if not config.get("masked_prediction_train", False):
             print(
@@ -782,6 +862,7 @@ def main():
         masked_tag = "masked" if config.get("masked_prediction_train", False) else "nomasked"
         masked_tasks_tag = "-".join(config.get("masked_tasks", [])) if config.get("masked_prediction_train", False) else "none"
         preserve_tag = "preserve" if config.get("preserve_pretrained", False) else "nopreserve"
+        iterative_tag = "iterrefine" if config.get("iterative_refine_train", False) else "noiterrefine"
         phase = "train+eval" if args.do_train and args.do_eval else ("train" if args.do_train else ("eval" if args.do_eval else "run"))
         ckpt_tag = ""
         if args.do_eval and not args.do_train and config.get("checkpoint_path"):
@@ -797,6 +878,7 @@ def main():
                 f"-{masked_tag}"
                 f"-mtasks={masked_tasks_tag}"
                 f"-{preserve_tag}"
+                f"-{iterative_tag}"
                 f"-sched={config['scheduler_type']}"
                 f"-conf={config['mt_conflict_method']}"
                 f"-ep={config['num_epochs']}"
@@ -805,7 +887,7 @@ def main():
             )
         group = (
             f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-"
-            f"{masked_tag}-{masked_tasks_tag}-{preserve_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
+            f"{masked_tag}-{masked_tasks_tag}-{preserve_tag}-{iterative_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
         )
         job_type = phase
         user_tags = args.tags.split(",") if args.tags != "" else []
@@ -821,6 +903,7 @@ def main():
                 masked_tag,
                 masked_tasks_tag,
                 preserve_tag,
+                iterative_tag,
                 config["scheduler_type"],
                 config["mt_conflict_method"],
             ] + user_tags

@@ -15,6 +15,7 @@ The workflow is designed for iterative editing:
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -177,6 +178,37 @@ def _apply_timing_from_predictions(df: pd.DataFrame, predictions: Dict[str, torc
     return out
 
 
+def _build_iterative_spec(
+    enable_iterative: bool,
+    iterative_steps: int,
+    keep_percentile_per_step: float,
+    tasks: List[str],
+    target_only_update: bool,
+) -> Dict[str, Any]:
+    return {
+        "enabled": bool(enable_iterative),
+        "steps": int(max(1, iterative_steps)),
+        "keep_percentile_per_step": float(max(0.0, min(100.0, keep_percentile_per_step))),
+        "masked_tasks": list(tasks),
+        "mode": "cumulative",
+        "freeze_confidence": "joint_mean",
+        "target_only_update": bool(target_only_update),
+        "min_remaining_targets": 0,
+        "confidence_temperature": 1.0,
+    }
+
+
+def _format_trace(trace: Dict[str, Any], show_trace: bool) -> str:
+    if not show_trace:
+        return ""
+    if not trace:
+        return "{}"
+    try:
+        return json.dumps(trace, indent=2)
+    except Exception:
+        return str(trace)
+
+
 def run_full_inference(
     score_file: Any,
     full_ckpt: str,
@@ -184,6 +216,10 @@ def run_full_inference(
     device: str,
     task_labels: List[str],
     tasks_csv: str,
+    enable_iterative: bool,
+    iterative_steps: int,
+    keep_percentile_per_step: float,
+    show_trace: bool,
 ):
     try:
         score_path = _resolve_score_path(score_file)
@@ -191,12 +227,26 @@ def run_full_inference(
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
         predictor = _get_predictor(full_ckpt, masked_ckpt, device)
 
+        iterative_spec = _build_iterative_spec(
+            enable_iterative=enable_iterative,
+            iterative_steps=iterative_steps,
+            keep_percentile_per_step=keep_percentile_per_step,
+            tasks=tasks,
+            target_only_update=False,
+        )
         with torch.no_grad():
-            predictions, routing = predictor.predict(
+            output, routing = predictor.predict(
                 score,
                 force_route="full",
+                iterative_spec=iterative_spec,
+                return_iterative_trace=bool(enable_iterative),
                 return_route=True,
             )
+        if enable_iterative:
+            predictions, trace = output
+        else:
+            predictions = output
+            trace = {"enabled": False, "steps": []}
 
         full_df = predictions_to_dataframe(
             score=score,
@@ -212,9 +262,9 @@ def run_full_inference(
             f"Full inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
             f"Rows={len(display_df)} tasks={','.join(tasks)}"
         )
-        return display_df, status
+        return display_df, status, _format_trace(trace, show_trace)
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}"
+        return pd.DataFrame(), f"Error: {exc}", ""
 
 
 def run_partial_rerender(
@@ -227,6 +277,11 @@ def run_partial_rerender(
     known_rows_expr: str,
     target_rows_expr: str,
     edited_table: Any,
+    enable_iterative: bool,
+    iterative_steps: int,
+    keep_percentile_per_step: float,
+    target_only_update: bool,
+    show_trace: bool,
 ):
     try:
         score_path = _resolve_score_path(score_file)
@@ -242,13 +297,27 @@ def run_partial_rerender(
             target_rows_expr=target_rows_expr,
         )
 
+        iterative_spec = _build_iterative_spec(
+            enable_iterative=enable_iterative,
+            iterative_steps=iterative_steps,
+            keep_percentile_per_step=keep_percentile_per_step,
+            tasks=tasks,
+            target_only_update=target_only_update,
+        )
         with torch.no_grad():
-            predictions, routing = predictor.predict(
+            output, routing = predictor.predict(
                 score,
                 user_edits=user_edits,
                 masked_spec=masked_spec,
+                iterative_spec=iterative_spec,
+                return_iterative_trace=bool(enable_iterative),
                 return_route=True,
             )
+        if enable_iterative:
+            predictions, trace = output
+        else:
+            predictions = output
+            trace = {"enabled": False, "steps": []}
 
         out_df = predictions_to_dataframe(
             score=score,
@@ -264,9 +333,9 @@ def run_partial_rerender(
             f"Partial inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
             f"Known rows={info.get('num_known', 0)} target rows={info.get('num_targets', 0)}"
         )
-        return display_df, status
+        return display_df, status, _format_trace(trace, show_trace)
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}"
+        return pd.DataFrame(), f"Error: {exc}", ""
 
 
 def build_demo() -> gr.Blocks:
@@ -306,6 +375,30 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             rerun_partial_btn = gr.Button("Re-predict From Edits", variant="secondary")
 
         with gr.Row():
+            enable_iterative = gr.Checkbox(
+                label="Enable Iterative Refinement",
+                value=False,
+            )
+            iterative_steps = gr.Number(
+                label="Refinement Steps",
+                value=10,
+                precision=0,
+            )
+            keep_percentile_per_step = gr.Number(
+                label="Keep Percentile/Step",
+                value=10.0,
+            )
+        with gr.Row():
+            target_only_update = gr.Checkbox(
+                label="Target-only overwrite (partial mode)",
+                value=True,
+            )
+            show_trace = gr.Checkbox(
+                label="Show Iteration Trace",
+                value=False,
+            )
+
+        with gr.Row():
             known_rows_expr = gr.Textbox(
                 label="Known Rows (1-based)",
                 value="",
@@ -323,11 +416,23 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             wrap=True,
         )
         status = gr.Textbox(label="Status", interactive=False)
+        trace_output = gr.Textbox(label="Iteration Trace", interactive=False, lines=12)
 
         run_full_btn.click(
             fn=run_full_inference,
-            inputs=[score_file, full_ckpt, masked_ckpt, device, task_selector, tasks_csv],
-            outputs=[table, status],
+            inputs=[
+                score_file,
+                full_ckpt,
+                masked_ckpt,
+                device,
+                task_selector,
+                tasks_csv,
+                enable_iterative,
+                iterative_steps,
+                keep_percentile_per_step,
+                show_trace,
+            ],
+            outputs=[table, status, trace_output],
         )
 
         rerun_partial_btn.click(
@@ -342,8 +447,13 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 known_rows_expr,
                 target_rows_expr,
                 table,
+                enable_iterative,
+                iterative_steps,
+                keep_percentile_per_step,
+                target_only_update,
+                show_trace,
             ],
-            outputs=[table, status],
+            outputs=[table, status, trace_output],
         )
 
     return demo
