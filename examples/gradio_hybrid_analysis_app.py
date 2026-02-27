@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import gradio as gr
+import numpy as np
 import pandas as pd
 import partitura as pt
 import torch
@@ -42,6 +43,27 @@ DEFAULT_MASKED_CKPT = os.environ.get(
     str(REPO_ROOT / "artifacts" / "gradio_checkpoints" / "t7pxcwri_masked_last.ckpt"),
 )
 DEFAULT_TASKS = ",".join(DEFAULT_EDITABLE_TASKS)
+AVAILABLE_TASKS: Dict[str, str] = {
+    "cadence": "Cadence Detection",
+    "localkey": "Local Key",
+    "tonkey": "Tonalized Key",
+    "quality": "Chord Quality",
+    "root": "Chord Root",
+    "bass": "Bass Note",
+    "inversion": "Chord Inversion",
+    "degree1": "Primary Degree",
+    "degree2": "Secondary Degree",
+    "romanNumeral": "Roman Numeral Analysis",
+    "phrase": "Phrase Segmentation",
+    "section": "Section Detection",
+    "hrhythm": "Harmonic Rhythm",
+    "pcset": "Pitch-Class Set",
+    "tpc_in_label": "Non-Chord Tone (NCT)",
+    "note_degree": "Note Degree",
+}
+TASK_ALIASES: Dict[str, str] = {
+    "hrythm": "hrhythm",
+}
 
 _PREDICTOR_CACHE: Dict[Tuple[str, str, str], HybridAnalysisPredictor] = {}
 
@@ -88,11 +110,71 @@ def _get_predictor(full_ckpt: str, masked_ckpt: str, device: str) -> HybridAnaly
     return _PREDICTOR_CACHE[key]
 
 
-def _select_display_columns(df: pd.DataFrame, tasks: List[str]) -> pd.DataFrame:
-    base_cols = [c for c in ["row", "note_id", "measure", "onset_beat", "duration_beat", "pitch_spelling", "pitch_midi"] if c in df.columns]
-    task_cols = [task for task in tasks if task in df.columns]
-    cols = base_cols + task_cols
-    return df[cols] if cols else df
+def _resolve_selected_tasks(task_labels: List[str], tasks_csv: str) -> List[str]:
+    label_to_task = {v: k for k, v in AVAILABLE_TASKS.items()}
+    if task_labels:
+        tasks = [label_to_task[label] for label in task_labels if label in label_to_task]
+    else:
+        tasks = parse_task_csv(tasks_csv)
+    normalized: List[str] = []
+    for task in tasks:
+        resolved = TASK_ALIASES.get(task, task)
+        if resolved not in normalized:
+            normalized.append(resolved)
+    return normalized
+
+
+def _convert_tpc_column_inplace(df: pd.DataFrame) -> None:
+    if "tpc_in_label" not in df.columns:
+        return
+    numeric = pd.to_numeric(df["tpc_in_label"], errors="coerce")
+    mapped = np.where(numeric.fillna(1).astype(int) == 0, "NCT", "Chord Tone")
+    keep_original_mask = numeric.isna()
+    if keep_original_mask.any():
+        original = df.loc[keep_original_mask, "tpc_in_label"].astype(str)
+        cleaned = original.str.strip()
+        mapped = pd.Series(mapped, index=df.index, dtype=object)
+        mapped.loc[keep_original_mask] = cleaned
+        df["tpc_in_label"] = mapped.values
+    else:
+        df["tpc_in_label"] = mapped
+
+
+def _format_table_output(df: pd.DataFrame, tasks: List[str]) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+    if "note_id" not in out.columns:
+        out.insert(0, "note_id", np.arange(len(out)))
+    _convert_tpc_column_inplace(out)
+
+    timing_cols = [
+        col for col in ["row", "note_id", "onset_beat", "measure", "duration_beat", "pitch_spelling", "pitch_midi"]
+        if col in out.columns
+    ]
+    prediction_cols = [task for task in tasks if task in out.columns]
+    confidence_cols = [col for col in out.columns if col.endswith("_confidence")]
+
+    ordered_cols: List[str] = timing_cols.copy()
+    for pred_col in prediction_cols:
+        ordered_cols.append(pred_col)
+        conf_col = f"{pred_col}_confidence"
+        if conf_col in confidence_cols:
+            ordered_cols.append(conf_col)
+    remaining_cols = [col for col in out.columns if col not in ordered_cols and not col.endswith("_id")]
+    out = out[ordered_cols + remaining_cols]
+    return out
+
+
+def _apply_timing_from_predictions(df: pd.DataFrame, predictions: Dict[str, torch.Tensor]) -> pd.DataFrame:
+    out = df.copy()
+    onset = predictions.get("onset")
+    if isinstance(onset, torch.Tensor) and onset.numel() == len(out):
+        out["onset_beat"] = onset.detach().cpu().numpy()
+    s_measure = predictions.get("s_measure")
+    if isinstance(s_measure, torch.Tensor) and s_measure.numel() == len(out):
+        out["measure"] = s_measure.detach().cpu().numpy()
+    return out
 
 
 def run_full_inference(
@@ -100,12 +182,13 @@ def run_full_inference(
     full_ckpt: str,
     masked_ckpt: str,
     device: str,
+    task_labels: List[str],
     tasks_csv: str,
 ):
     try:
         score_path = _resolve_score_path(score_file)
         score = _load_score(score_path)
-        tasks = parse_task_csv(tasks_csv)
+        tasks = _resolve_selected_tasks(task_labels, tasks_csv)
         predictor = _get_predictor(full_ckpt, masked_ckpt, device)
 
         with torch.no_grad():
@@ -119,10 +202,11 @@ def run_full_inference(
             score=score,
             predictions=predictions,
             tasks=tasks,
-            include_confidence=False,
+            include_confidence=True,
             include_class_ids=False,
         )
-        display_df = _select_display_columns(full_df, tasks)
+        full_df = _apply_timing_from_predictions(full_df, predictions)
+        display_df = _format_table_output(full_df, tasks)
 
         status = (
             f"Full inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
@@ -138,6 +222,7 @@ def run_partial_rerender(
     full_ckpt: str,
     masked_ckpt: str,
     device: str,
+    task_labels: List[str],
     tasks_csv: str,
     known_rows_expr: str,
     target_rows_expr: str,
@@ -146,7 +231,7 @@ def run_partial_rerender(
     try:
         score_path = _resolve_score_path(score_file)
         score = _load_score(score_path)
-        tasks = parse_task_csv(tasks_csv)
+        tasks = _resolve_selected_tasks(task_labels, tasks_csv)
         predictor = _get_predictor(full_ckpt, masked_ckpt, device)
 
         edited_df = pd.DataFrame(edited_table) if edited_table is not None else pd.DataFrame()
@@ -169,10 +254,11 @@ def run_partial_rerender(
             score=score,
             predictions=predictions,
             tasks=tasks,
-            include_confidence=False,
+            include_confidence=True,
             include_class_ids=False,
         )
-        display_df = _select_display_columns(out_df, tasks)
+        out_df = _apply_timing_from_predictions(out_df, predictions)
+        display_df = _format_table_output(out_df, tasks)
 
         status = (
             f"Partial inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
@@ -202,11 +288,18 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
 
         with gr.Row():
             score_file = gr.File(label="MusicXML Score", file_types=[".xml", ".musicxml", ".mxl"], type="filepath")
-            tasks_csv = gr.Textbox(
-                label="Tasks (comma-separated)",
-                value=DEFAULT_TASKS,
-                info="Default editable tasks: romanNumeral, localkey, quality, inversion, degree1, degree2",
-            )
+
+        task_selector = gr.CheckboxGroup(
+            choices=list(AVAILABLE_TASKS.values()),
+            value=[AVAILABLE_TASKS[t] for t in DEFAULT_EDITABLE_TASKS if t in AVAILABLE_TASKS],
+            label="Select Analysis Tasks",
+            info="Choose which tasks to run and show in the editable table.",
+        )
+        tasks_csv = gr.Textbox(
+            label="Tasks Override (internal keys CSV, optional)",
+            value=DEFAULT_TASKS,
+            info="Used only if no task is selected above. Example: romanNumeral,localkey,quality",
+        )
 
         with gr.Row():
             run_full_btn = gr.Button("Run Full Inference", variant="primary")
@@ -233,7 +326,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
 
         run_full_btn.click(
             fn=run_full_inference,
-            inputs=[score_file, full_ckpt, masked_ckpt, device, tasks_csv],
+            inputs=[score_file, full_ckpt, masked_ckpt, device, task_selector, tasks_csv],
             outputs=[table, status],
         )
 
@@ -244,6 +337,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 full_ckpt,
                 masked_ckpt,
                 device,
+                task_selector,
                 tasks_csv,
                 known_rows_expr,
                 target_rows_expr,
