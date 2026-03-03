@@ -169,12 +169,15 @@ def _format_table_output(df: pd.DataFrame, tasks: List[str]) -> pd.DataFrame:
 
 def _apply_timing_from_predictions(df: pd.DataFrame, predictions: Dict[str, torch.Tensor]) -> pd.DataFrame:
     out = df.copy()
-    onset = predictions.get("onset")
+    # Keep score-derived timing as the source of truth for display. Some model
+    # tensors (e.g., onset/s_measure logits or class ids) are not absolute
+    # timeline values and can misalign bar/beat rendering if used directly.
+    onset = predictions.get("onset_beat")
     if isinstance(onset, torch.Tensor) and onset.numel() == len(out):
         out["onset_beat"] = onset.detach().cpu().numpy()
-    s_measure = predictions.get("s_measure")
-    if isinstance(s_measure, torch.Tensor) and s_measure.numel() == len(out):
-        out["measure"] = s_measure.detach().cpu().numpy()
+    measure = predictions.get("measure")
+    if isinstance(measure, torch.Tensor) and measure.numel() == len(out):
+        out["measure"] = measure.detach().cpu().numpy()
     return out
 
 

@@ -249,7 +249,18 @@ def _decode_task_predictions(task: str, probs_or_ids: torch.Tensor) -> Tuple[np.
         class_ids = tensor.long().numpy()
         confidence = None
     else:
-        probs = torch.softmax(tensor, dim=-1) if tensor.dtype.is_floating_point else tensor.float()
+        if tensor.dtype.is_floating_point:
+            # Model predict() usually returns probabilities already; only softmax
+            # when values do not look like normalized probabilities.
+            row_sums = tensor.sum(dim=-1)
+            looks_like_probs = bool(
+                torch.all(tensor >= -1e-6)
+                and torch.all(tensor <= 1.0 + 1e-6)
+                and torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3, rtol=1e-3)
+            )
+            probs = tensor if looks_like_probs else torch.softmax(tensor, dim=-1)
+        else:
+            probs = tensor.float()
         class_ids = torch.argmax(probs, dim=-1).long().numpy()
         confidence = torch.max(probs, dim=-1).values.numpy()
 

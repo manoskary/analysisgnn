@@ -348,6 +348,15 @@ def build_alignment_from_tsv(
         converters=converters,
         drop_na_subset=drop_na_subset,
     )
+    return _build_alignment_from_dataframe(df=df, tokenizer=tokenizer, interval=interval)
+
+
+def _build_alignment_from_dataframe(
+    df: pd.DataFrame,
+    tokenizer,
+    interval: str = "P1",
+) -> BpeNoteAlignment:
+    """Build token-to-note alignment from a dataframe with timing/pitch columns."""
 
     pitch = _extract_pitch(df)
     velocity = _extract_velocity(df, len(df))
@@ -442,6 +451,32 @@ def build_alignment_from_tsv(
         num_notes=num_notes,
         note_meta=note_meta,
     )
+
+
+def build_alignment_from_note_array(
+    note_array: np.ndarray,
+    tokenizer,
+    interval: str = "P1",
+) -> BpeNoteAlignment:
+    """Build token-to-note alignment directly from a Partitura note array."""
+    required = {"pitch", "onset_beat", "duration_beat", "ts_beats", "ts_beat_type"}
+    missing = [key for key in required if key not in note_array.dtype.names]
+    if missing:
+        raise ValueError(
+            "Note array is missing required fields for MusicBERT alignment: "
+            + ", ".join(missing)
+        )
+
+    frame = pd.DataFrame(
+        {
+            "pitch": np.asarray(note_array["pitch"], dtype=int),
+            "onset_beat": np.asarray(note_array["onset_beat"], dtype=float),
+            "duration_beat": np.asarray(note_array["duration_beat"], dtype=float),
+            "ts_beats": np.asarray(note_array["ts_beats"], dtype=int),
+            "ts_beat_type": np.asarray(note_array["ts_beat_type"], dtype=int),
+        }
+    )
+    return _build_alignment_from_dataframe(df=frame, tokenizer=tokenizer, interval=interval)
 
 
 def save_alignment_npz(alignment: BpeNoteAlignment, output_path: str) -> None:

@@ -2286,12 +2286,31 @@ class ContinualAnalysisGNN(LightningModule):
         return note_embeddings
 
     def _fuse_note_features(self, note_features: Optional[torch.Tensor], note_embeddings: torch.Tensor) -> torch.Tensor:
+        expected_base_dim = self._expected_base_note_feature_dim()
+        if note_features is not None and expected_base_dim is not None:
+            if int(note_features.size(-1)) > expected_base_dim:
+                note_features = note_features[..., :expected_base_dim]
+            elif int(note_features.size(-1)) < expected_base_dim:
+                pad = torch.zeros(
+                    (note_features.size(0), expected_base_dim - int(note_features.size(-1))),
+                    dtype=note_features.dtype,
+                    device=note_features.device,
+                )
+                note_features = torch.cat([note_features, pad], dim=-1)
+
         if note_features is not None and note_embeddings.dtype != note_features.dtype:
             note_embeddings = note_embeddings.to(note_features.dtype)
         elif note_features is None:
             note_dtype = self.model.project_dict["note"][0].weight.dtype
             if note_embeddings.dtype != note_dtype:
                 note_embeddings = note_embeddings.to(note_dtype)
+        if note_features is None and expected_base_dim is not None and expected_base_dim > 0:
+            note_features = torch.zeros(
+                (note_embeddings.size(0), expected_base_dim),
+                dtype=note_embeddings.dtype,
+                device=note_embeddings.device,
+            )
+
         if note_features is None or self.musicbert_fusion == "replace":
             return note_embeddings
         if self.musicbert_fusion == "concat":
@@ -2303,6 +2322,25 @@ class ContinualAnalysisGNN(LightningModule):
             gate = self.musicbert_gate(torch.cat([note_features, projected], dim=-1))
             return gate * projected + (1.0 - gate) * note_features
         return note_embeddings
+
+    def _expected_base_note_feature_dim(self) -> Optional[int]:
+        expected_note_dim = self._expected_note_input_dim()
+        if expected_note_dim is None:
+            return None
+        if self.musicbert_fusion != "concat":
+            return expected_note_dim
+        mb_dim = self.musicbert_hidden_size
+        if mb_dim is None and self.note_encoder is not None:
+            try:
+                mb_dim = int(self.note_encoder.backbone.model.config.hidden_size)
+            except Exception:
+                mb_dim = None
+        if mb_dim is None:
+            return expected_note_dim
+        base_dim = int(expected_note_dim) - int(mb_dim)
+        if base_dim < 0:
+            return expected_note_dim
+        return base_dim
 
     def _normalize_musicbert_inputs(self, batch):
         input_ids = batch.input_ids
@@ -2336,11 +2374,93 @@ class ContinualAnalysisGNN(LightningModule):
         if isinstance(token2note, torch.Tensor):
             token2note_list = [token2note]
         else:
-            token2note_list = [
-                torch.tensor(edges, dtype=torch.float32, device=self.device) for edges in token2note
-            ]
+            token2note_list = []
+            for edges in token2note:
+                if isinstance(edges, torch.Tensor):
+                    token2note_list.append(edges.to(device=self.device, dtype=torch.float32))
+                else:
+                    token2note_list.append(torch.tensor(edges, dtype=torch.float32, device=self.device))
 
         return input_ids_tensor, attention_mask_tensor, token2note_list, num_notes
+
+    def _musicbert_requested(self) -> bool:
+        return bool(
+            self.note_encoder is not None
+            or self.musicbert_use_cached_embeddings
+            or self.hparams.get("use_musicbert", False)
+        )
+
+    def _ensure_runtime_note_encoder(self) -> None:
+        if self.note_encoder is not None:
+            self.note_encoder = self.note_encoder.to(self.device)
+            self.note_encoder.eval()
+            return
+        if not self._musicbert_requested():
+            return
+        from analysisgnn.models.musicbert_note_encoder import MusicBertNoteEncoder
+
+        model_name = str(self.hparams.get("musicbert_model_name", "manoskary/musicbert-large"))
+        note_encoder = MusicBertNoteEncoder(
+            pretrained_name=model_name,
+            adapter_cfg=None,
+            freeze_backbone=True,
+        )
+        for param in note_encoder.parameters():
+            param.requires_grad = False
+        note_encoder.eval()
+        note_encoder = note_encoder.to(self.device)
+        self.note_encoder = note_encoder
+        if self.musicbert_hidden_size is None:
+            try:
+                self.musicbert_hidden_size = int(note_encoder.backbone.model.config.hidden_size)
+            except Exception:
+                self.musicbert_hidden_size = None
+
+    def _get_runtime_musicbert_tokenizer(self):
+        tokenizer = self.__dict__.get("_runtime_musicbert_tokenizer")
+        if tokenizer is None:
+            from miditok import MusicTokenizer
+
+            tokenizer_name = str(self.hparams.get("musicbert_tokenizer_name", "manoskary/miditok-REMI"))
+            tokenizer = MusicTokenizer.from_pretrained(tokenizer_name)
+            self.__dict__["_runtime_musicbert_tokenizer"] = tokenizer
+        return tokenizer
+
+    def _attach_runtime_musicbert_inputs_for_predict(self, data, note_array) -> None:
+        if not self._musicbert_requested():
+            return
+        note_store = data["note"]
+        if getattr(note_store, "musicbert_note_embeddings", None) is not None:
+            return
+        required_fields = ("input_ids", "attention_mask", "token2note", "num_notes")
+        if all(hasattr(data, field) for field in required_fields):
+            return
+
+        self._ensure_runtime_note_encoder()
+        if self.note_encoder is None:
+            return
+
+        from analysisgnn.data.musicbert_alignment import build_alignment_from_note_array
+
+        tokenizer = self._get_runtime_musicbert_tokenizer()
+        alignment = build_alignment_from_note_array(
+            note_array=note_array,
+            tokenizer=tokenizer,
+            interval="P1",
+        )
+        expected_nodes = int(note_store.x.size(0))
+        if int(alignment.num_notes) != expected_nodes:
+            raise ValueError(
+                "Runtime MusicBERT alignment note count mismatch: "
+                f"{alignment.num_notes} vs {expected_nodes}"
+            )
+
+        data.input_ids = torch.from_numpy(np.asarray(alignment.input_ids, dtype=np.int64)).unsqueeze(0).to(self.device)
+        data.attention_mask = torch.from_numpy(np.asarray(alignment.attention_mask, dtype=np.int64)).unsqueeze(0).to(
+            self.device
+        )
+        data.token2note = [torch.from_numpy(np.asarray(alignment.token2note, dtype=np.float32)).to(self.device)]
+        data.num_notes = [int(alignment.num_notes)]
 
     def _compute_task_losses(self, batch, force_unmasked_batch: bool = False):
         raw_x_dict = batch.x_dict
@@ -4661,19 +4781,19 @@ class ContinualAnalysisGNN(LightningModule):
                 feature_type = str(self.hparams.get("feature_type", "simple"))
             except Exception:
                 feature_type = "simple"
+            runtime_feature_type = "voice" if feature_type == "simple" else feature_type
             try:
-                note_features = select_features(score_obj, feature_type)
+                note_features = select_features(note_array, runtime_feature_type)
                 if not isinstance(note_features, np.ndarray):
                     note_features = np.asarray(note_features)
-                if len(note_features) != len(note_array_raw):
+                if len(note_features) != len(note_array):
                     raise ValueError(
-                        f"Feature extractor produced {len(note_features)} rows for {len(note_array_raw)} notes "
-                        f"(feature_type='{feature_type}')."
+                        f"Feature extractor produced {len(note_features)} rows for {len(note_array)} notes "
+                        f"(feature_type='{runtime_feature_type}')."
                     )
-                note_features = note_features[sort_idx]
             except Exception as feature_exc:
                 warnings.warn(
-                    f"Feature extraction with feature_type='{feature_type}' failed ({feature_exc}); "
+                    f"Feature extraction with feature_type='{runtime_feature_type}' failed ({feature_exc}); "
                     "falling back to voice features.",
                     RuntimeWarning,
                 )
@@ -4697,6 +4817,7 @@ class ContinualAnalysisGNN(LightningModule):
             # Add batch information for single score (all nodes belong to batch 0)
             batch_size = data["note"].x.size(0)
             data["note"].batch = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+            self._attach_runtime_musicbert_inputs_for_predict(data=data, note_array=note_array)
 
             node_mask, overrides, conditioning = normalize_user_edits_to_masked_conditioning(
                 user_edits=user_edits,
