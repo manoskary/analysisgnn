@@ -254,12 +254,11 @@ def _decode_task_predictions(task: str, probs_or_ids: torch.Tensor) -> Tuple[np.
         confidence = torch.max(probs, dim=-1).values.numpy()
 
     decoded: np.ndarray
-    if task in available_representations:
-        try:
-            decoded_obj = available_representations[task].decode(np.asarray(class_ids).reshape(-1, 1))
-            decoded = np.asarray(decoded_obj).reshape(-1)
-        except Exception:
-            decoded = np.asarray(class_ids)
+    if task in available_representations:        
+        decoded_obj = available_representations[task].decode(np.asarray(class_ids).reshape(-1, 1))
+        decoded = np.asarray(decoded_obj).reshape(-1)
+        # except Exception:
+        #     decoded = np.asarray(class_ids)
     else:
         decoded = np.asarray(class_ids)
 

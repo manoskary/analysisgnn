@@ -184,6 +184,7 @@ def _build_iterative_spec(
     keep_percentile_per_step: float,
     tasks: List[str],
     target_only_update: bool,
+    zero_known_start: bool,
 ) -> Dict[str, Any]:
     return {
         "enabled": bool(enable_iterative),
@@ -195,6 +196,7 @@ def _build_iterative_spec(
         "target_only_update": bool(target_only_update),
         "min_remaining_targets": 0,
         "confidence_temperature": 1.0,
+        "zero_known_start": bool(zero_known_start),
     }
 
 
@@ -233,6 +235,7 @@ def run_full_inference(
             keep_percentile_per_step=keep_percentile_per_step,
             tasks=tasks,
             target_only_update=False,
+            zero_known_start=True,
         )
         with torch.no_grad():
             output, routing = predictor.predict(
@@ -303,6 +306,7 @@ def run_partial_rerender(
             keep_percentile_per_step=keep_percentile_per_step,
             tasks=tasks,
             target_only_update=target_only_update,
+            zero_known_start=False,
         )
         with torch.no_grad():
             output, routing = predictor.predict(
@@ -343,8 +347,9 @@ def build_demo() -> gr.Blocks:
         gr.Markdown("""
 # AnalysisGNN Hybrid Inference
 
-Two-checkpoint workflow:
+Three explicit inference paths:
 - Base model for full-piece prediction.
+- Iterative refinement (no known labels at step 1) for apples-to-apples full-model benchmarking.
 - Masked model for edit-conditioned partial re-prediction.
 
 Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
@@ -370,9 +375,13 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             info="Used only if no task is selected above. Example: romanNumeral,localkey,quality",
         )
 
-        with gr.Row():
-            run_full_btn = gr.Button("Run Full Inference", variant="primary")
-            rerun_partial_btn = gr.Button("Re-predict From Edits", variant="secondary")
+        mode_selector = gr.Dropdown(
+            label="Inference Mode",
+            choices=["Iterative (no known labels)", "Full", "Edit-conditioned"],
+            value="Iterative (no known labels)",
+            info="Use Iterative for fair full-vs-iter benchmarks; use Edit-conditioned for user-corrected rerenders.",
+        )
+        run_btn = gr.Button("Run Inference", variant="primary")
 
         with gr.Row():
             enable_iterative = gr.Checkbox(
@@ -418,26 +427,71 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
         status = gr.Textbox(label="Status", interactive=False)
         trace_output = gr.Textbox(label="Iteration Trace", interactive=False, lines=12)
 
-        run_full_btn.click(
-            fn=run_full_inference,
-            inputs=[
-                score_file,
-                full_ckpt,
-                masked_ckpt,
-                device,
-                task_selector,
-                tasks_csv,
-                enable_iterative,
-                iterative_steps,
-                keep_percentile_per_step,
-                show_trace,
-            ],
-            outputs=[table, status, trace_output],
-        )
+        def run_by_mode(
+            mode: str,
+            score_file: Any,
+            full_ckpt: str,
+            masked_ckpt: str,
+            device: str,
+            task_labels: List[str],
+            tasks_csv: str,
+            known_rows_expr: str,
+            target_rows_expr: str,
+            edited_table: Any,
+            enable_iterative: bool,
+            iterative_steps: int,
+            keep_percentile_per_step: float,
+            target_only_update: bool,
+            show_trace: bool,
+        ):
+            mode_value = (mode or "").strip()
+            if mode_value == "Full":
+                return run_full_inference(
+                    score_file=score_file,
+                    full_ckpt=full_ckpt,
+                    masked_ckpt=masked_ckpt,
+                    device=device,
+                    task_labels=task_labels,
+                    tasks_csv=tasks_csv,
+                    enable_iterative=False,
+                    iterative_steps=iterative_steps,
+                    keep_percentile_per_step=keep_percentile_per_step,
+                    show_trace=show_trace,
+                )
+            if mode_value == "Iterative (no known labels)":
+                return run_full_inference(
+                    score_file=score_file,
+                    full_ckpt=full_ckpt,
+                    masked_ckpt=masked_ckpt,
+                    device=device,
+                    task_labels=task_labels,
+                    tasks_csv=tasks_csv,
+                    enable_iterative=True,
+                    iterative_steps=iterative_steps,
+                    keep_percentile_per_step=keep_percentile_per_step,
+                    show_trace=show_trace,
+                )
+            return run_partial_rerender(
+                score_file=score_file,
+                full_ckpt=full_ckpt,
+                masked_ckpt=masked_ckpt,
+                device=device,
+                task_labels=task_labels,
+                tasks_csv=tasks_csv,
+                known_rows_expr=known_rows_expr,
+                target_rows_expr=target_rows_expr,
+                edited_table=edited_table,
+                enable_iterative=enable_iterative,
+                iterative_steps=iterative_steps,
+                keep_percentile_per_step=keep_percentile_per_step,
+                target_only_update=target_only_update,
+                show_trace=show_trace,
+            )
 
-        rerun_partial_btn.click(
-            fn=run_partial_rerender,
+        run_btn.click(
+            fn=run_by_mode,
             inputs=[
+                mode_selector,
                 score_file,
                 full_ckpt,
                 masked_ckpt,

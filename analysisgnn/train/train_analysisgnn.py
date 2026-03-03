@@ -69,6 +69,18 @@ def get_parser():
     parser.add_argument('--weight_decay', type=float, default=5e-3, help="Weight decay")
     parser.add_argument("--grad_clip_val", type=float, default=1.0, help="Gradient clipping value")
     parser.add_argument("--num_workers", type=int, default=5, help="Number of workers")
+    parser.add_argument(
+        "--num_sanity_val_steps",
+        type=int,
+        default=0,
+        help="Sanity validation steps before training starts (set 0 for faster startup).",
+    )
+    parser.add_argument(
+        "--reload_dataloaders_every_n_epochs",
+        type=int,
+        default=0,
+        help="How often to rebuild dataloaders. 0 avoids per-epoch reload overhead.",
+    )
     parser.add_argument("--lambda_dctn", type=float, default=0.5, help="Lambda for the distilation loss")
     parser.add_argument("--lambda_featl", type=float, default=0.1, help="Lambda for the feature regularization loss")
     parser.add_argument("--lambda_ewc", type=float, default=2.0, help="Lambda for the Elastic Weight Consolidation loss")
@@ -235,8 +247,33 @@ def get_parser():
         "--iterative_eval_tasks",
         type=str,
         default="",
+        help="Deprecated alias for --iterative_eval_masked_tasks.",
+    )
+    parser.add_argument(
+        "--iterative_eval_masked_tasks",
+        type=str,
+        default="",
         help="Comma-separated task list for iterative evaluation refinement; defaults to masked_tasks or all available.",
     )
+    parser.add_argument(
+        "--iterative_eval_target_only_update",
+        action="store_true",
+        default=False,
+        help="If set, iterative evaluation only updates target nodes and preserves baseline predictions elsewhere.",
+    )
+    parser.add_argument(
+        "--iterative_eval_zero_known",
+        dest="iterative_eval_zero_known",
+        action="store_true",
+        help="Force iterative evaluation to start with zero known labels (fair apples-to-apples against full inference).",
+    )
+    parser.add_argument(
+        "--no_iterative_eval_zero_known",
+        dest="iterative_eval_zero_known",
+        action="store_false",
+        help="Allow iterative evaluation to use known labels from masked conditioning.",
+    )
+    parser.set_defaults(iterative_eval_zero_known=True)
     parser.add_argument("--use_musicbert", action="store_true", help="Use MusicBERT note encoder")
     parser.add_argument("--musicbert_model_name", type=str, default="manoskary/musicbert-large", help="MusicBERT model name")
     parser.add_argument(
@@ -493,6 +530,9 @@ def main():
     args.main_tasks = args.main_tasks.split(",")
     args.masked_tasks = [t.strip() for t in args.masked_tasks.split(",") if t.strip()]
     args.iterative_eval_tasks = [t.strip() for t in args.iterative_eval_tasks.split(",") if t.strip()]
+    args.iterative_eval_masked_tasks = [
+        t.strip() for t in args.iterative_eval_masked_tasks.split(",") if t.strip()
+    ]
     args.preserve_tasks = [t.strip() for t in args.preserve_tasks.split(",") if t.strip()]
     args.num_epochs = args.num_epochs.split(",")
     if len(args.num_epochs) == 1:
@@ -539,6 +579,12 @@ def main():
         config["iterative_eval_tasks"] = [
             t.strip() for t in config["iterative_eval_tasks"].split(",") if t.strip()
         ]
+    if isinstance(config.get("iterative_eval_masked_tasks", []), str):
+        config["iterative_eval_masked_tasks"] = [
+            t.strip() for t in config["iterative_eval_masked_tasks"].split(",") if t.strip()
+        ]
+    if not config.get("iterative_eval_masked_tasks"):
+        config["iterative_eval_masked_tasks"] = list(config.get("iterative_eval_tasks", []))
     if isinstance(config.get("preserve_tasks", []), str):
         config["preserve_tasks"] = [t.strip() for t in config["preserve_tasks"].split(",") if t.strip()]
     if not config.get("preserve_tasks"):
@@ -606,7 +652,9 @@ def main():
         keep_pct = float(config.get("iterative_eval_keep_percentile", 10.0))
         if keep_pct < 0 or keep_pct > 100:
             raise ValueError("--iterative_eval_keep_percentile must be in [0, 100].")
-        unknown_eval_tasks = [t for t in config.get("iterative_eval_tasks", []) if t not in TASK_DICT]
+        unknown_eval_tasks = [
+            t for t in config.get("iterative_eval_masked_tasks", []) if t not in TASK_DICT
+        ]
         if unknown_eval_tasks:
             raise ValueError(f"Unknown iterative eval task(s): {unknown_eval_tasks}")
     if config.get("preserve_pretrained", False):
@@ -863,6 +911,12 @@ def main():
         masked_tasks_tag = "-".join(config.get("masked_tasks", [])) if config.get("masked_prediction_train", False) else "none"
         preserve_tag = "preserve" if config.get("preserve_pretrained", False) else "nopreserve"
         iterative_tag = "iterrefine" if config.get("iterative_refine_train", False) else "noiterrefine"
+        iterative_eval_tag = "itereval" if config.get("iterative_eval", False) else "noitereval"
+        iterative_eval_zero_known_tag = (
+            "iterzero"
+            if config.get("iterative_eval", False) and config.get("iterative_eval_zero_known", True)
+            else "iternonzero"
+        )
         phase = "train+eval" if args.do_train and args.do_eval else ("train" if args.do_train else ("eval" if args.do_eval else "run"))
         ckpt_tag = ""
         if args.do_eval and not args.do_train and config.get("checkpoint_path"):
@@ -879,6 +933,8 @@ def main():
                 f"-mtasks={masked_tasks_tag}"
                 f"-{preserve_tag}"
                 f"-{iterative_tag}"
+                f"-{iterative_eval_tag}"
+                f"-{iterative_eval_zero_known_tag}"
                 f"-sched={config['scheduler_type']}"
                 f"-conf={config['mt_conflict_method']}"
                 f"-ep={config['num_epochs']}"
@@ -887,7 +943,8 @@ def main():
             )
         group = (
             f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-"
-            f"{masked_tag}-{masked_tasks_tag}-{preserve_tag}-{iterative_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
+            f"{masked_tag}-{masked_tasks_tag}-{preserve_tag}-{iterative_tag}-"
+            f"{iterative_eval_tag}-{iterative_eval_zero_known_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
         )
         job_type = phase
         user_tags = args.tags.split(",") if args.tags != "" else []
@@ -904,6 +961,8 @@ def main():
                 masked_tasks_tag,
                 preserve_tag,
                 iterative_tag,
+                iterative_eval_tag,
+                iterative_eval_zero_known_tag,
                 config["scheduler_type"],
                 config["mt_conflict_method"],
             ] + user_tags
@@ -979,10 +1038,10 @@ def main():
     trainer = Trainer(
         max_epochs=config["num_epochs"], accelerator=accelerator, devices=devices,
         # strategy=strategy,
-        num_sanity_val_steps=3,
+        num_sanity_val_steps=int(config.get("num_sanity_val_steps", 0)),
         logger=wandb_logger if config["use_wandb"] else None,
         callbacks=callbacks,
-        reload_dataloaders_every_n_epochs=1,
+        reload_dataloaders_every_n_epochs=int(config.get("reload_dataloaders_every_n_epochs", 0)),
         log_every_n_steps=1,
         gradient_clip_val=gradient_clip_val,
         accumulate_grad_batches=config["accumulate_grad_batches"],
