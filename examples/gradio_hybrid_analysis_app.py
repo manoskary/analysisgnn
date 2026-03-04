@@ -203,6 +203,18 @@ def _build_iterative_spec(
     }
 
 
+def _build_aggregation_spec(aggregation_mode: str, voter_path: str) -> Tuple[Dict[str, Any], str]:
+    mode_raw = str(aggregation_mode or "Mean").strip().lower()
+    mode = "voter" if mode_raw == "voter" else "mean"
+    path = (voter_path or "").strip()
+    if mode == "voter" and not path:
+        return {"mode": "mean"}, "Aggregation mode 'Voter' selected without checkpoint; falling back to mean."
+    spec: Dict[str, Any] = {"mode": mode}
+    if mode == "voter":
+        spec["voter_path"] = path
+    return spec, ""
+
+
 def _format_trace(trace: Dict[str, Any], show_trace: bool) -> str:
     if not show_trace:
         return ""
@@ -224,6 +236,8 @@ def run_full_inference(
     enable_iterative: bool,
     iterative_steps: int,
     keep_percentile_per_step: float,
+    aggregation_mode: str,
+    voter_checkpoint_path: str,
     show_trace: bool,
 ):
     try:
@@ -240,11 +254,16 @@ def run_full_inference(
             target_only_update=False,
             zero_known_start=True,
         )
+        aggregation_spec, aggregation_warning = _build_aggregation_spec(
+            aggregation_mode=aggregation_mode,
+            voter_path=voter_checkpoint_path,
+        )
         with torch.no_grad():
             output, routing = predictor.predict(
                 score,
                 force_route="full",
                 iterative_spec=iterative_spec,
+                aggregation_spec=aggregation_spec,
                 return_iterative_trace=bool(enable_iterative),
                 return_route=True,
             )
@@ -266,8 +285,10 @@ def run_full_inference(
 
         status = (
             f"Full inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
-            f"Rows={len(display_df)} tasks={','.join(tasks)}"
+            f"Rows={len(display_df)} tasks={','.join(tasks)} aggregation={aggregation_spec.get('mode', 'mean')}"
         )
+        if aggregation_warning:
+            status = f"{status} | {aggregation_warning}"
         return display_df, status, _format_trace(trace, show_trace)
     except Exception as exc:
         return pd.DataFrame(), f"Error: {exc}", ""
@@ -287,6 +308,8 @@ def run_partial_rerender(
     iterative_steps: int,
     keep_percentile_per_step: float,
     target_only_update: bool,
+    aggregation_mode: str,
+    voter_checkpoint_path: str,
     show_trace: bool,
 ):
     try:
@@ -311,12 +334,17 @@ def run_partial_rerender(
             target_only_update=target_only_update,
             zero_known_start=False,
         )
+        aggregation_spec, aggregation_warning = _build_aggregation_spec(
+            aggregation_mode=aggregation_mode,
+            voter_path=voter_checkpoint_path,
+        )
         with torch.no_grad():
             output, routing = predictor.predict(
                 score,
                 user_edits=user_edits,
                 masked_spec=masked_spec,
                 iterative_spec=iterative_spec,
+                aggregation_spec=aggregation_spec,
                 return_iterative_trace=bool(enable_iterative),
                 return_route=True,
             )
@@ -338,8 +366,11 @@ def run_partial_rerender(
 
         status = (
             f"Partial inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
-            f"Known rows={info.get('num_known', 0)} target rows={info.get('num_targets', 0)}"
+            f"Known rows={info.get('num_known', 0)} target rows={info.get('num_targets', 0)} "
+            f"aggregation={aggregation_spec.get('mode', 'mean')}"
         )
+        if aggregation_warning:
+            status = f"{status} | {aggregation_warning}"
         return display_df, status, _format_trace(trace, show_trace)
     except Exception as exc:
         return pd.DataFrame(), f"Error: {exc}", ""
@@ -401,6 +432,17 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 value=10.0,
             )
         with gr.Row():
+            aggregation_mode = gr.Dropdown(
+                label="Aggregation Mode",
+                choices=["Mean", "Voter"],
+                value="Mean",
+            )
+            voter_checkpoint_path = gr.Textbox(
+                label="Voter Checkpoint Path",
+                value="",
+                info="Optional. Required only when Aggregation Mode is Voter.",
+            )
+        with gr.Row():
             target_only_update = gr.Checkbox(
                 label="Target-only overwrite (partial mode)",
                 value=True,
@@ -444,6 +486,8 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             enable_iterative: bool,
             iterative_steps: int,
             keep_percentile_per_step: float,
+            aggregation_mode: str,
+            voter_checkpoint_path: str,
             target_only_update: bool,
             show_trace: bool,
         ):
@@ -459,6 +503,8 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     enable_iterative=False,
                     iterative_steps=iterative_steps,
                     keep_percentile_per_step=keep_percentile_per_step,
+                    aggregation_mode=aggregation_mode,
+                    voter_checkpoint_path=voter_checkpoint_path,
                     show_trace=show_trace,
                 )
             if mode_value == "Iterative (no known labels)":
@@ -472,6 +518,8 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     enable_iterative=True,
                     iterative_steps=iterative_steps,
                     keep_percentile_per_step=keep_percentile_per_step,
+                    aggregation_mode=aggregation_mode,
+                    voter_checkpoint_path=voter_checkpoint_path,
                     show_trace=show_trace,
                 )
             return run_partial_rerender(
@@ -487,6 +535,8 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 enable_iterative=enable_iterative,
                 iterative_steps=iterative_steps,
                 keep_percentile_per_step=keep_percentile_per_step,
+                aggregation_mode=aggregation_mode,
+                voter_checkpoint_path=voter_checkpoint_path,
                 target_only_update=target_only_update,
                 show_trace=show_trace,
             )
@@ -507,6 +557,8 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 enable_iterative,
                 iterative_steps,
                 keep_percentile_per_step,
+                aggregation_mode,
+                voter_checkpoint_path,
                 target_only_update,
                 show_trace,
             ],

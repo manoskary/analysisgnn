@@ -7,6 +7,7 @@ from .chord import ChordPredictionModel, ChordPrediction, PostChordPrediction, M
 from .pitch_spelling import PitchSpellingModel
 from .musicbert_backbone import MusicBertAdapterConfig, MusicBertBackbone
 from .musicbert_note_encoder import MusicBertNoteEncoder
+from .posthoc_aggregator import PosthocAggregationBundle, WeightedGroupVoter
 
 __all__ = [
     "CadencePLModel",
@@ -17,6 +18,8 @@ __all__ = [
     "MusicBertBackbone",
     "MusicBertNoteEncoder",
     "MultiTaskLoss",
+    "PosthocAggregationBundle",
     "PitchSpellingModel",
     "PostChordPrediction",
+    "WeightedGroupVoter",
 ]

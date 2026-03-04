@@ -274,6 +274,24 @@ def get_parser():
         help="Allow iterative evaluation to use known labels from masked conditioning.",
     )
     parser.set_defaults(iterative_eval_zero_known=True)
+    parser.add_argument(
+        "--aggregation_mode",
+        type=str,
+        default="mean",
+        choices=["mean", "voter"],
+        help="Post-hoc aggregation mode for onset/beat/measure pooling.",
+    )
+    parser.add_argument(
+        "--aggregation_voter_path",
+        type=str,
+        default=None,
+        help="Path to post-hoc voter checkpoint artifact (used when aggregation_mode=voter).",
+    )
+    parser.add_argument(
+        "--aggregation_compare_mean_in_test",
+        action="store_true",
+        help="During test, log both mean and voter aggregation metrics for apples-to-apples comparison.",
+    )
     parser.add_argument("--use_musicbert", action="store_true", help="Use MusicBERT note encoder")
     parser.add_argument("--musicbert_model_name", type=str, default="manoskary/musicbert-large", help="MusicBERT model name")
     parser.add_argument(
@@ -657,6 +675,29 @@ def main():
         ]
         if unknown_eval_tasks:
             raise ValueError(f"Unknown iterative eval task(s): {unknown_eval_tasks}")
+
+    aggregation_mode = str(config.get("aggregation_mode", "mean")).lower().strip()
+    if aggregation_mode not in {"mean", "voter"}:
+        print(f"Warning: unknown aggregation_mode '{aggregation_mode}', falling back to 'mean'.")
+        aggregation_mode = "mean"
+    aggregation_voter_path = config.get("aggregation_voter_path")
+    if aggregation_mode == "voter":
+        if not aggregation_voter_path:
+            print("Warning: aggregation_mode=voter but no aggregation_voter_path was provided; using mean.")
+            aggregation_mode = "mean"
+        elif not os.path.exists(aggregation_voter_path):
+            print(
+                f"Warning: aggregation_voter_path not found at '{aggregation_voter_path}'; using mean."
+            )
+            aggregation_mode = "mean"
+    if config.get("aggregation_compare_mean_in_test", False):
+        if not aggregation_voter_path or not os.path.exists(str(aggregation_voter_path)):
+            print(
+                "Warning: aggregation_compare_mean_in_test requires a valid aggregation_voter_path; "
+                "disabling compare mode."
+            )
+            config["aggregation_compare_mean_in_test"] = False
+    config["aggregation_mode"] = aggregation_mode
     if config.get("preserve_pretrained", False):
         if not config.get("masked_prediction_train", False):
             print(

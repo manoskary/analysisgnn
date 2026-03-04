@@ -380,6 +380,7 @@ class HybridAnalysisPredictor:
         user_edits: Optional[Dict[str, Any]] = None,
         masked_spec: Optional[Dict[str, Any]] = None,
         iterative_spec: Optional[Dict[str, Any]] = None,
+        aggregation_spec: Optional[Dict[str, Any]] = None,
         force_route: Optional[str] = None,
         return_edit_info: bool = False,
         return_iterative_trace: bool = False,
@@ -405,6 +406,7 @@ class HybridAnalysisPredictor:
             user_edits=user_edits,
             masked_spec=masked_spec,
             iterative_spec=iterative_spec,
+            aggregation_spec=aggregation_spec,
             return_edit_info=return_edit_info,
             return_iterative_trace=return_iterative_trace,
         )

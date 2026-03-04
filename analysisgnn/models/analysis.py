@@ -26,6 +26,10 @@ from analysisgnn.utils.node_masking import (
     split_nodes_by_mask,
     clamp_logits_to_labels,
 )
+from analysisgnn.models.posthoc_aggregator import (
+    PosthocAggregationBundle,
+    DEFAULT_TASKS_BY_LEVEL,
+)
 
 
 def isin_pairwise(element,test_elements, assume_unique=True):
@@ -280,132 +284,260 @@ class CAGrad:
         return combined
 
 
-def onsetwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["cadence", "phrase", "root", "localkey", "quality", "inversion", "degree1", "degree2", "romanNumeral", "section"]):        
-    if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
-        batch_size = len(graph["note"].x) if batch_size is None else batch_size
-        edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
-        valid_label_mask = torch.ones(batch_size, dtype=torch.bool).to(graph["note"].x.device) if valid_label_mask is None else valid_label_mask
-        # NOTE: Aggregate per onset
-        onset_edges = edge_index_dict["note", "onset", "note"]
-        onset_edge_mask_src = onset_edges[0] < batch_size
-        onset_edge_mask_dst = onset_edges[1] < batch_size
-        onset_edges = onset_edges[:, torch.logical_and(onset_edge_mask_src, onset_edge_mask_dst)]
-        # remove self loops
-        onset_edges = onset_edges[:, onset_edges[0] != onset_edges[1]]
-        # If tpc_in_label is in logits_softmax_dict make a mask out of argmax
-        if "tpc_in_label" in logits_softmax_dict:
-            tpc_in_label_mask = logits_softmax_dict["tpc_in_label"].argmax(-1).bool()
-            onset_edges = onset_edges[:, tpc_in_label_mask[onset_edges[0]] & tpc_in_label_mask[onset_edges[1]]]
-        else:
-            tpc_in_label_mask = None
-        # aggregate the logit predictions based on the onset edges
-        aggregate_logit_dict = {}
-        for k, v in logits_softmax_dict.items():
-            if k in rna_keys:
-                aggregate_logit_dict[k] = torch_scatter.scatter_mean(v[onset_edges[0]], onset_edges[1], dim=0, out=v).softmax(-1)
-        # keep valid labels
-        aggregate_logit_dict = {k: v[valid_label_mask].softmax(-1) for k, v in aggregate_logit_dict.items()}
-        logits_softmax_dict.update(aggregate_logit_dict)
-        batch_id = graph["note"].batch[:batch_size][valid_label_mask]
-        if torch.all(batch_id == batch_id[0]):                            
-            onsets = graph["note"].onset_div[:batch_size][valid_label_mask]
-            onsets = onsets - onsets.min()
-            if tpc_in_label_mask is not None:
-                onsets_filtered = onsets[tpc_in_label_mask]
-                aggregate_logit_dict = {k: v[tpc_in_label_mask] for k, v in aggregate_logit_dict.items()}
-            else:
-                onsets_filtered = onsets
-            unique_onset_values, un_onset_indices = torch.unique(onsets_filtered, return_inverse=True)
-            unique_logit_map = (un_onset_indices[1:] != un_onset_indices[:-1]).nonzero(as_tuple=True)[0] + 1
-            unique_logit_map = torch.cat([torch.tensor([0], device=unique_logit_map.device), unique_logit_map])
-            onsetwise_logit_dict = {k: v[unique_logit_map] for k, v in aggregate_logit_dict.items()}
-            # RNA calculation
-            rna_preds = {k: onsetwise_logit_dict[k].argmax(-1) for k in rna_keys}            
-            # find unique onsets where the predictions change
-            for k in rna_preds.keys():
-                x = rna_preds[k]
-                # assume that x is in order. Find in which i+1 != i
-                change_points = (x[1:] != x[:-1]).nonzero(as_tuple=True)[0] + 1
-                # Add 0 as the first change point
-                change_points = torch.cat([torch.tensor([0], device=change_points.device), change_points])
-                # Update the logits_softmax_dict with the new logits
-                onsets_value_on_change = unique_onset_values[change_points]
-                x_on_change = x[change_points]
-                x_logits_on_change = onsetwise_logit_dict[k][change_points]
-                # find indices of onsets that are between change points and assign them to the same logits
-                for i in range(len(change_points) - 1):
-                    onset_mask = (onsets_value_on_change[i] <= onsets) & (onsets < onsets_value_on_change[i + 1])
-                    logits_softmax_dict[k][onset_mask] = x_logits_on_change[i]
-
-    return logits_softmax_dict
+def _normalize_valid_mask(batch_size: int, graph, valid_label_mask=None) -> torch.Tensor:
+    if valid_label_mask is None:
+        return torch.ones(batch_size, dtype=torch.bool, device=graph["note"].x.device)
+    mask = valid_label_mask[:batch_size]
+    if not isinstance(mask, torch.Tensor):
+        mask = torch.tensor(mask, device=graph["note"].x.device)
+    return mask.to(device=graph["note"].x.device, dtype=torch.bool)
 
 
-def beatwise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["root", "localkey", "quality", "inversion", "degree1", "degree2", "romanNumeral", "cadence", "phrase", "section"]):        
-    if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
-        batch_size = len(graph["note"].x) if batch_size is None else batch_size
-        edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
-        valid_label_mask = torch.ones(batch_size, dtype=torch.bool).to(graph["note"].x.device) if valid_label_mask is None else valid_label_mask
-        # NOTE: Aggregate per beat
-        beat_edges_out = edge_index_dict["beat", "connects", "note"]
-        beat_edges_in = edge_index_dict["note", "connects", "beat"]
-        # find number of beats from beat_edges_in and beat_edges_out
-        num_beats = max(beat_edges_out[0].max(), beat_edges_in[1].max()) + 1
-        beat_edge_mask_src = beat_edges_out[1] < batch_size
-        beat_edge_mask_dst = beat_edges_out[0] < batch_size
-        beat_edges_out = beat_edges_out[:, beat_edge_mask_dst]
-        beat_edges_in = beat_edges_in[:, beat_edge_mask_src]
-        # If tpc_in_label is in logits_softmax_dict make a mask out of argmax
-        if "tpc_in_label" in logits_softmax_dict:
-            tpc_in_label_mask = logits_softmax_dict["tpc_in_label"].argmax(-1).bool()
-            beat_edges_out = beat_edges_out[:, tpc_in_label_mask[beat_edges_out[1]]]
-            beat_edges_in = beat_edges_in[:, tpc_in_label_mask[beat_edges_in[0]]]
-        else:
-            tpc_in_label_mask = None
-        # aggregate the logit predictions based on the onset edges
-        aggregate_logit_dict = {}
-        for k, v in logits_softmax_dict.items():
-            if k in rna_keys:
-                # create a tensor of size (num_beats, num_classes) to store the aggregated logits
-                beat_logits = torch.zeros((num_beats, v.size(-1)), device=v.device)
-                # aggregate logits from notes to beats
-                beat_logits = torch_scatter.scatter_mean(v[beat_edges_out[1]], beat_edges_out[0], dim=0, dim_size=num_beats, out=beat_logits)
-                # distribute back to notes
-                aggregate_logit_dict[k] = torch_scatter.scatter_mean(beat_logits[beat_edges_in[1]], beat_edges_in[0], dim=0, out=v).softmax(-1)
-    return logits_softmax_dict
+def _group_ids_from_cluster_or_edges(
+    level: str,
+    graph,
+    edge_index_dict,
+    batch_size: int,
+) -> torch.Tensor:
+    note_store = graph["note"]
+    device = note_store.x.device
+    cluster_name = f"{level}_cluster"
+    cluster = getattr(note_store, cluster_name, None)
+    if isinstance(cluster, torch.Tensor) and cluster.numel() >= batch_size:
+        return cluster[:batch_size].to(device=device, dtype=torch.long)
+
+    out = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+    if level == "beat":
+        key = ("beat", "connects", "note")
+    elif level == "measure":
+        key = ("measure", "connects", "note")
+    else:
+        return out
+    if key not in edge_index_dict:
+        return out
+    edge = edge_index_dict[key]
+    if edge.numel() == 0:
+        return out
+    edge = edge[:, edge[1] < batch_size]
+    if edge.numel() == 0:
+        return out
+    out[edge[1]] = edge[0].to(dtype=torch.long)
+    return out
 
 
-def measurewise_logit_aggregation(logits_softmax_dict, graph, edge_index_dict=None, batch_size=None, valid_label_mask=None, rna_keys=["localkey"]):
-    if all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys:
-        batch_size = len(graph["note"].x) if batch_size is None else batch_size
-        edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
-        valid_label_mask = torch.ones(batch_size, dtype=torch.bool).to(graph["note"].x.device) if valid_label_mask is None else valid_label_mask
-        # NOTE: Aggregate per measure
-        measure_edges_out = edge_index_dict["measure", "connects", "note"]
-        measure_edges_in = edge_index_dict["note", "connects", "measure"]
-        # find number of measures from measure_edges_in and measure_edges_out
-        num_measures = max(measure_edges_out[0].max(), measure_edges_in[1].max()) + 1
-        measure_edge_mask_src = measure_edges_out[1] < batch_size
-        measure_edge_mask_dst = measure_edges_out[0] < batch_size
-        measure_edges_out = measure_edges_out[:, measure_edge_mask_dst]
-        measure_edges_in = measure_edges_in[:, measure_edge_mask_src]
-        # If tpc_in_label is in logits_softmax_dict make a mask out of argmax
-        if "tpc_in_label" in logits_softmax_dict:
-            tpc_in_label_mask = logits_softmax_dict["tpc_in_label"].argmax(-1).bool()
-            measure_edges_out = measure_edges_out[:, tpc_in_label_mask[measure_edges_out[1]]]
-            measure_edges_in = measure_edges_in[:, tpc_in_label_mask[measure_edges_in[0]]]
-        else:
-            tpc_in_label_mask = None
-        # aggregate the logit predictions based on the onset edges
-        aggregate_logit_dict = {}
-        for k, v in logits_softmax_dict.items():
-            if k in rna_keys:
-                # create a tensor of size (num_measures, num_classes) to store the aggregated logits
-                measure_logits = torch.zeros((num_measures, v.size(-1)), device=v.device)
-                # aggregate logits from notes to measures
-                measure_logits = torch_scatter.scatter_mean(v[measure_edges_out[1]], measure_edges_out[0], dim=0, dim_size=num_measures, out=measure_logits)                
-                # distribute back to notes
-                aggregate_logit_dict[k] = torch_scatter.scatter_mean(measure_logits[measure_edges_in[1]], measure_edges_in[0], dim=0, out=v).softmax(-1)
+def _groupwise_mean_broadcast(task_probs: torch.Tensor, group_ids: torch.Tensor, eligible_mask: torch.Tensor) -> torch.Tensor:
+    if task_probs.ndim != 2 or group_ids.numel() != task_probs.size(0):
+        return task_probs
+    valid = eligible_mask & (group_ids >= 0)
+    if not torch.any(valid):
+        return task_probs
+    idx = torch.where(valid)[0]
+    groups = group_ids[idx].to(dtype=torch.long)
+    _, inv = torch.unique(groups, sorted=True, return_inverse=True)
+    if inv.numel() == 0:
+        return task_probs
+    num_groups = int(inv.max().item()) + 1
+    agg = torch_scatter.scatter_mean(task_probs[idx], inv, dim=0, dim_size=num_groups)
+    out = task_probs.clone()
+    out[idx] = agg[inv]
+    return out
+
+
+def _aggregate_with_mode(
+    *,
+    level: str,
+    task: str,
+    task_probs: torch.Tensor,
+    all_probs: Dict[str, torch.Tensor],
+    graph,
+    group_ids: torch.Tensor,
+    eligible_mask: torch.Tensor,
+    aggregation_bundle: Optional[PosthocAggregationBundle] = None,
+    aggregation_mode: str = "mean",
+) -> torch.Tensor:
+    mode = str(aggregation_mode or "mean").lower().strip()
+    if mode != "voter" or aggregation_bundle is None:
+        return _groupwise_mean_broadcast(task_probs, group_ids, eligible_mask)
+    if not aggregation_bundle.supports(level, task):
+        return _groupwise_mean_broadcast(task_probs, group_ids, eligible_mask)
+    return aggregation_bundle.aggregate_task(
+        level=level,
+        task=task,
+        task_probs=task_probs,
+        all_task_probs=all_probs,
+        graph=graph,
+        group_ids=group_ids,
+        eligible_mask=eligible_mask,
+    )
+
+
+def onsetwise_logit_aggregation(
+    logits_softmax_dict,
+    graph,
+    edge_index_dict=None,
+    batch_size=None,
+    valid_label_mask=None,
+    rna_keys=None,
+    aggregation_bundle: Optional[PosthocAggregationBundle] = None,
+    aggregation_mode: str = "mean",
+):
+    if rna_keys is None:
+        rna_keys = DEFAULT_TASKS_BY_LEVEL["onset"]
+    if not (all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys):
         return logits_softmax_dict
+
+    batch_size = len(graph["note"].x) if batch_size is None else batch_size
+    edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
+    valid_mask = _normalize_valid_mask(batch_size, graph, valid_label_mask)
+    onsets = graph["note"].onset_div[:batch_size].to(dtype=torch.long)
+    group_ids = onsets - onsets.min()
+
+    tpc_in_label_mask = None
+    if "tpc_in_label" in logits_softmax_dict:
+        tpc_in_label_mask = logits_softmax_dict["tpc_in_label"][:batch_size].argmax(-1).bool()
+
+    aggregate_logit_dict = {}
+    for task, probs in logits_softmax_dict.items():
+        if task not in rna_keys:
+            continue
+        task_probs = probs[:batch_size]
+        eligible = valid_mask.clone()
+        if tpc_in_label_mask is not None:
+            eligible = eligible & tpc_in_label_mask
+        agg = _aggregate_with_mode(
+            level="onset",
+            task=task,
+            task_probs=task_probs,
+            all_probs=logits_softmax_dict,
+            graph=graph,
+            group_ids=group_ids,
+            eligible_mask=eligible,
+            aggregation_bundle=aggregation_bundle,
+            aggregation_mode=aggregation_mode,
+        )
+        aggregate_logit_dict[task] = agg
+
+    logits_softmax_dict.update(aggregate_logit_dict)
+    batch_id = graph["note"].batch[:batch_size][valid_mask]
+    if torch.all(batch_id == batch_id[0]):
+        onsets_valid = group_ids[valid_mask]
+        if tpc_in_label_mask is not None:
+            onset_mask = tpc_in_label_mask[valid_mask]
+            onsets_filtered = onsets_valid[onset_mask]
+            aggregate_logit_dict = {k: v[valid_mask][onset_mask] for k, v in aggregate_logit_dict.items()}
+        else:
+            onsets_filtered = onsets_valid
+            aggregate_logit_dict = {k: v[valid_mask] for k, v in aggregate_logit_dict.items()}
+        if onsets_filtered.numel() > 1:
+            unique_onset_values, un_onset_indices = torch.unique(onsets_filtered, return_inverse=True)
+            if un_onset_indices.numel() > 1:
+                unique_logit_map = (un_onset_indices[1:] != un_onset_indices[:-1]).nonzero(as_tuple=True)[0] + 1
+                unique_logit_map = torch.cat([torch.tensor([0], device=unique_logit_map.device), unique_logit_map])
+                onsetwise_logit_dict = {k: v[unique_logit_map] for k, v in aggregate_logit_dict.items()}
+                rna_preds = {k: onsetwise_logit_dict[k].argmax(-1) for k in rna_keys}
+                for k, x in rna_preds.items():
+                    if x.numel() <= 1:
+                        continue
+                    change_points = (x[1:] != x[:-1]).nonzero(as_tuple=True)[0] + 1
+                    change_points = torch.cat([torch.tensor([0], device=change_points.device), change_points])
+                    onsets_value_on_change = unique_onset_values[change_points]
+                    x_logits_on_change = onsetwise_logit_dict[k][change_points]
+                    for i in range(len(change_points) - 1):
+                        onset_range_mask = (onsets_valid >= onsets_value_on_change[i]) & (
+                            onsets_valid < onsets_value_on_change[i + 1]
+                        )
+                        full_mask = torch.zeros_like(valid_mask)
+                        valid_idx = torch.where(valid_mask)[0]
+                        full_mask[valid_idx[onset_range_mask]] = True
+                        logits_softmax_dict[k][full_mask] = x_logits_on_change[i]
+    return logits_softmax_dict
+
+
+def beatwise_logit_aggregation(
+    logits_softmax_dict,
+    graph,
+    edge_index_dict=None,
+    batch_size=None,
+    valid_label_mask=None,
+    rna_keys=None,
+    aggregation_bundle: Optional[PosthocAggregationBundle] = None,
+    aggregation_mode: str = "mean",
+):
+    if rna_keys is None:
+        rna_keys = DEFAULT_TASKS_BY_LEVEL["beat"]
+    if not (all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys):
+        return logits_softmax_dict
+
+    batch_size = len(graph["note"].x) if batch_size is None else batch_size
+    edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
+    valid_mask = _normalize_valid_mask(batch_size, graph, valid_label_mask)
+    group_ids = _group_ids_from_cluster_or_edges("beat", graph, edge_index_dict, batch_size)
+
+    tpc_in_label_mask = None
+    if "tpc_in_label" in logits_softmax_dict:
+        tpc_in_label_mask = logits_softmax_dict["tpc_in_label"][:batch_size].argmax(-1).bool()
+
+    aggregate_logit_dict = {}
+    for task, probs in logits_softmax_dict.items():
+        if task not in rna_keys:
+            continue
+        task_probs = probs[:batch_size]
+        eligible = valid_mask.clone()
+        if tpc_in_label_mask is not None:
+            eligible = eligible & tpc_in_label_mask
+        aggregate_logit_dict[task] = _aggregate_with_mode(
+            level="beat",
+            task=task,
+            task_probs=task_probs,
+            all_probs=logits_softmax_dict,
+            graph=graph,
+            group_ids=group_ids,
+            eligible_mask=eligible,
+            aggregation_bundle=aggregation_bundle,
+            aggregation_mode=aggregation_mode,
+        )
+    logits_softmax_dict.update(aggregate_logit_dict)
+    return logits_softmax_dict
+
+
+def measurewise_logit_aggregation(
+    logits_softmax_dict,
+    graph,
+    edge_index_dict=None,
+    batch_size=None,
+    valid_label_mask=None,
+    rna_keys=None,
+    aggregation_bundle: Optional[PosthocAggregationBundle] = None,
+    aggregation_mode: str = "mean",
+):
+    if rna_keys is None:
+        rna_keys = DEFAULT_TASKS_BY_LEVEL["measure"]
+    if not (all([k in logits_softmax_dict.keys() for k in rna_keys]) and rna_keys):
+        return logits_softmax_dict
+
+    batch_size = len(graph["note"].x) if batch_size is None else batch_size
+    edge_index_dict = graph.edge_index_dict if edge_index_dict is None else edge_index_dict
+    valid_mask = _normalize_valid_mask(batch_size, graph, valid_label_mask)
+    group_ids = _group_ids_from_cluster_or_edges("measure", graph, edge_index_dict, batch_size)
+
+    aggregate_logit_dict = {}
+    for task, probs in logits_softmax_dict.items():
+        if task not in rna_keys:
+            continue
+        task_probs = probs[:batch_size]
+        aggregate_logit_dict[task] = _aggregate_with_mode(
+            level="measure",
+            task=task,
+            task_probs=task_probs,
+            all_probs=logits_softmax_dict,
+            graph=graph,
+            group_ids=group_ids,
+            eligible_mask=valid_mask,
+            aggregation_bundle=aggregation_bundle,
+            aggregation_mode=aggregation_mode,
+        )
+    logits_softmax_dict.update(aggregate_logit_dict)
+    return logits_softmax_dict
 
 
         # # keep valid labels
@@ -1434,6 +1566,13 @@ class ContinualAnalysisGNN(LightningModule):
         self.iterative_eval_target_only_update = bool(
             hparams.get("iterative_eval_target_only_update", False)
         )
+        self.aggregation_mode = str(hparams.get("aggregation_mode", "mean")).lower().strip()
+        if self.aggregation_mode not in {"mean", "voter"}:
+            self.aggregation_mode = "mean"
+        self.aggregation_voter_path = hparams.get("aggregation_voter_path", None)
+        self.aggregation_compare_mean_in_test = bool(hparams.get("aggregation_compare_mean_in_test", False))
+        self.__dict__["_aggregation_bundle"] = None
+        self.__dict__["_aggregation_bundle_path"] = None
 
         # Pretrained-preservation settings for masked finetuning.
         self.preserve_pretrained = bool(hparams.get("preserve_pretrained", False))
@@ -1829,12 +1968,77 @@ class ContinualAnalysisGNN(LightningModule):
         note_prob_dict: Dict[str, torch.Tensor],
         data,
         batch_size: int,
+        aggregation_mode: Optional[str] = None,
+        aggregation_bundle: Optional[PosthocAggregationBundle] = None,
     ) -> Dict[str, torch.Tensor]:
+        mode = str(aggregation_mode or self.aggregation_mode or "mean").lower().strip()
         out = {k: v.clone() for k, v in note_prob_dict.items()}
-        out = onsetwise_logit_aggregation(out, graph=data, batch_size=batch_size)
-        out = beatwise_logit_aggregation(out, graph=data, batch_size=batch_size)
-        out = measurewise_logit_aggregation(out, graph=data, batch_size=batch_size)
+        out = onsetwise_logit_aggregation(
+            out,
+            graph=data,
+            batch_size=batch_size,
+            aggregation_mode=mode,
+            aggregation_bundle=aggregation_bundle,
+        )
+        out = beatwise_logit_aggregation(
+            out,
+            graph=data,
+            batch_size=batch_size,
+            aggregation_mode=mode,
+            aggregation_bundle=aggregation_bundle,
+        )
+        out = measurewise_logit_aggregation(
+            out,
+            graph=data,
+            batch_size=batch_size,
+            aggregation_mode=mode,
+            aggregation_bundle=aggregation_bundle,
+        )
         return out
+
+    def _load_posthoc_aggregation_bundle(
+        self,
+        path: Optional[str] = None,
+    ) -> Optional[PosthocAggregationBundle]:
+        voter_path = path or self.aggregation_voter_path
+        if not voter_path:
+            return None
+        if self.__dict__.get("_aggregation_bundle") is not None and self.__dict__.get("_aggregation_bundle_path") == voter_path:
+            return self.__dict__.get("_aggregation_bundle")
+        if not os.path.exists(voter_path):
+            warnings.warn(
+                f"Aggregation voter artifact not found at '{voter_path}'; falling back to mean aggregation.",
+                RuntimeWarning,
+            )
+            self.__dict__["_aggregation_bundle"] = None
+            self.__dict__["_aggregation_bundle_path"] = None
+            return None
+        payload = torch.load(voter_path, map_location="cpu")
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        state_dict = payload.get("state_dict", payload if isinstance(payload, dict) else {})
+        bundle = PosthocAggregationBundle.from_serializable_metadata(metadata)
+        bundle.load_state_dict(state_dict, strict=False)
+        bundle.eval()
+        bundle = bundle.to(self.device)
+        self.__dict__["_aggregation_bundle"] = bundle
+        self.__dict__["_aggregation_bundle_path"] = voter_path
+        return bundle
+
+    def _resolve_aggregation_runtime(
+        self,
+        aggregation_spec: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Optional[PosthocAggregationBundle]]:
+        spec = aggregation_spec or {}
+        mode = str(spec.get("mode", self.aggregation_mode or "mean")).lower().strip()
+        if mode not in {"mean", "voter"}:
+            mode = "mean"
+        path = spec.get("voter_path", None)
+        if mode != "voter":
+            return mode, None
+        bundle = self._load_posthoc_aggregation_bundle(path=path)
+        if bundle is None:
+            return "mean", None
+        return "voter", bundle
 
     def _expected_note_input_dim(self) -> Optional[int]:
         try:
@@ -4409,7 +4613,110 @@ class ContinualAnalysisGNN(LightningModule):
                     ),
                     "rn_onset_acc": float(onset_rna_acc.detach().cpu().item()) if onset_rna_acc is not None else None,
                     "rn_nct_acc": float(nct_rna_acc.detach().cpu().item()) if nct_rna_acc is not None else None,
+                    "task_acc": {
+                        task: float(val.detach().cpu().item())
+                        for task, val in accuracy_dict.items()
+                    },
                 }
+
+            if self.aggregation_compare_mean_in_test and not self.iterative_eval:
+                note_probs = self._predict_note_probs_once(
+                    data=batch,
+                    batch_size=batch_size,
+                    conditioning=batch_conditioning,
+                    overrides=None,
+                    x_dict_override=x_dict,
+                    neighbor_mask_node=num_sampled_nodes_dict,
+                    neighbor_mask_edge=num_sampled_edges_dict,
+                )
+                mean_probs = self._aggregate_note_probs(
+                    note_prob_dict=note_probs,
+                    data=batch,
+                    batch_size=batch_size,
+                    aggregation_mode="mean",
+                    aggregation_bundle=None,
+                )
+                voter_bundle = self._load_posthoc_aggregation_bundle(path=self.aggregation_voter_path)
+                voter_mode = "voter" if voter_bundle is not None else "mean"
+                voter_probs = self._aggregate_note_probs(
+                    note_prob_dict=note_probs,
+                    data=batch,
+                    batch_size=batch_size,
+                    aggregation_mode=voter_mode,
+                    aggregation_bundle=voter_bundle,
+                )
+
+                def _task_logits_from_probs(note_prob_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+                    out_logits: Dict[str, torch.Tensor] = {}
+                    for task in labels_dict.keys():
+                        if task not in note_prob_dict:
+                            continue
+                        task_probs = note_prob_dict[task][:batch_size]
+                        task_probs = task_probs[valid_label_mask]
+                        task_probs = task_probs[mask_dict[task]]
+                        out_logits[task] = torch.log(torch.clamp(task_probs, min=1e-8))
+                    return out_logits
+
+                mean_logits = _task_logits_from_probs(mean_probs)
+                voter_logits = _task_logits_from_probs(voter_probs)
+                mean_summary = _log_test_variant(
+                    metric_prefix="test_full_mean",
+                    variant_logits=mean_logits,
+                )
+                voter_summary = _log_test_variant(
+                    metric_prefix="test_full_voter",
+                    variant_logits=voter_logits,
+                )
+                if (
+                    mean_summary.get("total_loss") is not None
+                    and voter_summary.get("total_loss") is not None
+                ):
+                    self.log(
+                        f"test_full_delta/total_loss_voter_minus_mean_{gtask_key}",
+                        voter_summary["total_loss"] - mean_summary["total_loss"],
+                        add_dataloader_idx=True,
+                        batch_size=batch_size,
+                    )
+                if (
+                    mean_summary.get("rn_onset_acc") is not None
+                    and voter_summary.get("rn_onset_acc") is not None
+                ):
+                    self.log(
+                        f"test_full_delta/RN(Onset)_voter_minus_mean_{gtask_key}",
+                        voter_summary["rn_onset_acc"] - mean_summary["rn_onset_acc"],
+                        add_dataloader_idx=True,
+                        batch_size=batch_size,
+                    )
+                if (
+                    mean_summary.get("rn_nct_acc") is not None
+                    and voter_summary.get("rn_nct_acc") is not None
+                ):
+                    self.log(
+                        f"test_full_delta/RN(NCT)_voter_minus_mean_{gtask_key}",
+                        voter_summary["rn_nct_acc"] - mean_summary["rn_nct_acc"],
+                        add_dataloader_idx=True,
+                        batch_size=batch_size,
+                    )
+                key_tasks = [
+                    "romanNumeral",
+                    "degree2",
+                    "localkey",
+                    "quality",
+                    "inversion",
+                    "degree1",
+                ]
+                mean_task_acc = mean_summary.get("task_acc", {}) or {}
+                voter_task_acc = voter_summary.get("task_acc", {}) or {}
+                for task in key_tasks:
+                    if task not in mean_task_acc or task not in voter_task_acc:
+                        continue
+                    self.log(
+                        f"test_full_delta/{task}_acc_voter_minus_mean_{gtask_key}",
+                        voter_task_acc[task] - mean_task_acc[task],
+                        add_dataloader_idx=True,
+                        batch_size=batch_size,
+                    )
+                continue
 
             if self.iterative_eval:
                 x_valid = x
@@ -4729,6 +5036,7 @@ class ContinualAnalysisGNN(LightningModule):
         masked_spec: Optional[Dict[str, Any]] = None,
         return_edit_info: bool = False,
         iterative_spec: Optional[Dict[str, Any]] = None,
+        aggregation_spec: Optional[Dict[str, Any]] = None,
         return_iterative_trace: bool = False,
     ):
         """Predict analysis for a musical score.
@@ -4739,6 +5047,7 @@ class ContinualAnalysisGNN(LightningModule):
             masked_spec: Optional masked conditioning spec (known labels + mask).
             return_edit_info: If True, return (predictions, edit_info)
             iterative_spec: Optional iterative masked-refinement configuration.
+            aggregation_spec: Optional aggregation override {"mode": "mean|voter", "voter_path": "..."}.
             return_iterative_trace: If True, append iterative trace to output.
             
         Returns:
@@ -4861,10 +5170,13 @@ class ContinualAnalysisGNN(LightningModule):
                     overrides=overrides,
                     x_dict_override=x_dict,
                 )
+            aggregation_mode, aggregation_bundle = self._resolve_aggregation_runtime(aggregation_spec=aggregation_spec)
             predictions = self._aggregate_note_probs(
                 note_prob_dict=note_predictions,
                 data=data,
                 batch_size=batch_size,
+                aggregation_mode=aggregation_mode,
+                aggregation_bundle=aggregation_bundle,
             )
 
             outputs: List[Any] = [predictions]
