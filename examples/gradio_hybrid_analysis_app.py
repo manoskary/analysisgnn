@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import os
 import json
+import html as html_lib
+import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -32,6 +35,7 @@ from analysisgnn.inference.hybrid_predictor import (
     parse_task_csv,
     predictions_to_dataframe,
 )
+from analysisgnn.utils.roman_decode import decode_roman_numeral
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +71,14 @@ TASK_ALIASES: Dict[str, str] = {
 }
 
 _PREDICTOR_CACHE: Dict[Tuple[str, str, str], HybridAnalysisPredictor] = {}
+ASSETS_DIR = REPO_ROOT / "examples" / "assets"
+DEFAULT_EDGE_TYPES = ["onset", "consecutive", "during", "rest"]
+EDGE_LABELS = {
+    "onset": "Onset",
+    "consecutive": "Consecutive",
+    "during": "During",
+    "rest": "Rest",
+}
 
 
 def _resolve_score_path(score_file: Any) -> str:
@@ -181,6 +193,267 @@ def _apply_timing_from_predictions(df: pd.DataFrame, predictions: Dict[str, torc
     return out
 
 
+def _value_or_none(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
+def _parse_inversion_value(value: Any) -> Any:
+    val = _value_or_none(value)
+    if val is None:
+        return None
+    if isinstance(val, (int, np.integer)):
+        return int(val)
+    if isinstance(val, float):
+        return int(val)
+    text = str(val).strip()
+    if text == "":
+        return None
+    try:
+        return int(float(text))
+    except Exception:
+        mapping = {
+            "root": 0,
+            "root position": 0,
+            "6": 1,
+            "63": 1,
+            "first inversion": 1,
+            "64": 2,
+            "second inversion": 2,
+            "65": 1,
+            "43": 2,
+            "2": 3,
+            "42": 3,
+            "third inversion": 3,
+        }
+        return mapping.get(text.lower(), None)
+
+
+def _build_complete_rn_column(df: pd.DataFrame) -> pd.Series:
+    if df is None or len(df) == 0:
+        return pd.Series(dtype=object)
+    out: List[str] = []
+    required = ["degree1", "degree2", "inversion", "quality", "localkey"]
+    missing = [k for k in required if k not in df.columns]
+    if missing:
+        return pd.Series([""] * len(df), index=df.index, dtype=object)
+    for _, row in df.iterrows():
+        d1 = _value_or_none(row.get("degree1"))
+        d2 = _value_or_none(row.get("degree2"))
+        inv = _parse_inversion_value(row.get("inversion"))
+        quality = _value_or_none(row.get("quality"))
+        localkey = _value_or_none(row.get("localkey"))
+        if d1 is None or inv is None or quality is None or localkey is None:
+            out.append("")
+            continue
+        try:
+            rn = decode_roman_numeral(
+                degree1=str(d1),
+                degree2=str(d2) if d2 is not None else "None",
+                inversion=inv,
+                quality=str(quality),
+                localkey=str(localkey),
+                include_key=False,
+            )
+        except Exception:
+            rn = ""
+        out.append(rn)
+    return pd.Series(out, index=df.index, dtype=object)
+
+
+def _read_score_xml_text(score_path: str, score: pt.score.Score) -> str:
+    suffix = Path(score_path).suffix.lower()
+    if suffix in {".xml", ".musicxml"}:
+        with open(score_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    # For formats like .mxl, export score object to temporary MusicXML text.
+    with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        pt.save_musicxml(score, tmp_path)
+        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _sorted_note_array(score: pt.score.Score) -> np.ndarray:
+    note_array_raw = score.note_array(
+        include_time_signature=True,
+        include_pitch_spelling=True,
+        include_key_signature=True,
+        include_staff=True,
+        include_metrical_position=True,
+    )
+    sort_idx = np.argsort(note_array_raw, order=["onset_div", "pitch"])
+    return note_array_raw[sort_idx]
+
+
+def _extract_graph_edges_from_score(score: pt.score.Score, note_array: np.ndarray) -> Tuple[Dict[str, List[List[int]]], str]:
+    try:
+        from analysisgnn.descriptors import select_features
+        from graphmuse import create_score_graph
+    except Exception as exc:
+        return {k: [[], []] for k in DEFAULT_EDGE_TYPES}, f"Could not import graph builders ({exc})."
+
+    warning = ""
+    try:
+        note_features = select_features(note_array, "voice")
+    except Exception as exc:
+        warning = f"Feature selection for graph overlay failed ({exc}); using zero features."
+        note_features = np.zeros((len(note_array), 1), dtype=np.float32)
+    try:
+        measures = score[-1].measures
+    except Exception:
+        measures = None
+
+    try:
+        graph = create_score_graph(
+            note_features,
+            note_array,
+            measures=measures,
+            add_beats=True,
+            labels=None,
+        )
+        edge_index_dict = graph.edge_index_dict
+    except Exception as exc:
+        return {k: [[], []] for k in DEFAULT_EDGE_TYPES}, f"Graph construction failed ({exc})."
+
+    key_map = {
+        "onset": ("note", "onset", "note"),
+        "consecutive": ("note", "consecutive", "note"),
+        "during": ("note", "during", "note"),
+        "rest": ("note", "rest", "note"),
+    }
+    n = len(note_array)
+    edges: Dict[str, List[List[int]]] = {}
+    for edge_type, key in key_map.items():
+        if key not in edge_index_dict:
+            edges[edge_type] = [[], []]
+            continue
+        edge_index = edge_index_dict[key]
+        if isinstance(edge_index, torch.Tensor):
+            src = edge_index[0].detach().cpu().numpy()
+            dst = edge_index[1].detach().cpu().numpy()
+        else:
+            src = np.asarray(edge_index[0])
+            dst = np.asarray(edge_index[1])
+        valid = (src >= 0) & (src < n) & (dst >= 0) & (dst < n)
+        src = src[valid].astype(int).tolist()
+        dst = dst[valid].astype(int).tolist()
+        edges[edge_type] = [src, dst]
+    return edges, warning
+
+
+def _build_graph_overlay_payload(
+    score: pt.score.Score,
+    df: pd.DataFrame,
+    tasks: List[str],
+    edge_types: List[str],
+) -> Dict[str, Any]:
+    note_array = _sorted_note_array(score)
+    n = min(len(df), len(note_array))
+    data = df.iloc[:n].reset_index(drop=True).copy()
+    rn_full = _build_complete_rn_column(data)
+    edges_all, edge_warning = _extract_graph_edges_from_score(score, note_array[:n])
+
+    notes_payload: List[Dict[str, Any]] = []
+    for idx in range(n):
+        row = data.iloc[idx]
+        conf: Dict[str, float] = {}
+        task_vals: Dict[str, Any] = {}
+        for task in tasks:
+            if task in row.index:
+                task_vals[task] = _value_or_none(row.get(task))
+            conf_col = f"{task}_confidence"
+            if conf_col in row.index:
+                conf_val = _value_or_none(row.get(conf_col))
+                if conf_val is not None:
+                    try:
+                        conf[task] = float(conf_val)
+                    except Exception:
+                        pass
+
+        note_id = _value_or_none(row.get("note_id"))
+        if note_id is None and "id" in note_array.dtype.names:
+            note_id = _value_or_none(note_array["id"][idx])
+        notes_payload.append(
+            {
+                "row": int(_value_or_none(row.get("row")) if "row" in row.index else idx),
+                "note_id": str(note_id) if note_id is not None else None,
+                "onset_div": int(note_array["onset_div"][idx]) if "onset_div" in note_array.dtype.names else None,
+                "onset_beat": float(_value_or_none(row.get("onset_beat")) or 0.0),
+                "measure": int(_value_or_none(row.get("measure"))) if _value_or_none(row.get("measure")) is not None else None,
+                "duration_beat": float(_value_or_none(row.get("duration_beat")) or 0.0),
+                "pitch_midi": int(_value_or_none(row.get("pitch_midi"))) if _value_or_none(row.get("pitch_midi")) is not None else None,
+                "pitch_spelling": str(_value_or_none(row.get("pitch_spelling")) or ""),
+                "tasks": task_vals,
+                "confidence": conf,
+                "romanNumeral_full": str(rn_full.iloc[idx]) if idx < len(rn_full) else "",
+            }
+        )
+
+    visible = [et for et in edge_types if et in DEFAULT_EDGE_TYPES]
+    payload: Dict[str, Any] = {
+        "notes": notes_payload,
+        "edges": {k: edges_all.get(k, [[], []]) for k in DEFAULT_EDGE_TYPES},
+        "meta": {
+            "selected_tasks": list(tasks),
+            "visible_edge_types": visible,
+            "edge_warning": edge_warning,
+        },
+    }
+    return payload
+
+
+@lru_cache(maxsize=1)
+def _load_visual_assets() -> Tuple[str, str, str]:
+    template = (ASSETS_DIR / "verovio_score_graph.html").read_text(encoding="utf-8")
+    script = (ASSETS_DIR / "verovio_score_graph.js").read_text(encoding="utf-8")
+    style = (ASSETS_DIR / "verovio_score_graph.css").read_text(encoding="utf-8")
+    return template, script, style
+
+
+def _build_verovio_html(payload: Dict[str, Any]) -> str:
+    template, script, style = _load_visual_assets()
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    doc = template.replace("__AGN_CSS__", style)
+    doc = doc.replace("__AGN_JS__", script)
+    doc = doc.replace("__AGN_PAYLOAD_JSON__", payload_json)
+    srcdoc = html_lib.escape(doc, quote=True)
+    return (
+        "<iframe "
+        "style='width:100%;height:980px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
+        f"srcdoc=\"{srcdoc}\"></iframe>"
+    )
+
+
+def _build_visual_payload(
+    score_path: str,
+    score: pt.score.Score,
+    df: pd.DataFrame,
+    tasks: List[str],
+    edge_types: List[str],
+) -> Dict[str, Any]:
+    payload = _build_graph_overlay_payload(score=score, df=df, tasks=tasks, edge_types=edge_types)
+    payload["score_xml"] = _read_score_xml_text(score_path=score_path, score=score)
+    payload["score_format"] = "musicxml"
+    return payload
+
+
 def _build_iterative_spec(
     enable_iterative: bool,
     iterative_steps: int,
@@ -289,9 +562,16 @@ def run_full_inference(
         )
         if aggregation_warning:
             status = f"{status} | {aggregation_warning}"
-        return display_df, status, _format_trace(trace, show_trace)
+        visual_payload = _build_visual_payload(
+            score_path=score_path,
+            score=score,
+            df=display_df,
+            tasks=tasks,
+            edge_types=[],
+        )
+        return display_df, status, _format_trace(trace, show_trace), visual_payload
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}", ""
+        return pd.DataFrame(), f"Error: {exc}", "", {}
 
 
 def run_partial_rerender(
@@ -371,9 +651,70 @@ def run_partial_rerender(
         )
         if aggregation_warning:
             status = f"{status} | {aggregation_warning}"
-        return display_df, status, _format_trace(trace, show_trace)
+        visual_payload = _build_visual_payload(
+            score_path=score_path,
+            score=score,
+            df=display_df,
+            tasks=tasks,
+            edge_types=[],
+        )
+        return display_df, status, _format_trace(trace, show_trace), visual_payload
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}", ""
+        return pd.DataFrame(), f"Error: {exc}", "", {}
+
+
+def refresh_visual_tab(
+    score_file: Any,
+    task_labels: List[str],
+    tasks_csv: str,
+    table_data: Any,
+    edge_type_labels: List[str],
+    visual_state: Dict[str, Any],
+):
+    try:
+        selected_edge_types = [k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])]
+        tasks = _resolve_selected_tasks(task_labels, tasks_csv)
+        score_path = None
+        score = None
+        payload: Dict[str, Any] = {}
+
+        if score_file is not None:
+            score_path = _resolve_score_path(score_file)
+            score = _load_score(score_path)
+
+        df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
+        if score is not None and len(df) > 0:
+            payload = _build_visual_payload(
+                score_path=score_path,
+                score=score,
+                df=df,
+                tasks=tasks,
+                edge_types=selected_edge_types,
+            )
+        elif isinstance(visual_state, dict) and visual_state:
+            payload = dict(visual_state)
+            payload.setdefault("meta", {})
+            payload["meta"]["visible_edge_types"] = selected_edge_types
+        else:
+            raise ValueError("No predictions available yet. Run inference first to populate the visual tab.")
+
+        html_frame = _build_verovio_html(payload)
+        note_count = len(payload.get("notes", []))
+        edge_warning = ((payload.get("meta") or {}).get("edge_warning") or "").strip()
+        status = (
+            f"Visual refreshed: notes={note_count}, "
+            f"visible edges={','.join(selected_edge_types) if selected_edge_types else 'none'}."
+        )
+        if edge_warning:
+            status = f"{status} Graph warning: {edge_warning}"
+        return html_frame, status, payload
+    except Exception as exc:
+        fallback = (
+            "<div style='padding:12px;border:1px solid #d1d5db;border-radius:10px;background:#fff;'>"
+            f"Visual rendering error: {html_lib.escape(str(exc))}"
+            "</div>"
+        )
+        return fallback, f"Visual error: {exc}", visual_state if isinstance(visual_state, dict) else {}
 
 
 def build_demo() -> gr.Blocks:
@@ -385,6 +726,8 @@ Three explicit inference paths:
 - Base model for full-piece prediction.
 - Iterative refinement (no known labels at step 1) for apples-to-apples full-model benchmarking.
 - Masked model for edit-conditioned partial re-prediction.
+
+This app also includes a separate **Verovio Visual Score** tab for score + graph overlays.
 
 Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
 """)
@@ -401,7 +744,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             choices=list(AVAILABLE_TASKS.values()),
             value=[AVAILABLE_TASKS[t] for t in DEFAULT_EDITABLE_TASKS if t in AVAILABLE_TASKS],
             label="Select Analysis Tasks",
-            info="Choose which tasks to run and show in the editable table.",
+            info="Choose which tasks to run and show in the editable table and visual tab.",
         )
         tasks_csv = gr.Textbox(
             label="Tasks Override (internal keys CSV, optional)",
@@ -409,68 +752,94 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             info="Used only if no task is selected above. Example: romanNumeral,localkey,quality",
         )
 
-        mode_selector = gr.Dropdown(
-            label="Inference Mode",
-            choices=["Iterative (no known labels)", "Full", "Edit-conditioned"],
-            value="Iterative (no known labels)",
-            info="Use Iterative for fair full-vs-iter benchmarks; use Edit-conditioned for user-corrected rerenders.",
-        )
-        run_btn = gr.Button("Run Inference", variant="primary")
+        visual_payload_state = gr.State({})
 
-        with gr.Row():
-            enable_iterative = gr.Checkbox(
-                label="Enable Iterative Refinement",
-                value=False,
-            )
-            iterative_steps = gr.Number(
-                label="Refinement Steps",
-                value=10,
-                precision=0,
-            )
-            keep_percentile_per_step = gr.Number(
-                label="Keep Percentile/Step",
-                value=10.0,
-            )
-        with gr.Row():
-            aggregation_mode = gr.Dropdown(
-                label="Aggregation Mode",
-                choices=["Mean", "Voter"],
-                value="Mean",
-            )
-            voter_checkpoint_path = gr.Textbox(
-                label="Voter Checkpoint Path",
-                value="",
-                info="Optional. Required only when Aggregation Mode is Voter.",
-            )
-        with gr.Row():
-            target_only_update = gr.Checkbox(
-                label="Target-only overwrite (partial mode)",
-                value=True,
-            )
-            show_trace = gr.Checkbox(
-                label="Show Iteration Trace",
-                value=False,
-            )
+        with gr.Tabs():
+            with gr.Tab("Inference & Edits"):
+                mode_selector = gr.Dropdown(
+                    label="Inference Mode",
+                    choices=["Iterative (no known labels)", "Full", "Edit-conditioned"],
+                    value="Iterative (no known labels)",
+                    info="Use Iterative for fair full-vs-iter benchmarks; use Edit-conditioned for user-corrected rerenders.",
+                )
+                run_btn = gr.Button("Run Inference", variant="primary")
 
-        with gr.Row():
-            known_rows_expr = gr.Textbox(
-                label="Known Rows (1-based)",
-                value="",
-                info="Rows treated as known/corrected labels (context).",
-            )
-            target_rows_expr = gr.Textbox(
-                label="Target Rows (1-based, optional)",
-                value="",
-                info="Rows to re-predict. Empty means all non-known rows.",
-            )
+                with gr.Row():
+                    enable_iterative = gr.Checkbox(
+                        label="Enable Iterative Refinement",
+                        value=False,
+                    )
+                    iterative_steps = gr.Number(
+                        label="Refinement Steps",
+                        value=10,
+                        precision=0,
+                    )
+                    keep_percentile_per_step = gr.Number(
+                        label="Keep Percentile/Step",
+                        value=10.0,
+                    )
+                with gr.Row():
+                    aggregation_mode = gr.Dropdown(
+                        label="Aggregation Mode",
+                        choices=["Mean", "Voter"],
+                        value="Mean",
+                    )
+                    voter_checkpoint_path = gr.Textbox(
+                        label="Voter Checkpoint Path",
+                        value="",
+                        info="Optional. Required only when Aggregation Mode is Voter.",
+                    )
+                with gr.Row():
+                    target_only_update = gr.Checkbox(
+                        label="Target-only overwrite (partial mode)",
+                        value=True,
+                    )
+                    show_trace = gr.Checkbox(
+                        label="Show Iteration Trace",
+                        value=False,
+                    )
 
-        table = gr.Dataframe(
-            label="Predictions (editable)",
-            interactive=True,
-            wrap=True,
-        )
-        status = gr.Textbox(label="Status", interactive=False)
-        trace_output = gr.Textbox(label="Iteration Trace", interactive=False, lines=12)
+                with gr.Row():
+                    known_rows_expr = gr.Textbox(
+                        label="Known Rows (1-based)",
+                        value="",
+                        info="Rows treated as known/corrected labels (context).",
+                    )
+                    target_rows_expr = gr.Textbox(
+                        label="Target Rows (1-based, optional)",
+                        value="",
+                        info="Rows to re-predict. Empty means all non-known rows.",
+                    )
+
+                table = gr.Dataframe(
+                    label="Predictions (editable)",
+                    interactive=True,
+                    wrap=True,
+                )
+                status = gr.Textbox(label="Status", interactive=False)
+                trace_output = gr.Textbox(label="Iteration Trace", interactive=False, lines=12)
+
+            with gr.Tab("Verovio Visual Score"):
+                gr.Markdown(
+                    "Render the uploaded score with graph overlays. "
+                    "Click a note in the score to inspect note-level predictions and complete RN decoding."
+                )
+                visual_edge_types = gr.CheckboxGroup(
+                    label="Visible Edge Types",
+                    choices=[EDGE_LABELS[k] for k in DEFAULT_EDGE_TYPES],
+                    value=[],
+                    info="Edges are hidden by default; select one or more types and refresh.",
+                )
+                refresh_visual_btn = gr.Button("Refresh Visual from Latest Predictions", variant="secondary")
+                visual_html = gr.HTML(
+                    value=(
+                        "<div style='padding:12px;border:1px solid #d1d5db;border-radius:10px;background:#fff;'>"
+                        "Run inference first, then click “Refresh Visual from Latest Predictions”."
+                        "</div>"
+                    ),
+                    label="Verovio Score + Graph",
+                )
+                visual_status = gr.Textbox(label="Visual Status", interactive=False)
 
         def run_by_mode(
             mode: str,
@@ -562,7 +931,20 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 target_only_update,
                 show_trace,
             ],
-            outputs=[table, status, trace_output],
+            outputs=[table, status, trace_output, visual_payload_state],
+        )
+
+        refresh_visual_btn.click(
+            fn=refresh_visual_tab,
+            inputs=[
+                score_file,
+                task_selector,
+                tasks_csv,
+                table,
+                visual_edge_types,
+                visual_payload_state,
+            ],
+            outputs=[visual_html, visual_status, visual_payload_state],
         )
 
     return demo

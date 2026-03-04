@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AnalysisGNN Verovio Graph View</title>
+    <style>
+__AGN_CSS__
+    </style>
+  </head>
+  <body class="agn-root">
+    <div class="agn-toolbar">
+      <div class="agn-status" id="agn-status">Loading score view…</div>
+      <div class="agn-legend">
+        <span class="agn-chip"><span class="agn-dot" style="background:#2563eb;"></span>Onset</span>
+        <span class="agn-chip"><span class="agn-dot" style="background:#dc2626;"></span>Consecutive</span>
+        <span class="agn-chip"><span class="agn-dot" style="background:#16a34a;"></span>During</span>
+        <span class="agn-chip"><span class="agn-dot" style="background:#f59e0b;"></span>Rest</span>
+      </div>
+    </div>
+    <div class="agn-score-wrap">
+      <div class="agn-pages" id="agn-pages"></div>
+    </div>
+    <div class="agn-note-panel" id="agn-note-panel">
+      Click a note to inspect note-level analysis, confidences, and full Roman numeral decoding.
+    </div>
+
+    <script>
+      window.__AGN_PAYLOAD__ = __AGN_PAYLOAD_JSON__;
+    </script>
+    <script src="https://www.verovio.org/javascript/5.0.0/verovio-toolkit-wasm.js"></script>
+    <script>
+__AGN_JS__
+    </script>
+  </body>
+</html>

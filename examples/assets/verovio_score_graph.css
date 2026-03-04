@@ -1,0 +1,121 @@
+.agn-root {
+  font-family: "IBM Plex Sans", "Inter", system-ui, -apple-system, Segoe UI, sans-serif;
+  color: #0f172a;
+  background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
+  min-height: 100vh;
+  margin: 0;
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+.agn-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  background: #ffffff;
+  margin-bottom: 10px;
+}
+
+.agn-status {
+  font-size: 12px;
+  color: #334155;
+}
+
+.agn-legend {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.agn-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+}
+
+.agn-score-wrap {
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.agn-pages {
+  display: inline-flex;
+  gap: 0;
+  align-items: flex-start;
+}
+
+.agn-page {
+  position: relative;
+}
+
+.agn-note-panel {
+  margin-top: 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 12px;
+  min-height: 110px;
+}
+
+.agn-note-panel h3 {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+}
+
+.agn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+  font-size: 12px;
+}
+
+.agn-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: #f8fafc;
+}
+
+.agn-label {
+  color: #475569;
+}
+
+.agn-value {
+  color: #0f172a;
+  font-weight: 600;
+}
+
+g.note.agn-active use,
+g.note.agn-active > use,
+g.note.agn-active path,
+g.note.agn-active > path,
+g.note.agn-active ellipse,
+g.note.agn-active > ellipse,
+g.note.agn-active circle,
+g.note.agn-active > circle {
+  fill: #2563eb !important;
+  stroke: #2563eb !important;
+  filter: drop-shadow(0 0 2px rgba(37, 99, 235, 0.85));
+}
+
+.agn-edge {
+  pointer-events: none;
+  fill: none;
+  stroke-opacity: 0.35;
+  stroke-linecap: round;
+}
