@@ -13,6 +13,7 @@ import torch
 import argparse
 import wandb
 import os
+import hashlib
 from pathlib import Path
 import numpy as np
 from pytorch_lightning import Trainer, seed_everything
@@ -47,6 +48,21 @@ TASK_DICT = {
         "note_degree": 49,
         "staff": 4,
     }
+
+
+def _clip_wandb_label(value: str, *, max_len: int = 128, field_name: str = "label") -> str:
+    """Clip long W&B identifiers while preserving uniqueness."""
+    text = str(value or "").strip()
+    if len(text) <= max_len:
+        return text
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+    keep = max(1, max_len - len(digest) - 1)
+    clipped = f"{text[:keep]}-{digest}"
+    print(
+        f"Warning: W&B {field_name} exceeded {max_len} chars; "
+        f"using clipped value '{clipped}'."
+    )
+    return clipped
 
 
 def get_parser():
@@ -982,11 +998,13 @@ def main():
                 f"-bs={config['batch_size']}"
                 f"-lr={config['lr']}{ckpt_tag}"
             )
+        run_name = _clip_wandb_label(run_name, max_len=128, field_name="name")
         group = (
             f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-"
             f"{masked_tag}-{masked_tasks_tag}-{preserve_tag}-{iterative_tag}-"
             f"{iterative_eval_tag}-{iterative_eval_zero_known_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
         )
+        group = _clip_wandb_label(group, max_len=128, field_name="group")
         job_type = phase
         user_tags = args.tags.split(",") if args.tags != "" else []
         tags = [
