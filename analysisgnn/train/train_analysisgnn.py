@@ -868,6 +868,58 @@ def main():
         ckpt = torch.load(config["checkpoint_path"], map_location="cpu")
         ckpt_state = ckpt.get("state_dict", {})
         ckpt_hparams = ckpt.get("hyper_parameters", {}) if isinstance(ckpt, dict) else {}
+        # Align architecture-critical knobs to checkpoint values so eval/resume
+        # does not fail on linear shape mismatches when CLI defaults differ.
+        if isinstance(ckpt_hparams, dict):
+            ckpt_fusion = ckpt_hparams.get("musicbert_fusion", None)
+            if ckpt_fusion is not None and config.get("musicbert_fusion") != ckpt_fusion:
+                print(
+                    "Warning: overriding musicbert_fusion from checkpoint "
+                    f"({config.get('musicbert_fusion')} -> {ckpt_fusion}) for shape compatibility."
+                )
+                config["musicbert_fusion"] = ckpt_fusion
+            ckpt_base_in = ckpt_hparams.get("base_in_channels", None)
+            if ckpt_base_in is not None:
+                try:
+                    ckpt_base_in = int(ckpt_base_in)
+                    if config.get("base_in_channels") != ckpt_base_in:
+                        print(
+                            "Warning: overriding base_in_channels from checkpoint "
+                            f"({config.get('base_in_channels')} -> {ckpt_base_in})."
+                        )
+                        config["base_in_channels"] = ckpt_base_in
+                except Exception:
+                    pass
+            ckpt_in = ckpt_hparams.get("in_channels", None)
+            if ckpt_in is not None:
+                try:
+                    ckpt_in = int(ckpt_in)
+                    if config.get("in_channels") != ckpt_in:
+                        print(
+                            "Warning: overriding in_channels from checkpoint "
+                            f"({config.get('in_channels')} -> {ckpt_in})."
+                        )
+                        config["in_channels"] = ckpt_in
+                except Exception:
+                    pass
+            for k in ("musicbert_hidden_size", "musicbert_embedding_dim"):
+                v = ckpt_hparams.get(k, None)
+                if v is not None:
+                    try:
+                        config[k] = int(v)
+                    except Exception:
+                        pass
+        ckpt_note_proj = ckpt_state.get("model.project_dict.note.0.weight", None)
+        if isinstance(ckpt_note_proj, torch.Tensor) and ckpt_note_proj.ndim == 2:
+            # project_dict.note consumes [x_note || pitch_emb || key_emb], where
+            # pitch/key contribute 128 dims in total.
+            inferred_in = int(ckpt_note_proj.shape[1]) - 128
+            if inferred_in > 0 and int(config.get("in_channels", inferred_in)) != inferred_in:
+                print(
+                    "Warning: inferred in_channels from checkpoint note projection "
+                    f"({config.get('in_channels')} -> {inferred_in})."
+                )
+                config["in_channels"] = inferred_in
         has_note_encoder = any(key.startswith("note_encoder.") for key in ckpt_state.keys())
         has_label_conditioning = any(
             key.startswith("label_condition_embeddings.") or key.startswith("label_condition_fusion.")
