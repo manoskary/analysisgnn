@@ -119,3 +119,12 @@ g.note.agn-active > circle {
   stroke-opacity: 0.35;
   stroke-linecap: round;
 }
+
+.agn-rn-label {
+  fill: #111827;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: "IBM Plex Sans", "Inter", system-ui, -apple-system, Segoe UI, sans-serif;
+  text-anchor: middle;
+  pointer-events: none;
+}

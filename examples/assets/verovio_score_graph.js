@@ -61,7 +61,10 @@
     const confEntries = Object.entries(note.confidence || {});
     const cards = [];
     cards.push(`<div class="agn-card"><div class="agn-label">Row</div><div class="agn-value">${escapeHtml(note.row)}</div></div>`);
-    cards.push(`<div class="agn-card"><div class="agn-label">Note ID</div><div class="agn-value">${escapeHtml(note.note_id || "")}</div></div>`);
+    cards.push(`<div class="agn-card"><div class="agn-label">Score Note ID</div><div class="agn-value">${escapeHtml(note.note_id || "")}</div></div>`);
+    if (note.table_note_id != null && String(note.table_note_id).trim() !== "") {
+      cards.push(`<div class="agn-card"><div class="agn-label">Table Note ID</div><div class="agn-value">${escapeHtml(note.table_note_id)}</div></div>`);
+    }
     cards.push(`<div class="agn-card"><div class="agn-label">Pitch</div><div class="agn-value">${escapeHtml(note.pitch_spelling || "")} (${escapeHtml(note.pitch_midi || "")})</div></div>`);
     cards.push(`<div class="agn-card"><div class="agn-label">Timing</div><div class="agn-value">m${escapeHtml(note.measure || "")} @ ${escapeHtml(note.onset_beat || "")}</div></div>`);
     cards.push(`<div class="agn-card"><div class="agn-label">Complete RN</div><div class="agn-value">${escapeHtml(note.romanNumeral_full || "")}</div></div>`);
@@ -73,6 +76,22 @@
       );
     }
     panelEl.innerHTML = `<h3>Note Analysis</h3><div class="agn-grid">${cards.join("")}</div>`;
+  }
+
+  function findNoteElementById(noteId) {
+    if (!noteId) return null;
+    const raw = String(noteId);
+    const direct = document.getElementById(raw);
+    if (direct) return direct;
+    const noteEls = iterNoteElements(pagesEl);
+    for (const noteEl of noteEls) {
+      const nid = String(noteEl.id || "");
+      if (!nid) continue;
+      if (nid === raw || nid.endsWith(raw) || nid.includes(raw)) {
+        return noteEl;
+      }
+    }
+    return null;
   }
 
   function ensureVerovioReady() {
@@ -166,12 +185,14 @@
       }
 
       const allRenderedNotes = iterNoteElements(pagesEl);
-      const mappedRows = new Set();
+      const mappedIdx = new Set();
       // First pass: map by note id.
-      for (const note of notes) {
+      for (let i = 0; i < notes.length; i += 1) {
+        const note = notes[i];
+        const noteIndex = Number(note && note.index != null ? note.index : i);
         const noteId = note && note.note_id ? String(note.note_id) : "";
         if (!noteId) continue;
-        const element = document.getElementById(noteId);
+        const element = findNoteElementById(noteId);
         if (!element) continue;
         const noteGroup = element.classList && element.classList.contains("note")
           ? element
@@ -181,20 +202,21 @@
         if (!pageMargin) continue;
         const xy = glyphXY(noteGroup);
         if (!xy) continue;
-        noteMap.set(Number(note.row), {
+        noteMap.set(noteIndex, {
           note,
           noteGroup,
           pageMargin,
           x: xy.x,
           y: xy.y,
         });
-        mappedRows.add(Number(note.row));
+        mappedIdx.add(noteIndex);
       }
       // Fallback: map remaining rows by sequence order.
       let renderIdx = 0;
-      for (const note of notes) {
-        const row = Number(note.row);
-        if (mappedRows.has(row)) continue;
+      for (let i = 0; i < notes.length; i += 1) {
+        const note = notes[i];
+        const noteIndex = Number(note && note.index != null ? note.index : i);
+        if (mappedIdx.has(noteIndex)) continue;
         if (renderIdx >= allRenderedNotes.length) break;
         const noteGroup = allRenderedNotes[renderIdx];
         renderIdx += 1;
@@ -202,7 +224,7 @@
         if (!pageMargin) continue;
         const xy = glyphXY(noteGroup);
         if (!xy) continue;
-        noteMap.set(row, {
+        noteMap.set(noteIndex, {
           note,
           noteGroup,
           pageMargin,
@@ -241,17 +263,58 @@
         }
       }
 
-      function setActiveRow(row) {
+      function renderRomanNumeralOverlay() {
+        const spans = (((payload.meta || {}).roman_spans) || []);
+        if (!Array.isArray(spans) || spans.length === 0) return 0;
+        const onsetAnchors = new Map();
+        for (const item of noteMap.values()) {
+          const onset = Number(item.note && item.note.onset_div);
+          if (!Number.isFinite(onset)) continue;
+          const prev = onsetAnchors.get(onset);
+          if (!prev || item.x < prev.x) {
+            onsetAnchors.set(onset, item);
+          }
+        }
+        const pageLabelY = new Map();
+        let drawn = 0;
+        for (const span of spans) {
+          const onset = Number(span.start_onset_div);
+          const label = String((span.label == null ? "" : span.label)).trim();
+          if (!Number.isFinite(onset) || !label) continue;
+          const anchor = onsetAnchors.get(onset);
+          if (!anchor) continue;
+          let y = pageLabelY.get(anchor.pageMargin);
+          if (y == null) {
+            try {
+              const box = anchor.pageMargin.getBBox();
+              y = Number(box.y + box.height + 22);
+            } catch (_err) {
+              y = Number(anchor.y + 28);
+            }
+            pageLabelY.set(anchor.pageMargin, y);
+          }
+          const textEl = document.createElementNS("http://www.w3.org/2000/svg", "text");
+          textEl.setAttribute("x", String(anchor.x));
+          textEl.setAttribute("y", String(y));
+          textEl.setAttribute("class", "agn-rn-label");
+          textEl.textContent = label;
+          anchor.pageMargin.appendChild(textEl);
+          drawn += 1;
+        }
+        return drawn;
+      }
+
+      function setActiveNote(noteIndex) {
         for (const item of noteMap.values()) {
           item.noteGroup.classList.remove("agn-active");
         }
-        const item = noteMap.get(Number(row));
+        const item = noteMap.get(Number(noteIndex));
         if (!item) return;
         item.noteGroup.classList.add("agn-active");
       }
 
-      function highlightIncident(row) {
-        const r = String(row);
+      function highlightIncident(noteIndex) {
+        const r = String(noteIndex);
         for (const edge of edgeEls) {
           const isVisibleType = visibleTypes.has(edge.dataset.edgeType);
           const incident = edge.dataset.src === r || edge.dataset.dst === r;
@@ -264,17 +327,19 @@
         }
       }
 
-      for (const [row, item] of noteMap.entries()) {
+      for (const [noteIndex, item] of noteMap.entries()) {
         item.noteGroup.addEventListener("click", () => {
-          setActiveRow(row);
-          highlightIncident(row);
+          setActiveNote(noteIndex);
+          highlightIncident(noteIndex);
           renderPanel(item.note);
         });
       }
+      const rnLabelCount = renderRomanNumeralOverlay();
 
       setStatus(
         `Rendered ${notes.length} notes in horizontal continuous view (${pageCount} svg page fragment(s)). ` +
-        `Visible edges: ${Array.from(visibleTypes).join(", ") || "none"}`
+        `Visible edges: ${Array.from(visibleTypes).join(", ") || "none"}. ` +
+        `RN labels: ${rnLabelCount}`
       );
       renderPanel(null);
     } catch (error) {

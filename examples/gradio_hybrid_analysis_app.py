@@ -61,14 +61,10 @@ AVAILABLE_TASKS: Dict[str, str] = {
     "romanNumeral": "Roman Numeral Analysis",
     "phrase": "Phrase Segmentation",
     "section": "Section Detection",
-    "hrhythm": "Harmonic Rhythm",
-    "pcset": "Pitch-Class Set",
     "tpc_in_label": "Non-Chord Tone (NCT)",
     "note_degree": "Note Degree",
 }
-TASK_ALIASES: Dict[str, str] = {
-    "hrythm": "hrhythm",
-}
+TASK_ALIASES: Dict[str, str] = {}
 
 _PREDICTOR_CACHE: Dict[Tuple[str, str, str], HybridAnalysisPredictor] = {}
 ASSETS_DIR = REPO_ROOT / "examples" / "assets"
@@ -125,6 +121,7 @@ def _get_predictor(full_ckpt: str, masked_ckpt: str, device: str) -> HybridAnaly
 
 def _resolve_selected_tasks(task_labels: List[str], tasks_csv: str) -> List[str]:
     label_to_task = {v: k for k, v in AVAILABLE_TASKS.items()}
+    supported_tasks = set(AVAILABLE_TASKS.keys())
     if task_labels:
         tasks = [label_to_task[label] for label in task_labels if label in label_to_task]
     else:
@@ -132,8 +129,12 @@ def _resolve_selected_tasks(task_labels: List[str], tasks_csv: str) -> List[str]
     normalized: List[str] = []
     for task in tasks:
         resolved = TASK_ALIASES.get(task, task)
+        if resolved not in supported_tasks:
+            continue
         if resolved not in normalized:
             normalized.append(resolved)
+    if not normalized:
+        normalized = [t for t in DEFAULT_EDITABLE_TASKS if t in supported_tasks]
     return normalized
 
 
@@ -290,6 +291,126 @@ def _read_score_xml_text(score_path: str, score: pt.score.Score) -> str:
             pass
 
 
+def _build_complete_rn_spans(df: pd.DataFrame) -> List[Tuple[int, int, str]]:
+    """Build non-redundant Roman Numeral spans over onset_div."""
+    if df is None or len(df) == 0:
+        return []
+    if "onset_div" not in df.columns:
+        return []
+
+    work = df.copy()
+    if "romanNumeral_full" not in work.columns:
+        work["romanNumeral_full"] = _build_complete_rn_column(work)
+    if "duration_div" not in work.columns:
+        return []
+
+    work["onset_div"] = pd.to_numeric(work["onset_div"], errors="coerce")
+    work["duration_div"] = pd.to_numeric(work["duration_div"], errors="coerce").fillna(0)
+    work["romanNumeral_full"] = work["romanNumeral_full"].fillna("").astype(str).str.strip()
+    work = work.dropna(subset=["onset_div"])
+    if len(work) == 0:
+        return []
+
+    by_onset = (
+        work.sort_values(["onset_div", "duration_div"])
+        .groupby("onset_div", sort=True)
+    )
+    onset_points: List[int] = []
+    onset_rn: List[str] = []
+    for onset, group in by_onset:
+        onset_i = int(onset)
+        candidates = [v for v in group["romanNumeral_full"].tolist() if v]
+        rn_value = candidates[0] if candidates else ""
+        onset_points.append(onset_i)
+        onset_rn.append(rn_value)
+    if not onset_points:
+        return []
+
+    score_end = int(np.max(work["onset_div"].to_numpy() + np.maximum(1, work["duration_div"].to_numpy())))
+    spans: List[Tuple[int, int, str]] = []
+    current_rn = ""
+    current_start: int | None = None
+    for onset, rn in zip(onset_points, onset_rn):
+        if rn == current_rn:
+            continue
+        if current_rn and current_start is not None and onset > current_start:
+            spans.append((current_start, onset, current_rn))
+        current_rn = rn
+        current_start = onset if rn else None
+    if current_rn and current_start is not None:
+        final_end = max(current_start + 1, score_end)
+        spans.append((current_start, final_end, current_rn))
+    return spans
+
+
+def _read_score_xml_with_complete_rn(
+    score_path: str,
+    score: pt.score.Score,
+    df: pd.DataFrame,
+) -> str:
+    """Export MusicXML with RomanNumeral harmony spans inserted."""
+    if df is None or len(df) == 0:
+        return _read_score_xml_text(score_path, score)
+
+    note_array = _sorted_note_array(score)
+    n = min(len(df), len(note_array))
+    if n == 0:
+        return _read_score_xml_text(score_path, score)
+
+    work = df.iloc[:n].reset_index(drop=True).copy()
+    if "onset_div" in note_array.dtype.names:
+        work["onset_div"] = note_array["onset_div"][:n]
+    if "duration_div" in note_array.dtype.names:
+        work["duration_div"] = note_array["duration_div"][:n]
+    work["romanNumeral_full"] = _build_complete_rn_column(work)
+    spans = _build_complete_rn_spans(work)
+    if not spans:
+        return _read_score_xml_text(score_path, score)
+
+    try:
+        score_for_xml = _load_score(score_path)
+    except Exception:
+        score_for_xml = score
+    parts = list(getattr(score_for_xml, "parts", []) or [])
+    if not parts:
+        return _read_score_xml_text(score_path, score)
+
+    harmony_classes = tuple(
+        cls for cls in (pt.score.Harmony, pt.score.RomanNumeral, pt.score.ChordSymbol) if cls is not None
+    )
+    for part in parts:
+        for cls in harmony_classes:
+            try:
+                to_remove = list(part.iter_all(cls))
+            except Exception:
+                to_remove = []
+            for obj in to_remove:
+                try:
+                    part.remove(obj)
+                except Exception:
+                    pass
+
+    target_part = parts[0]
+    for start_div, end_div, rn_text in spans:
+        try:
+            rn_obj = pt.score.RomanNumeral(text=str(rn_text))
+            target_part.add(rn_obj, start=int(start_div), end=int(end_div))
+        except Exception:
+            continue
+
+    with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        pt.save_musicxml(score_for_xml, tmp_path)
+        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _sorted_note_array(score: pt.score.Score) -> np.ndarray:
     note_array_raw = score.note_array(
         include_time_signature=True,
@@ -368,6 +489,13 @@ def _build_graph_overlay_payload(
     n = min(len(df), len(note_array))
     data = df.iloc[:n].reset_index(drop=True).copy()
     rn_full = _build_complete_rn_column(data)
+    spans_df = data.copy()
+    if "onset_div" in note_array.dtype.names:
+        spans_df["onset_div"] = note_array["onset_div"][:n]
+    if "duration_div" in note_array.dtype.names:
+        spans_df["duration_div"] = note_array["duration_div"][:n]
+    spans_df["romanNumeral_full"] = rn_full
+    rn_spans = _build_complete_rn_spans(spans_df)
     edges_all, edge_warning = _extract_graph_edges_from_score(score, note_array[:n])
 
     notes_payload: List[Dict[str, Any]] = []
@@ -388,12 +516,13 @@ def _build_graph_overlay_payload(
                         pass
 
         note_id = _value_or_none(row.get("note_id"))
-        if note_id is None and "id" in note_array.dtype.names:
-            note_id = _value_or_none(note_array["id"][idx])
+        score_note_id = _value_or_none(note_array["id"][idx]) if "id" in note_array.dtype.names else None
         notes_payload.append(
             {
+                "index": idx,
                 "row": int(_value_or_none(row.get("row")) if "row" in row.index else idx),
-                "note_id": str(note_id) if note_id is not None else None,
+                "note_id": str(score_note_id) if score_note_id is not None else (str(note_id) if note_id is not None else None),
+                "table_note_id": str(note_id) if note_id is not None else None,
                 "onset_div": int(note_array["onset_div"][idx]) if "onset_div" in note_array.dtype.names else None,
                 "onset_beat": float(_value_or_none(row.get("onset_beat")) or 0.0),
                 "measure": int(_value_or_none(row.get("measure"))) if _value_or_none(row.get("measure")) is not None else None,
@@ -414,6 +543,15 @@ def _build_graph_overlay_payload(
             "selected_tasks": list(tasks),
             "visible_edge_types": visible,
             "edge_warning": edge_warning,
+            "roman_spans": [
+                {
+                    "start_onset_div": int(s),
+                    "end_onset_div": int(e),
+                    "label": str(lbl),
+                }
+                for s, e, lbl in rn_spans
+                if str(lbl).strip()
+            ],
         },
     }
     return payload
@@ -449,7 +587,11 @@ def _build_visual_payload(
     edge_types: List[str],
 ) -> Dict[str, Any]:
     payload = _build_graph_overlay_payload(score=score, df=df, tasks=tasks, edge_types=edge_types)
-    payload["score_xml"] = _read_score_xml_text(score_path=score_path, score=score)
+    payload["score_xml"] = _read_score_xml_with_complete_rn(
+        score_path=score_path,
+        score=score,
+        df=df,
+    )
     payload["score_format"] = "musicxml"
     return payload
 
