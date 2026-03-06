@@ -51,7 +51,7 @@ DEFAULT_TASKS = ",".join(DEFAULT_EDITABLE_TASKS)
 AVAILABLE_TASKS: Dict[str, str] = {
     "cadence": "Cadence Detection",
     "localkey": "Local Key",
-    "tonkey": "Tonalized Key",
+    "tonkey": "Tonicized Key",
     "quality": "Chord Quality",
     "root": "Chord Root",
     "bass": "Bass Note",

@@ -254,7 +254,7 @@ And the model predicts on the note level:
 - Sections
 - Pedal Notes
 - Local Key
-- Tonalized Key
+- Tonicized Key
 - Chord Degree
 - Inversion
 - Quality
