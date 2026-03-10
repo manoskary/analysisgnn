@@ -403,6 +403,7 @@ class HybridAnalysisPredictor:
         force_route: Optional[str] = None,
         return_edit_info: bool = False,
         return_iterative_trace: bool = False,
+        return_beat_predictions: bool = False,
         return_route: bool = False,
     ) -> Any:
         """Predict using the full or masked model depending on the request payload."""
@@ -428,6 +429,7 @@ class HybridAnalysisPredictor:
             aggregation_spec=aggregation_spec,
             return_edit_info=return_edit_info,
             return_iterative_trace=return_iterative_trace,
+            return_beat_predictions=return_beat_predictions,
         )
 
         if not return_route:

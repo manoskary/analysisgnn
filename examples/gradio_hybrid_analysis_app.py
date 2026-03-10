@@ -20,7 +20,7 @@ import html as html_lib
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 import numpy as np
@@ -46,6 +46,23 @@ DEFAULT_FULL_CKPT = os.environ.get(
 DEFAULT_MASKED_CKPT = os.environ.get(
     "ANALYSISGNN_MASKED_CKPT",
     str(REPO_ROOT / "artifacts" / "gradio_checkpoints" / "t7pxcwri_masked_last.ckpt"),
+)
+
+
+def _resolve_optional_default_path(env_key: str, fallback: Path) -> str:
+    env_val = os.environ.get(env_key, "").strip()
+    if env_val:
+        return env_val if os.path.exists(env_val) else ""
+    return str(fallback) if fallback.exists() else ""
+
+
+DEFAULT_VOTER_CKPT = _resolve_optional_default_path(
+    "ANALYSISGNN_VOTER_CKPT",
+    REPO_ROOT / "artifacts" / "posthoc_voter" / "uocj8f6y_voter.pt",
+)
+DEFAULT_BEAT_VOTER_CKPT = _resolve_optional_default_path(
+    "ANALYSISGNN_BEAT_VOTER_CKPT",
+    Path(DEFAULT_VOTER_CKPT) if DEFAULT_VOTER_CKPT else REPO_ROOT / "artifacts" / "posthoc_voter" / "uocj8f6y_voter.pt",
 )
 DEFAULT_TASKS = ",".join(DEFAULT_EDITABLE_TASKS)
 AVAILABLE_TASKS: Dict[str, str] = {
@@ -75,6 +92,17 @@ EDGE_LABELS = {
     "during": "During",
     "rest": "Rest",
 }
+DEFAULT_BEAT_TASKS = [
+    "cadence",
+    "phrase",
+    "romanNumeral",
+    "root",
+    "bass",
+    "degree1",
+    "degree2",
+    "inversion",
+    "localkey",
+]
 
 
 def _resolve_score_path(score_file: Any) -> str:
@@ -618,16 +646,113 @@ def _build_iterative_spec(
     }
 
 
-def _build_aggregation_spec(aggregation_mode: str, voter_path: str) -> Tuple[Dict[str, Any], str]:
+def _build_aggregation_spec(
+    aggregation_mode: str,
+    voter_path: str,
+    *,
+    beat_tasks: Optional[List[str]] = None,
+) -> Tuple[Dict[str, Any], str]:
     mode_raw = str(aggregation_mode or "Mean").strip().lower()
-    mode = "voter" if mode_raw == "voter" else "mean"
+    mode_map = {
+        "mean": "mean",
+        "voter": "voter",
+        "voter consistent beat": "voter_consistent_beat",
+        "voter_consistent_beat": "voter_consistent_beat",
+    }
+    mode = mode_map.get(mode_raw, "mean")
     path = (voter_path or "").strip()
-    if mode == "voter" and not path:
-        return {"mode": "mean"}, "Aggregation mode 'Voter' selected without checkpoint; falling back to mean."
+    if mode in {"voter", "voter_consistent_beat"} and not path:
+        return {"mode": "mean"}, (
+            f"Aggregation mode '{aggregation_mode}' selected without checkpoint; falling back to mean."
+        )
+    if mode in {"voter", "voter_consistent_beat"} and path and not os.path.exists(path):
+        return {"mode": "mean"}, (
+            f"Voter checkpoint not found at '{path}'; falling back to mean."
+        )
     spec: Dict[str, Any] = {"mode": mode}
-    if mode == "voter":
+    if mode in {"voter", "voter_consistent_beat"}:
         spec["voter_path"] = path
+    if beat_tasks:
+        spec["beat_tasks"] = [t for t in beat_tasks if t]
     return spec, ""
+
+
+def _is_trace_payload(obj: Any) -> bool:
+    return isinstance(obj, dict) and "enabled" in obj and "steps" in obj
+
+
+def _is_beat_payload(obj: Any) -> bool:
+    return isinstance(obj, dict) and "rows" in obj and "tasks" in obj and "mode" in obj
+
+
+def _parse_predict_output(
+    output: Any,
+    *,
+    enable_iterative: bool,
+    enable_beat: bool,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any], Optional[Dict[str, Any]]]:
+    default_trace: Dict[str, Any] = {"enabled": False, "steps": []}
+    if isinstance(output, tuple):
+        if len(output) == 0:
+            return {}, default_trace, None
+        predictions = output[0]
+        trace = default_trace
+        beat_payload = None
+        for item in output[1:]:
+            if _is_trace_payload(item):
+                trace = item
+            elif _is_beat_payload(item):
+                beat_payload = item
+        if enable_iterative and trace is default_trace:
+            trace = {"enabled": True, "steps": []}
+        if enable_beat and beat_payload is None:
+            beat_payload = {"rows": [], "tasks": [], "mode": "mean"}
+        return predictions, trace, beat_payload
+    return output, default_trace, None
+
+
+def _beat_payload_to_dataframe(
+    beat_payload: Optional[Dict[str, Any]],
+    beat_tasks: List[str],
+) -> pd.DataFrame:
+    if not isinstance(beat_payload, dict):
+        return pd.DataFrame()
+    rows = beat_payload.get("rows", [])
+    if not rows:
+        return pd.DataFrame()
+    payload_tasks = beat_payload.get("tasks", [])
+    tasks = [t for t in beat_tasks if t in payload_tasks] if beat_tasks else list(payload_tasks)
+    if not tasks:
+        tasks = list(payload_tasks)
+
+    flat_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        out: Dict[str, Any] = {
+            "beat_id": row.get("beat_id"),
+            "beat_index": row.get("beat_index"),
+            "measure": row.get("measure"),
+            "onset_beat": row.get("onset_beat"),
+            "note_count": row.get("note_count"),
+            "romanNumeral_full": row.get("romanNumeral_full", ""),
+        }
+        task_map = row.get("tasks", {}) if isinstance(row, dict) else {}
+        for task in tasks:
+            entry = task_map.get(task, {}) if isinstance(task_map, dict) else {}
+            out[task] = entry.get("label")
+            out[f"{task}_confidence"] = entry.get("confidence")
+            out[f"{task}_conflict_flag"] = entry.get("conflict_flag")
+            out[f"{task}_conflict_prob"] = entry.get("conflict_prob")
+        flat_rows.append(out)
+
+    beat_df = pd.DataFrame(flat_rows)
+    core_cols = ["beat_id", "beat_index", "measure", "onset_beat", "note_count", "romanNumeral_full"]
+    ordered_cols: List[str] = [c for c in core_cols if c in beat_df.columns]
+    for task in tasks:
+        for col in [task, f"{task}_confidence", f"{task}_conflict_flag", f"{task}_conflict_prob"]:
+            if col in beat_df.columns:
+                ordered_cols.append(col)
+    remaining = [c for c in beat_df.columns if c not in ordered_cols]
+    return beat_df[ordered_cols + remaining]
 
 
 def _format_trace(trace: Dict[str, Any], show_trace: bool) -> str:
@@ -653,6 +778,10 @@ def run_full_inference(
     keep_percentile_per_step: float,
     aggregation_mode: str,
     voter_checkpoint_path: str,
+    enable_beat: bool,
+    beat_aggregation_mode: str,
+    beat_voter_checkpoint_path: str,
+    beat_tasks: List[str],
     show_trace: bool,
 ):
     try:
@@ -682,11 +811,11 @@ def run_full_inference(
                 return_iterative_trace=bool(enable_iterative),
                 return_route=True,
             )
-        if enable_iterative:
-            predictions, trace = output
-        else:
-            predictions = output
-            trace = {"enabled": False, "steps": []}
+        predictions, trace, _ = _parse_predict_output(
+            output,
+            enable_iterative=bool(enable_iterative),
+            enable_beat=False,
+        )
 
         full_df = predictions_to_dataframe(
             score=score,
@@ -704,6 +833,42 @@ def run_full_inference(
         )
         if aggregation_warning:
             status = f"{status} | {aggregation_warning}"
+
+        beat_df = pd.DataFrame()
+        beat_status = "Beat-level aggregation disabled."
+        if bool(enable_beat):
+            selected_beat_tasks = [t for t in (beat_tasks or []) if t]
+            if not selected_beat_tasks:
+                selected_beat_tasks = list(DEFAULT_BEAT_TASKS)
+            beat_agg_spec, beat_agg_warning = _build_aggregation_spec(
+                aggregation_mode=beat_aggregation_mode,
+                voter_path=beat_voter_checkpoint_path,
+                beat_tasks=selected_beat_tasks,
+            )
+            with torch.no_grad():
+                beat_output_raw = predictor.predict(
+                    score,
+                    force_route="full",
+                    iterative_spec=iterative_spec,
+                    aggregation_spec=beat_agg_spec,
+                    return_beat_predictions=True,
+                    return_route=False,
+                )
+            _, _, beat_payload = _parse_predict_output(
+                beat_output_raw,
+                enable_iterative=False,
+                enable_beat=True,
+            )
+            beat_df = _beat_payload_to_dataframe(
+                beat_payload=beat_payload,
+                beat_tasks=selected_beat_tasks,
+            )
+            beat_status = (
+                f"Beat-level table ready: rows={len(beat_df)} mode={beat_agg_spec.get('mode', 'mean')}"
+            )
+            if beat_agg_warning:
+                beat_status = f"{beat_status} | {beat_agg_warning}"
+
         visual_payload = _build_visual_payload(
             score_path=score_path,
             score=score,
@@ -711,9 +876,9 @@ def run_full_inference(
             tasks=tasks,
             edge_types=[],
         )
-        return display_df, status, _format_trace(trace, show_trace), visual_payload
+        return display_df, status, _format_trace(trace, show_trace), visual_payload, beat_df, beat_status
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}", "", {}
+        return pd.DataFrame(), f"Error: {exc}", "", {}, pd.DataFrame(), ""
 
 
 def run_partial_rerender(
@@ -732,6 +897,10 @@ def run_partial_rerender(
     target_only_update: bool,
     aggregation_mode: str,
     voter_checkpoint_path: str,
+    enable_beat: bool,
+    beat_aggregation_mode: str,
+    beat_voter_checkpoint_path: str,
+    beat_tasks: List[str],
     show_trace: bool,
 ):
     try:
@@ -770,11 +939,11 @@ def run_partial_rerender(
                 return_iterative_trace=bool(enable_iterative),
                 return_route=True,
             )
-        if enable_iterative:
-            predictions, trace = output
-        else:
-            predictions = output
-            trace = {"enabled": False, "steps": []}
+        predictions, trace, _ = _parse_predict_output(
+            output,
+            enable_iterative=bool(enable_iterative),
+            enable_beat=False,
+        )
 
         out_df = predictions_to_dataframe(
             score=score,
@@ -793,6 +962,43 @@ def run_partial_rerender(
         )
         if aggregation_warning:
             status = f"{status} | {aggregation_warning}"
+
+        beat_df = pd.DataFrame()
+        beat_status = "Beat-level aggregation disabled."
+        if bool(enable_beat):
+            selected_beat_tasks = [t for t in (beat_tasks or []) if t]
+            if not selected_beat_tasks:
+                selected_beat_tasks = list(DEFAULT_BEAT_TASKS)
+            beat_agg_spec, beat_agg_warning = _build_aggregation_spec(
+                aggregation_mode=beat_aggregation_mode,
+                voter_path=beat_voter_checkpoint_path,
+                beat_tasks=selected_beat_tasks,
+            )
+            with torch.no_grad():
+                beat_output_raw = predictor.predict(
+                    score,
+                    user_edits=user_edits,
+                    masked_spec=masked_spec,
+                    iterative_spec=iterative_spec,
+                    aggregation_spec=beat_agg_spec,
+                    return_beat_predictions=True,
+                    return_route=False,
+                )
+            _, _, beat_payload = _parse_predict_output(
+                beat_output_raw,
+                enable_iterative=False,
+                enable_beat=True,
+            )
+            beat_df = _beat_payload_to_dataframe(
+                beat_payload=beat_payload,
+                beat_tasks=selected_beat_tasks,
+            )
+            beat_status = (
+                f"Beat-level table ready: rows={len(beat_df)} mode={beat_agg_spec.get('mode', 'mean')}"
+            )
+            if beat_agg_warning:
+                beat_status = f"{beat_status} | {beat_agg_warning}"
+
         visual_payload = _build_visual_payload(
             score_path=score_path,
             score=score,
@@ -800,9 +1006,9 @@ def run_partial_rerender(
             tasks=tasks,
             edge_types=[],
         )
-        return display_df, status, _format_trace(trace, show_trace), visual_payload
+        return display_df, status, _format_trace(trace, show_trace), visual_payload, beat_df, beat_status
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}", "", {}
+        return pd.DataFrame(), f"Error: {exc}", "", {}, pd.DataFrame(), ""
 
 
 def refresh_visual_tab(
@@ -928,8 +1134,31 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     )
                     voter_checkpoint_path = gr.Textbox(
                         label="Voter Checkpoint Path",
-                        value="",
+                        value=DEFAULT_VOTER_CKPT,
                         info="Optional. Required only when Aggregation Mode is Voter.",
+                    )
+                with gr.Accordion("Beat-Level Aggregation (Optional)", open=False):
+                    with gr.Row():
+                        enable_beat = gr.Checkbox(
+                            label="Enable Beat-Level Aggregation",
+                            value=False,
+                        )
+                        beat_aggregation_mode = gr.Dropdown(
+                            label="Beat Aggregation Mode",
+                            choices=["Mean", "Voter", "Voter Consistent Beat"],
+                            value="Mean",
+                        )
+                    with gr.Row():
+                        beat_voter_checkpoint_path = gr.Textbox(
+                            label="Beat Voter Checkpoint Path",
+                            value=DEFAULT_BEAT_VOTER_CKPT,
+                            info="Required for Voter or Voter Consistent Beat.",
+                        )
+                    beat_tasks = gr.CheckboxGroup(
+                        label="Beat Tasks",
+                        choices=[(AVAILABLE_TASKS.get(t, t), t) for t in DEFAULT_BEAT_TASKS if t in AVAILABLE_TASKS],
+                        value=[t for t in DEFAULT_BEAT_TASKS if t in AVAILABLE_TASKS],
+                        info="Tasks to include in the beat-level table.",
                     )
                 with gr.Row():
                     target_only_update = gr.Checkbox(
@@ -960,6 +1189,12 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 )
                 status = gr.Textbox(label="Status", interactive=False)
                 trace_output = gr.Textbox(label="Iteration Trace", interactive=False, lines=12)
+                beat_status = gr.Textbox(label="Beat Status", interactive=False)
+                beat_table = gr.Dataframe(
+                    label="Beat-Level Table",
+                    interactive=False,
+                    wrap=True,
+                )
 
             with gr.Tab("Verovio Visual Score"):
                 gr.Markdown(
@@ -999,6 +1234,10 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             keep_percentile_per_step: float,
             aggregation_mode: str,
             voter_checkpoint_path: str,
+            enable_beat: bool,
+            beat_aggregation_mode: str,
+            beat_voter_checkpoint_path: str,
+            beat_tasks: List[str],
             target_only_update: bool,
             show_trace: bool,
         ):
@@ -1016,6 +1255,10 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     keep_percentile_per_step=keep_percentile_per_step,
                     aggregation_mode=aggregation_mode,
                     voter_checkpoint_path=voter_checkpoint_path,
+                    enable_beat=enable_beat,
+                    beat_aggregation_mode=beat_aggregation_mode,
+                    beat_voter_checkpoint_path=beat_voter_checkpoint_path,
+                    beat_tasks=beat_tasks,
                     show_trace=show_trace,
                 )
             if mode_value == "Iterative (no known labels)":
@@ -1031,6 +1274,10 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     keep_percentile_per_step=keep_percentile_per_step,
                     aggregation_mode=aggregation_mode,
                     voter_checkpoint_path=voter_checkpoint_path,
+                    enable_beat=enable_beat,
+                    beat_aggregation_mode=beat_aggregation_mode,
+                    beat_voter_checkpoint_path=beat_voter_checkpoint_path,
+                    beat_tasks=beat_tasks,
                     show_trace=show_trace,
                 )
             return run_partial_rerender(
@@ -1048,6 +1295,10 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 keep_percentile_per_step=keep_percentile_per_step,
                 aggregation_mode=aggregation_mode,
                 voter_checkpoint_path=voter_checkpoint_path,
+                enable_beat=enable_beat,
+                beat_aggregation_mode=beat_aggregation_mode,
+                beat_voter_checkpoint_path=beat_voter_checkpoint_path,
+                beat_tasks=beat_tasks,
                 target_only_update=target_only_update,
                 show_trace=show_trace,
             )
@@ -1070,10 +1321,14 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 keep_percentile_per_step,
                 aggregation_mode,
                 voter_checkpoint_path,
+                enable_beat,
+                beat_aggregation_mode,
+                beat_voter_checkpoint_path,
+                beat_tasks,
                 target_only_update,
                 show_trace,
             ],
-            outputs=[table, status, trace_output, visual_payload_state],
+            outputs=[table, status, trace_output, visual_payload_state, beat_table, beat_status],
         )
 
         refresh_visual_btn.click(

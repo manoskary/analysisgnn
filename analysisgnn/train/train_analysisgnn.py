@@ -14,6 +14,7 @@ import argparse
 import wandb
 import os
 import hashlib
+import re
 from pathlib import Path
 import numpy as np
 from pytorch_lightning import Trainer, seed_everything
@@ -23,6 +24,19 @@ from pytorch_lightning.tuner import Tuner
 # for repeatability
 seed_everything(0, workers=True)
 torch.multiprocessing.set_sharing_strategy("file_system")
+
+
+class WarmupEarlyStopping(EarlyStopping):
+    """EarlyStopping that is inactive before a minimum epoch."""
+
+    def __init__(self, *args, start_epoch: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_epoch = max(0, int(start_epoch))
+
+    def _should_skip_check(self, trainer) -> bool:
+        if trainer.current_epoch < self.start_epoch:
+            return True
+        return super()._should_skip_check(trainer)
 
 TASK_DICT = {
         "cadence": 4,
@@ -49,6 +63,30 @@ TASK_DICT = {
         "staff": 4,
     }
 
+WANDB_TASK_ABBR = {
+    "all": "all",
+    "rna": "rna",
+    "cadence": "cad",
+    "localkey": "lk",
+    "tonkey": "tk",
+    "quality": "ql",
+    "inversion": "inv",
+    "root": "rt",
+    "bass": "bs",
+    "degree1": "d1",
+    "degree2": "d2",
+    "romanNumeral": "rn",
+    "section": "sec",
+    "phrase": "phr",
+    "organ_point": "op",
+    "tpc_in_label": "nct",
+    "tpc_is_root": "nct_rt",
+    "tpc_is_bass": "nct_bs",
+    "downbeat": "db",
+    "note_degree": "nd",
+    "staff": "stf",
+}
+
 
 def _clip_wandb_label(value: str, *, max_len: int = 128, field_name: str = "label") -> str:
     """Clip long W&B identifiers while preserving uniqueness."""
@@ -63,6 +101,41 @@ def _clip_wandb_label(value: str, *, max_len: int = 128, field_name: str = "labe
         f"using clipped value '{clipped}'."
     )
     return clipped
+
+
+def _sanitize_wandb_token(value: str) -> str:
+    """Normalize free-form text into a W&B-safe token."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9._-]+", "_", text)
+    text = text.strip("._-")
+    return text or "none"
+
+
+def _compact_task_tag(tasks, *, field_name: str, max_items: int = 6, max_len: int = 48) -> str:
+    """Build short deterministic task tags for W&B names/groups."""
+    if isinstance(tasks, str):
+        raw_items = [x.strip() for x in tasks.split(",") if x.strip()]
+    else:
+        raw_items = [str(x).strip() for x in (tasks or []) if str(x).strip()]
+
+    compact = []
+    seen = set()
+    for task in raw_items:
+        token = WANDB_TASK_ABBR.get(task, _sanitize_wandb_token(task))
+        if token in seen:
+            continue
+        seen.add(token)
+        compact.append(token)
+
+    overflow = 0
+    if len(compact) > max_items:
+        overflow = len(compact) - max_items
+        compact = compact[:max_items]
+    if overflow > 0:
+        compact.append(f"plus{overflow}")
+
+    label = ".".join(compact) if compact else "none"
+    return _clip_wandb_label(label, max_len=max_len, field_name=field_name)
 
 
 def get_parser():
@@ -239,14 +312,69 @@ def get_parser():
     parser.add_argument(
         "--iterative_train_consistency_lambda",
         type=float,
-        default=0.1,
+        default=0.02,
         help="KL consistency weight between pass-1 and pass-2 on pseudo-frozen nodes.",
+    )
+    parser.add_argument(
+        "--iterative_train_start_epoch",
+        type=int,
+        default=8,
+        help="Epoch to start iterative pass-2 refinement (before this, pass-2 is disabled).",
+    )
+    parser.add_argument(
+        "--iterative_train_keep_ratio_start",
+        type=float,
+        default=0.05,
+        help="Pass-2 pseudo-freeze ratio at iterative_train_start_epoch.",
+    )
+    parser.add_argument(
+        "--iterative_train_keep_ratio_end",
+        type=float,
+        default=0.30,
+        help="Pass-2 pseudo-freeze ratio at end of training.",
+    )
+    parser.add_argument(
+        "--iterative_train_conf_min",
+        type=float,
+        default=0.80,
+        help="Minimum confidence for pseudo-label freezing candidates in pass-2.",
+    )
+    parser.add_argument(
+        "--iterative_train_min_remaining_ratio",
+        type=float,
+        default=0.20,
+        help="Minimum target-node ratio that must remain unfrozen for pass-2.",
+    )
+    parser.add_argument(
+        "--iterative_train_pass2_weight_start",
+        type=float,
+        default=0.25,
+        help="Pass-2 loss weight at iterative_train_start_epoch.",
+    )
+    parser.add_argument(
+        "--iterative_train_pass2_weight_end",
+        type=float,
+        default=0.75,
+        help="Pass-2 loss weight at end of training.",
     )
     parser.add_argument(
         "--iterative_eval",
         action="store_true",
         help="Enable LLaDA-style iterative refinement during validation/test (no known labels at step 1).",
     )
+    parser.add_argument(
+        "--iterative_eval_during_fit",
+        dest="iterative_eval_during_fit",
+        action="store_true",
+        help="Also compute iterative metrics during validation epochs (logged under val_iter/*).",
+    )
+    parser.add_argument(
+        "--no_iterative_eval_during_fit",
+        dest="iterative_eval_during_fit",
+        action="store_false",
+        help="Skip iterative validation during fit; keep iterative benchmarking for test only.",
+    )
+    parser.set_defaults(iterative_eval_during_fit=False)
     parser.add_argument(
         "--iterative_eval_steps",
         type=int,
@@ -294,14 +422,14 @@ def get_parser():
         "--aggregation_mode",
         type=str,
         default="mean",
-        choices=["mean", "voter"],
+        choices=["mean", "voter", "voter_consistent_beat"],
         help="Post-hoc aggregation mode for onset/beat/measure pooling.",
     )
     parser.add_argument(
         "--aggregation_voter_path",
         type=str,
         default=None,
-        help="Path to post-hoc voter checkpoint artifact (used when aggregation_mode=voter).",
+        help="Path to post-hoc voter checkpoint artifact (used when aggregation_mode=voter|voter_consistent_beat).",
     )
     parser.add_argument(
         "--aggregation_compare_mean_in_test",
@@ -383,12 +511,18 @@ def get_parser():
     parser.add_argument("--plateau_factor", type=float, default=0.5, help="ReduceLROnPlateau factor.")
     parser.add_argument("--plateau_patience", type=int, default=6, help="ReduceLROnPlateau patience.")
     parser.add_argument("--plateau_min_lr", type=float, default=1e-6, help="ReduceLROnPlateau minimum LR.")
-    parser.add_argument("--monitor_metric", type=str, default="val/total_loss",
+    parser.add_argument("--monitor_metric", type=str, default="val_full/total_loss",
                         help="Metric used by checkpointing/early stopping and plateau scheduler.")
     parser.add_argument("--monitor_mode", type=str, default="min", choices=["min", "max"],
                         help="Optimization mode for monitor_metric.")
     parser.add_argument("--early_stop_patience", type=int, default=12, help="Early stopping patience.")
     parser.add_argument("--early_stop_min_delta", type=float, default=0.002, help="Early stopping min_delta.")
+    parser.add_argument(
+        "--early_stop_start_epoch",
+        type=int,
+        default=12,
+        help="Do not activate early stopping before this epoch.",
+    )
     parser.add_argument("--optimizer_stats_log_every_n_steps", type=int, default=50,
                         help="Log LR and gradient norms every N optimizer steps.")
     parser.add_argument(
@@ -441,7 +575,7 @@ def get_parser():
     parser.add_argument(
         "--freeze_graph_encoder_stage_epochs",
         type=int,
-        default=15,
+        default=5,
         help="When preserve_pretrained is enabled, freeze graph encoder for this many initial epochs.",
     )
     parser.add_argument(
@@ -453,13 +587,13 @@ def get_parser():
     parser.add_argument(
         "--preserve_stage_a_lr",
         type=float,
-        default=1e-4,
+        default=5e-5,
         help="Stage-A learning rate (preserve_pretrained).",
     )
     parser.add_argument(
         "--preserve_stage_b_lr",
         type=float,
-        default=5e-5,
+        default=3e-5,
         help="Stage-B learning rate (preserve_pretrained).",
     )
     parser.add_argument(
@@ -629,7 +763,7 @@ def main():
         config["scheduler_type"] = "cosine_warmup"
         if config.get("mt_conflict_method", "none") == "none":
             config["mt_conflict_method"] = "pcgrad"
-        config["monitor_metric"] = "val/total_loss"
+        config["monitor_metric"] = "val_full/total_loss"
         config["monitor_mode"] = "min"
         config["early_stopping"] = True
         config["lr"] = 1e-3
@@ -667,6 +801,18 @@ def main():
         if config.get("feedback_mode", "single_pass") != "single_pass":
             raise ValueError("Only --feedback_mode single_pass is currently supported.")
     if config.get("iterative_refine_train", False):
+        keep_ratio_legacy = float(config.get("iterative_train_keep_ratio", 0.5))
+        keep_ratio_start_cfg = float(config.get("iterative_train_keep_ratio_start", 0.05))
+        keep_ratio_end_cfg = float(config.get("iterative_train_keep_ratio_end", 0.30))
+        if keep_ratio_legacy != 0.5 and keep_ratio_start_cfg == 0.05 and keep_ratio_end_cfg == 0.30:
+            config["iterative_train_keep_ratio_start"] = keep_ratio_legacy
+            config["iterative_train_keep_ratio_end"] = keep_ratio_legacy
+        pass2_weight_legacy = float(config.get("iterative_train_pass2_weight", 1.0))
+        pass2_weight_start_cfg = float(config.get("iterative_train_pass2_weight_start", 0.25))
+        pass2_weight_end_cfg = float(config.get("iterative_train_pass2_weight_end", 0.75))
+        if pass2_weight_legacy != 1.0 and pass2_weight_start_cfg == 0.25 and pass2_weight_end_cfg == 0.75:
+            config["iterative_train_pass2_weight_start"] = pass2_weight_legacy
+            config["iterative_train_pass2_weight_end"] = pass2_weight_legacy
         steps = int(config.get("iterative_train_steps", 2))
         if steps < 1:
             raise ValueError("--iterative_train_steps must be >= 1.")
@@ -676,6 +822,22 @@ def main():
         keep_ratio = float(config.get("iterative_train_keep_ratio", 0.5))
         if keep_ratio < 0 or keep_ratio > 1:
             raise ValueError("--iterative_train_keep_ratio must be in [0, 1].")
+        keep_ratio_start = float(config.get("iterative_train_keep_ratio_start", 0.05))
+        keep_ratio_end = float(config.get("iterative_train_keep_ratio_end", 0.30))
+        if keep_ratio_start < 0 or keep_ratio_start > 1:
+            raise ValueError("--iterative_train_keep_ratio_start must be in [0, 1].")
+        if keep_ratio_end < 0 or keep_ratio_end > 1:
+            raise ValueError("--iterative_train_keep_ratio_end must be in [0, 1].")
+        conf_min = float(config.get("iterative_train_conf_min", 0.80))
+        if conf_min < 0 or conf_min > 1:
+            raise ValueError("--iterative_train_conf_min must be in [0, 1].")
+        min_rem = float(config.get("iterative_train_min_remaining_ratio", 0.20))
+        if min_rem < 0 or min_rem > 1:
+            raise ValueError("--iterative_train_min_remaining_ratio must be in [0, 1].")
+        pass2_w_start = float(config.get("iterative_train_pass2_weight_start", 0.25))
+        pass2_w_end = float(config.get("iterative_train_pass2_weight_end", 0.75))
+        if pass2_w_start < 0 or pass2_w_end < 0:
+            raise ValueError("--iterative_train_pass2_weight_start/end must be >= 0.")
         if not config.get("masked_prediction_train", False):
             print("Warning: --iterative_refine_train requires masked prediction; disabling iterative refine train.")
             config["iterative_refine_train"] = False
@@ -693,13 +855,15 @@ def main():
             raise ValueError(f"Unknown iterative eval task(s): {unknown_eval_tasks}")
 
     aggregation_mode = str(config.get("aggregation_mode", "mean")).lower().strip()
-    if aggregation_mode not in {"mean", "voter"}:
+    if aggregation_mode not in {"mean", "voter", "voter_consistent_beat"}:
         print(f"Warning: unknown aggregation_mode '{aggregation_mode}', falling back to 'mean'.")
         aggregation_mode = "mean"
     aggregation_voter_path = config.get("aggregation_voter_path")
-    if aggregation_mode == "voter":
+    if aggregation_mode in {"voter", "voter_consistent_beat"}:
         if not aggregation_voter_path:
-            print("Warning: aggregation_mode=voter but no aggregation_voter_path was provided; using mean.")
+            print(
+                "Warning: aggregation_mode requires aggregation_voter_path but none was provided; using mean."
+            )
             aggregation_mode = "mean"
         elif not os.path.exists(aggregation_voter_path):
             print(
@@ -1001,6 +1165,9 @@ def main():
     if config["use_wandb"]:
 
         task_group = "-".join(config["main_tasks"])
+        task_group_tag = _compact_task_tag(
+            config.get("main_tasks", []), field_name="main_tasks_group"
+        )
         musicbert_tag = "mb"
         if not config.get("use_musicbert", False):
             musicbert_tag = "no-mb"
@@ -1014,10 +1181,19 @@ def main():
             musicbert_tag = "mb-unfrozen"
 
         aug = "aug" if config.get("use_transpositions", True) else "noaug"
-        feature_tag = config.get("feature_type", "cadence")
+        feature_tag = _sanitize_wandb_token(config.get("feature_type", "cadence"))
         arch_tag = "no-gnn" if config.get("disable_graph_encoder", False) else "gnn"
         masked_tag = "masked" if config.get("masked_prediction_train", False) else "nomasked"
-        masked_tasks_tag = "-".join(config.get("masked_tasks", [])) if config.get("masked_prediction_train", False) else "none"
+        masked_tasks_tag = (
+            _compact_task_tag(
+                config.get("masked_tasks", []),
+                field_name="masked_tasks_group",
+                max_items=4,
+                max_len=36,
+            )
+            if config.get("masked_prediction_train", False)
+            else "none"
+        )
         preserve_tag = "preserve" if config.get("preserve_pretrained", False) else "nopreserve"
         iterative_tag = "iterrefine" if config.get("iterative_refine_train", False) else "noiterrefine"
         iterative_eval_tag = "itereval" if config.get("iterative_eval", False) else "noitereval"
@@ -1033,7 +1209,7 @@ def main():
             ckpt_tag = f"-ckpt={ckpt_parent}"
         run_name = (
             f"{phase}-{model_arch}"
-            f"-tasks={task_group}"
+            f"-tasks={task_group_tag}"
             f"-feat={feature_tag}"
                 f"-{musicbert_tag}"
                 f"-{arch_tag}"
@@ -1044,17 +1220,19 @@ def main():
                 f"-{iterative_tag}"
                 f"-{iterative_eval_tag}"
                 f"-{iterative_eval_zero_known_tag}"
-                f"-sched={config['scheduler_type']}"
-                f"-conf={config['mt_conflict_method']}"
+                f"-sched={_sanitize_wandb_token(config['scheduler_type'])}"
+                f"-conf={_sanitize_wandb_token(config['mt_conflict_method'])}"
                 f"-ep={config['num_epochs']}"
                 f"-bs={config['batch_size']}"
                 f"-lr={config['lr']}{ckpt_tag}"
             )
         run_name = _clip_wandb_label(run_name, max_len=128, field_name="name")
         group = (
-            f"{task_group}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-"
+            f"{task_group_tag}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-"
             f"{masked_tag}-{masked_tasks_tag}-{preserve_tag}-{iterative_tag}-"
-            f"{iterative_eval_tag}-{iterative_eval_zero_known_tag}-{config['scheduler_type']}-{config['mt_conflict_method']}"
+            f"{iterative_eval_tag}-{iterative_eval_zero_known_tag}-"
+            f"{_sanitize_wandb_token(config['scheduler_type'])}-"
+            f"{_sanitize_wandb_token(config['mt_conflict_method'])}"
         )
         group = _clip_wandb_label(group, max_len=128, field_name="group")
         job_type = phase
@@ -1063,7 +1241,7 @@ def main():
             t
             for t in [
                 phase,
-                task_group,
+                task_group_tag,
                 feature_tag,
                 musicbert_tag,
                 arch_tag,
@@ -1116,7 +1294,7 @@ def main():
                 wandb_logger = None
                 config["use_wandb"] = False
 
-    monitor_metric = config.get("monitor_metric", "val/total_loss")
+    monitor_metric = config.get("monitor_metric", "val_full/total_loss")
     monitor_mode = config.get("monitor_mode", "min")
     checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor=monitor_metric, mode=monitor_mode, save_last=True)
     # Set up spawn strategy
@@ -1129,11 +1307,12 @@ def main():
         callbacks.append(swa)
     if config.get("early_stopping", True):
         callbacks.append(
-            EarlyStopping(
+            WarmupEarlyStopping(
                 monitor=monitor_metric,
                 mode=monitor_mode,
                 patience=config.get("early_stop_patience", 12),
                 min_delta=config.get("early_stop_min_delta", 0.002),
+                start_epoch=config.get("early_stop_start_epoch", 12),
                 check_finite=True,
                 strict=False,
             )
