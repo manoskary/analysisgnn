@@ -1,0 +1,257 @@
+cadence,localkey,tonkey,quality,root,bass,inversion,degree1,degree2,romanNumeral,onset,s_measure
+0,G,G,major triad,G,G,0,1,None,I,-1.0,1
+0,G,G,major triad,G,G,0,1,None,I,-0.5,1
+0,G,G,major triad,G,G,0,1,None,I,0.0,2
+0,G,G,major triad,G,G,0,1,None,I,0.0,2
+0,G,G,minor triad,A,A,0,5,None,viio,1.0,2
+0,G,G,minor triad,A,A,0,5,None,viio,1.0,2
+0,G,G,major triad,G,B,1,1,None,I,2.0,2
+0,G,G,major triad,G,B,1,1,None,I,2.0,2
+0,G,G,major triad,G,B,1,1,None,I,3.0,3
+0,G,G,major triad,G,B,1,1,None,I,3.0,3
+0,G,G,diminished triad,F#,A,0,7,None,viio,4.0,3
+0,G,G,diminished triad,F#,A,0,7,None,viio,4.0,3
+0,G,G,dominant seventh chord,D,A,1,5,None,V7,5.0,3
+0,G,G,dominant seventh chord,D,F#,1,5,None,V7,5.5,3
+0,G,G,diminished triad,D,F#,1,5,None,viio,6.0,4
+0,G,G,diminished triad,D,F#,1,5,None,viio,6.0,4
+0,G,G,major triad,G,G,0,1,None,I,7.0,4
+0,G,G,major triad,G,G,0,1,None,I,7.0,4
+0,G,G,diminished triad,A,A,0,7,None,viio,8.0,4
+0,G,G,diminished triad,A,A,0,7,None,viio,8.0,4
+0,G,G,diminished triad,F#,A,0,7,None,viio,9.0,5
+0,G,G,diminished triad,F#,A,0,7,None,viio,9.0,5
+0,G,G,major triad,G,G,0,1,None,I,10.0,5
+0,G,G,major triad,G,G,0,1,None,I,10.0,5
+0,G,G,major triad,G,G,0,1,None,I,11.0,5
+0,G,G,major triad,G,G,0,1,None,I,11.5,5
+0,G,G,minor triad,E,G,1,6,None,vi,12.0,6
+0,G,G,minor triad,E,G,1,6,None,vi,12.0,6
+0,G,G,minor triad,E,G,1,6,None,vi,13.0,6
+0,G,G,minor triad,E,G,1,6,None,vi,13.5,6
+0,G,D,diminished triad,C#,E,1,7,5,viio,14.0,6
+0,G,D,diminished triad,C#,E,1,7,5,viio,14.0,6
+0,G,D,dominant seventh chord,A,C#,1,5,5,V7,15.0,7
+0,G,D,dominant seventh chord,A,C#,1,5,5,V7,15.0,7
+0,G,D,dominant seventh chord,A,C#,1,5,5,V7,15.5,7
+0,G,D,dominant seventh chord,A,A,0,5,5,V7,16.0,7
+0,G,D,dominant seventh chord,A,A,0,5,5,V7,16.0,7
+0,G,D,dominant seventh chord,A,A,0,5,5,V7,16.5,7
+0,G,G,major triad,D,D,0,5,None,V,17.0,7
+0,G,G,major triad,D,D,0,5,None,V,17.0,7
+0,G,G,major triad,G,G,0,1,None,I,18.0,8
+0,G,G,major triad,G,G,0,1,None,I,18.0,8
+0,G,G,major triad,G,G,0,1,None,I,18.333334,8
+0,G,G,major triad,G,G,0,1,None,I,18.666666,8
+0,G,G,major triad,D,A,0,5,None,V,19.0,8
+0,G,G,major triad,D,A,0,5,None,V,19.0,8
+0,G,D,major triad,A,A,0,5,5,V,20.0,8
+0,G,D,major triad,A,A,0,5,5,V,20.0,8
+3,G,G,major triad,D,D,0,5,None,V,21.0,9
+3,G,G,major triad,D,D,0,5,None,V,21.0,9
+0,G,G,major triad,D,D,0,5,None,V,22.0,9
+0,G,G,major triad,G,D,0,5,None,V7,23.0,10
+0,G,G,major triad,G,D,0,5,None,V7,23.5,10
+0,G,A,major triad,E,E,0,5,2,V,24.0,11
+0,G,A,major triad,E,E,0,5,2,V,24.0,11
+0,G,A,dominant seventh chord,E,E,0,5,2,V7,25.0,11
+0,G,A,dominant seventh chord,E,E,0,5,2,V7,25.0,11
+0,G,G,minor triad,A,C,1,2,None,ii,26.0,11
+0,G,G,minor triad,A,C,1,2,None,ii,26.0,11
+0,G,G,diminished triad,B,B,0,5,None,viio,27.0,12
+0,G,G,diminished triad,B,B,0,5,None,viio,27.0,12
+0,G,G,minor triad,A,A,0,2,None,ii,28.0,12
+0,G,G,minor triad,A,A,0,2,None,ii,28.0,12
+0,G,G,diminished triad,D,A,0,7,None,viio,29.0,12
+0,G,G,diminished triad,D,A,0,7,None,viio,29.0,12
+0,G,G,diminished triad,D,F#,0,7,None,viio,29.5,12
+0,G,G,diminished triad,D,F#,0,7,None,viio,29.5,12
+0,G,G,major triad,D,D,0,5,None,V,30.0,13
+0,G,G,major triad,D,D,0,5,None,V,30.0,13
+0,G,G,major triad,D,D,0,5,None,V,31.0,13
+0,G,G,major triad,D,D,0,5,None,V,31.0,13
+0,G,G,major triad,G,B,1,1,None,I,32.0,13
+0,G,G,major triad,G,B,1,1,None,I,32.0,13
+0,G,G,minor triad,A,A,0,2,None,ii,33.0,14
+0,G,G,minor triad,A,A,0,2,None,ii,33.0,14
+0,G,G,major triad,G,G,0,1,None,I,34.0,14
+0,G,G,major triad,G,G,0,1,None,I,34.0,14
+0,G,G,minor triad,A,C,1,2,None,ii,35.0,14
+0,G,G,minor triad,A,C,1,2,None,ii,35.5,14
+0,G,G,minor triad,A,C,1,2,None,ii,36.0,15
+0,G,G,minor triad,A,C,1,2,None,ii,36.0,15
+0,G,G,minor triad,A,C,1,2,None,ii,37.0,15
+0,G,G,minor triad,A,C,1,2,None,ii,37.5,15
+0,G,G,major triad,D,A,1,5,None,V7,38.0,15
+0,G,G,major triad,D,A,1,5,None,V7,38.0,15
+0,G,G,major triad,D,F#,1,5,None,V,39.0,16
+0,G,G,major triad,D,F#,1,5,None,V,39.0,16
+0,G,G,major triad,D,F#,1,5,None,V,39.5,16
+0,G,G,dominant seventh chord,D,D,0,5,None,V7,40.0,16
+0,G,G,dominant seventh chord,D,D,0,5,None,V7,40.0,16
+0,G,G,dominant seventh chord,D,D,0,5,None,V7,40.5,16
+0,G,G,major triad,G,G,0,1,None,I,41.0,16
+0,G,G,major triad,G,G,0,1,None,I,41.0,16
+0,G,G,minor triad,A,C,1,2,None,ii,42.0,17
+0,G,G,minor triad,A,C,1,2,None,ii,42.0,17
+0,G,G,minor triad,A,C,1,2,None,ii,42.333332,17
+0,G,G,minor triad,A,C,1,2,None,ii,42.666668,17
+0,G,G,major triad,D,D,0,5,None,V,43.0,17
+0,G,G,major triad,D,D,0,5,None,V,43.0,17
+0,G,G,major triad,D,D,0,5,None,V,44.0,17
+0,G,G,major triad,D,D,0,5,None,V,44.0,17
+1,G,G,major triad,G,G,0,1,None,I,45.0,18
+1,G,G,major triad,G,G,0,1,None,I,45.0,18
+0,C,C,major triad,C,C,0,1,None,I,47.0,19
+0,C,C,major triad,C,C,0,1,None,I,47.0,19
+0,C,C,major triad,C,C,0,1,None,I,47.5,19
+0,C,C,major triad,C,C,0,1,None,I,47.5,19
+0,C,C,major triad,C,C,0,1,None,I,48.0,20
+0,C,C,major triad,C,C,0,1,None,I,48.0,20
+0,C,C,major triad,C,C,0,1,None,I,48.0,20
+0,C,C,major triad,C,C,0,1,None,I,49.0,20
+0,C,C,major triad,C,C,0,1,None,I,49.0,20
+0,C,C,major triad,C,C,0,1,None,I,49.0,20
+0,C,C,major triad,G,B,1,5,None,V,50.0,20
+0,C,C,major triad,G,B,1,5,None,V,50.0,20
+0,C,C,major triad,G,B,1,5,None,V,50.0,20
+0,C,C,major triad,G,C,1,5,None,V,50.5,20
+0,C,C,major triad,G,C,1,5,None,V,50.5,20
+0,C,C,major triad,C,C,0,1,None,I,51.0,21
+0,C,C,major triad,C,C,0,1,None,I,51.0,21
+0,C,C,major triad,C,C,0,1,None,I,51.0,21
+0,C,C,dominant seventh chord,G,D,2,5,None,V7,52.0,21
+0,C,C,dominant seventh chord,G,D,2,5,None,V7,52.0,21
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,53.0,21
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,53.0,21
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,53.0,21
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,53.5,21
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,53.5,21
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,54.0,22
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,54.0,22
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,54.0,22
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,55.0,22
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,55.0,22
+0,C,C,dominant seventh chord,G,B,1,5,None,V7,55.0,22
+0,C,C,major triad,G,B,1,5,None,V,56.0,22
+0,C,C,major triad,G,B,1,5,None,V,56.0,22
+0,C,C,major triad,G,B,1,5,None,V,56.0,22
+0,C,C,major triad,G,B,1,5,None,V,56.5,22
+0,C,C,major triad,C,C,0,1,None,I,57.0,23
+0,C,C,major triad,C,C,0,1,None,I,57.0,23
+0,C,C,major triad,C,C,0,1,None,I,57.0,23
+0,C,C,major triad,C,C,0,1,None,I,58.0,23
+0,C,C,major triad,C,C,0,1,None,I,59.0,23
+0,C,C,major triad,C,C,0,1,None,I,59.0,23
+0,C,C,major triad,C,C,0,1,None,I,59.25,23
+0,C,C,major triad,C,C,0,1,None,I,59.25,23
+0,C,C,major triad,C,C,0,1,None,I,59.5,23
+0,C,C,major triad,C,C,0,1,None,I,59.5,23
+0,C,C,minor triad,C,C,0,1,None,I,59.75,23
+0,C,C,minor triad,C,C,0,1,None,I,59.75,23
+0,G,G,diminished triad,F#,F#,0,7,None,viio,60.0,24
+0,G,G,diminished triad,F#,F#,0,7,None,viio,60.0,24
+0,G,G,diminished triad,D,F#,1,7,None,viio,61.0,24
+0,G,G,major triad,G,B,1,1,None,I,62.0,24
+0,G,G,major triad,G,B,1,1,None,I,62.0,24
+0,G,G,major triad,G,B,1,1,None,I,62.25,24
+0,G,G,major triad,G,B,1,1,None,I,62.25,24
+0,G,G,major triad,G,B,1,1,None,I,62.5,24
+0,G,G,major triad,G,B,1,1,None,I,62.5,24
+0,G,G,major triad,G,B,1,1,None,I,62.75,24
+0,G,G,major triad,G,B,1,1,None,I,62.75,24
+0,G,G,minor triad,E,E,0,6,None,vi,63.0,25
+0,G,G,minor triad,E,E,0,6,None,vi,63.0,25
+0,G,G,minor triad,E,E,0,6,None,vi,64.0,25
+0,G,G,major triad,G,B,1,1,None,I,65.0,25
+0,G,G,major triad,G,B,1,1,None,I,65.0,25
+0,G,G,major triad,G,B,1,1,None,I,65.25,25
+0,G,G,major triad,G,B,1,1,None,I,65.5,25
+0,G,G,major triad,G,B,1,1,None,I,65.75,25
+0,G,G,major triad,C,C,0,4,None,IV,66.0,26
+0,G,G,major triad,C,C,0,4,None,IV,66.0,26
+0,G,G,major triad,D,D,0,5,None,V,67.0,26
+0,G,G,major triad,D,D,0,5,None,V,67.0,26
+0,G,G,major triad,D,D,0,5,None,V,68.0,26
+0,G,G,major triad,D,D,0,5,None,V,68.0,26
+1,G,G,major triad,G,G,0,1,None,I,69.0,27
+1,G,G,major triad,G,G,0,1,None,I,69.0,27
+0,G,G,major triad,G,G,0,1,None,I,70.0,27
+0,C,C,minor triad,E,E,0,6,None,vi,71.0,28
+0,C,C,minor triad,E,E,0,6,None,vi,71.0,28
+0,C,D,minor triad,E,E,0,6,None,vi,71.5,28
+0,C,D,minor triad,E,E,0,6,None,vi,71.5,28
+0,C,D,major triad,A,A,0,5,2,V,72.0,29
+0,C,D,major triad,A,A,0,5,2,V,72.0,29
+0,C,D,major triad,A,A,0,5,2,V,72.0,29
+0,C,D,major triad,A,A,0,5,2,V,72.5,29
+0,C,D,dominant seventh chord,A,G,3,5,2,V7,73.0,29
+0,C,D,dominant seventh chord,A,G,3,5,2,V7,73.0,29
+0,C,D,dominant seventh chord,A,G,3,5,2,V7,73.0,29
+0,C,C,minor triad,D,F,1,2,None,ii,74.0,29
+0,C,C,minor triad,D,F,1,2,None,ii,74.0,29
+0,C,C,minor triad,D,F,1,2,None,ii,74.0,29
+0,C,C,minor triad,D,F,1,2,None,ii,74.5,29
+0,C,C,minor triad,D,F,1,2,None,ii,74.5,29
+0,C,D,major triad,A,E,2,5,2,V,75.0,30
+0,C,D,major triad,A,E,2,5,2,V,75.0,30
+0,C,D,major triad,A,E,2,5,2,V,75.0,30
+0,C,C,minor triad,D,D,0,2,None,ii,76.0,30
+0,C,C,minor triad,D,D,0,2,None,ii,76.0,30
+0,C,C,minor triad,D,D,0,2,None,ii,77.0,30
+0,C,C,minor triad,D,D,0,2,None,ii,77.0,30
+0,C,C,minor triad,D,D,0,2,None,ii,77.0,30
+0,C,C,minor triad,D,D,0,2,None,ii,77.5,30
+0,C,C,minor triad,D,D,0,2,None,ii,77.5,30
+0,C,C,major triad,G,G,0,5,None,V,78.0,31
+0,C,C,major triad,G,G,0,5,None,V,78.0,31
+0,C,C,major triad,G,G,0,5,None,V,78.0,31
+0,C,C,dominant seventh chord,G,F,3,5,None,V7,79.0,31
+0,C,C,dominant seventh chord,G,F,3,5,None,V7,79.0,31
+0,C,C,dominant seventh chord,G,F,3,5,None,V7,79.0,31
+0,C,C,major triad,C,E,1,1,None,I,80.0,31
+0,C,C,major triad,C,E,1,1,None,I,80.0,31
+0,C,C,major triad,C,E,1,1,None,I,80.0,31
+0,C,C,major triad,C,E,1,1,None,I,80.5,31
+0,C,C,major triad,C,E,1,1,None,I,80.5,31
+0,C,C,major triad,G,D,2,5,None,V,81.0,32
+0,C,C,major triad,G,D,2,5,None,V,81.0,32
+0,C,C,major triad,G,D,2,5,None,V,81.0,32
+0,C,C,major triad,C,C,0,1,None,I,82.0,32
+0,C,C,major triad,C,C,0,1,None,I,82.0,32
+0,C,C,major triad,D,F,0,4,None,IV,83.0,32
+0,C,C,major triad,D,F,0,4,None,IV,83.0,32
+0,C,C,major triad,F,F,0,4,None,IV,83.25,32
+0,C,C,major triad,F,F,0,4,None,IV,83.25,32
+0,C,C,major triad,D,F,0,4,None,IV,83.5,32
+0,C,C,major triad,D,F,0,4,None,IV,83.5,32
+0,C,C,major triad,D,F,0,2,None,ii,83.75,32
+0,C,C,major triad,D,F,0,2,None,ii,83.75,32
+0,C,C,major triad,G,B,1,5,None,V,84.0,33
+0,C,C,major triad,G,B,1,5,None,V,84.0,33
+0,C,C,major triad,G,B,1,5,None,V,85.0,33
+0,C,C,major triad,C,E,1,1,None,I,86.0,33
+0,C,C,major triad,C,E,1,1,None,I,86.0,33
+0,C,C,major triad,C,E,1,1,None,I,86.25,33
+0,C,C,major triad,C,E,1,1,None,I,86.25,33
+0,C,C,major triad,C,E,1,1,None,I,86.5,33
+0,C,C,major triad,C,E,1,1,None,I,86.5,33
+0,C,C,major triad,C,E,1,1,None,I,86.75,33
+0,C,C,major triad,C,E,1,1,None,I,86.75,33
+0,C,C,minor triad,A,A,0,6,None,vi,87.0,34
+0,C,C,minor triad,A,A,0,6,None,vi,87.0,34
+0,C,C,minor triad,A,A,0,6,None,vi,88.0,34
+0,C,C,major triad,C,E,1,1,None,I,89.0,34
+0,C,C,major triad,C,E,1,1,None,I,89.0,34
+0,C,C,major triad,C,E,1,1,None,I,89.25,34
+0,C,C,major triad,C,E,1,1,None,I,89.5,34
+0,C,C,major triad,C,E,1,1,None,I,89.75,34
+0,C,C,major triad,F,F,0,4,None,IV,90.0,35
+0,C,C,major triad,F,F,0,4,None,IV,90.0,35
+0,C,C,major triad,G,G,0,5,None,V,91.0,35
+0,C,C,major triad,G,G,0,5,None,V,91.0,35
+0,C,C,major triad,G,G,0,5,None,V,92.0,35
+0,C,C,major triad,G,G,0,5,None,V,92.0,35
+1,C,C,major triad,C,C,0,1,None,I,93.0,36
+1,C,C,major triad,C,C,0,1,None,I,93.0,36
+0,C,C,major triad,C,C,0,1,None,I,94.0,36
