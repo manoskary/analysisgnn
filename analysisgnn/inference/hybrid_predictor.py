@@ -387,8 +387,13 @@ class HybridAnalysisPredictor:
         return_edit_info: bool = False,
         return_iterative_trace: bool = False,
         return_route: bool = False,
+        return_intermediates: bool = False,
     ) -> Any:
-        """Predict using the full or masked model depending on the request payload."""
+        """Predict using the full or masked model depending on the request payload.
+
+        When *return_intermediates* is True the underlying ``model.predict()``
+        appends a dict ``{"score", "note_array", "data"}`` to its output tuple.
+        """
         route = force_route
         if route is None:
             route = "masked" if self.should_use_masked_model(user_edits=user_edits, masked_spec=masked_spec) else "full"
@@ -411,6 +416,7 @@ class HybridAnalysisPredictor:
             aggregation_spec=aggregation_spec,
             return_edit_info=return_edit_info,
             return_iterative_trace=return_iterative_trace,
+            return_intermediates=return_intermediates,
         )
 
         if not return_route:
