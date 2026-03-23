@@ -1,211 +1,253 @@
-# PROMPT: Phase 1, Step 2 — Delta Lake Reader + Demo Notebook
+# PROMPT: Phase 1, Step 3 — Reference CSVs + Aggregation Package
 
 ## Goal
 
-Create `analysisgnn/storage/delta_reader.py` — a reader module that loads Delta Lake
-tables written by `write_analysis_results()` — and a Jupyter notebook in `notebooks/`
-that demonstrates the full predict → store → load → inspect workflow using the
-Mozart K.1 score.
+Produce ground-truth reference CSVs for two aggregation modes (`none` and `mean`)
+using the existing inference pipeline on Mozart K.1, then create a new
+`analysisgnn/aggregation/` package whose `mean` strategy reproduces the exact same
+values from the pre-aggregation Delta Lake. Along the way, unify the label decoding
+across the codebase.
+
+## Context
+
+### Two decoding systems exist today
+
+1. **Gradio / `_decode_task_predictions()`** in
+   `analysisgnn/inference/hybrid_predictor.py:248-295` — used for display. It decodes
+   argmax class IDs into human-readable labels via `available_representations[task].decode()`
+   or `CadenceEncoder.decode()`, falling back to raw integer IDs for tasks it doesn't
+   recognize.
+
+2. **Delta Lake / `resolve_task_vocabulary()`** in
+   `analysisgnn/storage/delta_writer.py:44-103` — used when writing the `class_label`
+   column. It uses a richer resolution chain (aliases, binary task vocabularies,
+   `NoteDegree49`, integer-label tasks, fallback).
+
+The Delta Lake approach is more complete but has one legacy artefact: it was designed
+for wide-format tables where labels become column names, so spaces were replaced by
+underscores (e.g., `major_triad`). The Gradio approach uses the original `decode()`
+output, which preserves spaces (e.g., `major triad`).
+
+### Known differences (per task)
+
+| Task            | Gradio output                                                                                      | Delta output                           | Issue                                                                                                       |
+|-----------------|----------------------------------------------------------------------------------------------------|----------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `quality`       | `"major triad"` (space)                                                                            | `"major triad"` (space)                | Actually same — Delta uses `_class_list_to_strings(classList)` which calls `str()`, preserving the original |
+| `hrythm`        | Raw int `0`/`1`                                                                                    | `"True"`/`"False"`                     | Gradio has no alias `hrythm`→`hrhythm`; falls through to int                                                |
+| `section`       | Raw int `0`/`1`                                                                                    | `"no_section_start"`/`"section_start"` | Not in `available_representations`; Delta has `_BINARY_TASK_VOCABULARIES`                                   |
+| `phrase`        | Raw int `0`/`1`                                                                                    | `"no_boundary"`/`"phrase_end"`         | Same                                                                                                        |
+| `organ_point`   | Raw int `0`/`1`                                                                                    | `"no_pedal"`/`"pedal_present"`         | Same                                                                                                        |
+| `tpc_in_label`  | Raw int `0`/`1` → Gradio display remaps to `"NCT"`/`"Chord Tone"`                                  | `"NCT"`/`"chord_tone"`                 | Three-way inconsistency                                                                                     |
+| `tpc_is_root`   | Raw int `0`/`1`                                                                                    | `"not_root"`/`"is_root"`               | Same pattern                                                                                                |
+| `tpc_is_bass`   | Raw int `0`/`1`                                                                                    | `"not_bass"`/`"is_bass"`               | Same pattern                                                                                                |
+| `note_degree`   | Raw int `0`..`48`                                                                                  | `"bbb1"`, `"bb1"`, ..., `"###7"`       | Not in `available_representations`; Delta has `_EXTRA_REPRESENTATION_CLASSES`                               |
+| `inversion`     | `int` (0,1,2,3)                                                                                    | `str` ("0","1","2","3")                | Type difference only                                                                                        |
+| `downbeat`      | `int`                                                                                              | `str`                                  | Type difference only                                                                                        |
+| `staff`         | `int`                                                                                              | `str`                                  | Type difference only                                                                                        |
+| `romanNumeral`  | Works for class_ids 0..183; crashes for 184 (`classList` has 184 entries due to missing-comma bug) | Pads with `"class_184"` fallback       | Delta is more robust                                                                                        |
+| Everything else | Identical                                                                                          | Identical                              |                                                                                                             |
+
+### The `romanNumeral` missing-comma bug
+
+`SIMPLE_NUMERAL_VOCABULARY` in `analysisgnn/utils/globals.py` has a missing comma at
+lines 2351-2354, concatenating `'#VII'` and `'bvio7'` into `'#VIIbvio7'`, producing
+184 items instead of 185. This means `SimpleRomanNumeral185.classList` actually has 184
+entries. When the model predicts class_id 184 (the 185th class), the Gradio decoder
+crashes and falls back to all-integer labels. The Delta writer pads with `"class_184"`.
 
 ## What to Build
 
-### 1. Reader Module: `analysisgnn/storage/delta_reader.py`
+### 1. Unify Label Decoding
 
-Thin convenience wrappers around `deltalake.DeltaTable`. Each function takes
-`output_dir` (the per-score directory, e.g., `outputs/Minuet_in_G_Major_K.1/`)
-and returns a pandas DataFrame or dict.
+**Do NOT modify files yet.** First, present the proposed unified vocabulary for each
+task (especially the binary tasks and `tpc_in_label`) so the user can review the
+musicological correctness before any code changes. The key decisions to get approval
+on:
 
-```python
-def load_notes(output_dir: str) -> pd.DataFrame
+- `tpc_in_label`: Currently three variants: int `0`/`1`, Delta `"NCT"`/`"chord_tone"`,
+  Gradio display `"NCT"`/`"Chord Tone"`. Propose one canonical form.
+- Binary tasks (`section`, `phrase`, `organ_point`, `tpc_is_root`, `tpc_is_bass`):
+  Are the Delta labels (`"no_boundary"`/`"phrase_end"`, etc.) musicologically accurate?
+- `hrythm`: The Delta label `"True"`/`"False"` comes from
+  `HarmonicRhythm2.classList = [True, False]`. Is there a better label?
+- `note_degree`: The Delta labels (`"bbb1"`, ..., `"###7"`) come from
+  `NoteDegree49.classList`. Are these correct?
+- `romanNumeral` class 184: Should this be `"class_184"`, or can we fix the
+  missing-comma bug and restore the intended label?
+
+After getting approval, update `_decode_task_predictions()` in `hybrid_predictor.py`
+to use `resolve_task_vocabulary()` as its label source. This means:
+
+- Remove the per-task `if task in available_representations: cls.decode(...)` chain
+- Instead: `vocab = resolve_task_vocabulary(task, num_classes)` then
+  `decoded = np.array([vocab[i] for i in class_ids])`
+- Keep the confidence/argmax computation unchanged
+- Remove the `_pcset_to_str` special case (handled by `_class_list_to_strings`)
+- Keep cadence's empty-string-for-class-0 semantics
+
+Also update `_convert_tpc_column_inplace()` in the Gradio app to match the unified
+vocabulary (or remove it if the unified vocab already handles tpc_in_label correctly).
+
+### 2. Generate Reference CSVs
+
+Create a script `scripts/generate_reference_csvs.py` that:
+
+1. Loads the model and runs inference on `notebooks/Minuet_in_G_Major_K.1.musicxml`
+2. For each mode in `["none", "mean"]`:
+   a. Calls `model.predict(score, aggregation_spec={"mode": mode}, return_intermediates=True)`
+   b. Calls `predictions_to_dataframe(score, predictions, tasks=ALL_TASKS, include_confidence=True, include_class_ids=False)`
+   c. Applies `_format_table_output(df, tasks)` for consistent column ordering
+   d. Saves to `outputs/Minuet_in_G_Major_K.1/reference_<mode>.csv`
+
+The CSVs have columns: `row`, `note_id`, `onset_beat`, `measure`, `duration_beat`,
+`pitch_spelling`, `pitch_midi`, then for each of the 21 tasks: `<task>`, `<task>_confidence`.
+
+### 3. Create `analysisgnn/aggregation/` Package
+
 ```
-Load the `notes/` table. Returns a DataFrame with columns: `note_id`, `onset_div`,
-`onset_beat`, `duration_div`, `duration_beat`, `pitch_midi`, `pitch_spelling`,
-`staff`, `voice`, `measure`, `ts_beats`.
-
-```python
-def load_edges(output_dir: str, edge_types: Optional[List[str]] = None) -> pd.DataFrame
-```
-Load the `edges/` table. If `edge_types` is given (e.g., `["onset", "consecutive"]`),
-filter to only those types. Returns columns: `src`, `dst`, `edge_type`.
-
-```python
-def load_probabilities(
-    output_dir: str,
-    task: Optional[str] = None,
-    top_k: Optional[int] = None,
-) -> pd.DataFrame
-```
-Load the `probabilities/` table. If `task` is given, filter to that task only.
-If `top_k` is given, filter to rows with `rank <= top_k` (e.g., `top_k=3` for
-top-3 predictions per note per task). Returns columns: `note_id`, `task`,
-`class_id`, `class_label`, `probability`, `is_argmax`, `rank`.
-
-```python
-def load_hyperedges(
-    output_dir: str,
-    edge_type: Optional[str] = None,
-) -> pd.DataFrame
-```
-Load the `hyperedges/` table. If `edge_type` is given (e.g., `"beat"`), filter
-to that grouping type. Returns columns: `group_id`, `note_id`, `edge_type`,
-`parent_group_id`.
-
-```python
-def load_metadata(output_dir: str) -> dict
-```
-Load `metadata.json` and return as a Python dict.
-
-```python
-def list_group_types(output_dir: str) -> List[str]
-```
-Return the distinct `edge_type` values present in the `hyperedges/` table.
-
-```python
-def list_tables(output_dir: str) -> List[str]
-```
-Return names of all Delta tables in the directory (by scanning for subdirectories
-containing `_delta_log/`).
-
-```python
-def export_table_to_csv(output_dir: str, table_name: str, csv_path: str) -> str
-```
-Load a named table and write it to CSV. Returns the CSV path.
-
-```python
-def argmax_summary(output_dir: str, tasks: Optional[List[str]] = None) -> pd.DataFrame
-```
-Convenience: pivot the `probabilities` table to produce a wide-format summary where
-each task becomes a column containing the argmax class_label, plus a `<task>_confidence`
-column with the argmax probability. Joined with the notes table on `note_id`.
-
-### 2. Tests: `tests/test_delta_reader.py`
-
-Use the Delta Lake already written at `outputs/Minuet_in_G_Major_K.1/` (by the
-Step 1 tests). No new inference needed — just test the reader functions:
-
-- `test_load_notes` — correct shape, expected columns, note_ids unique
-- `test_load_edges` — filtering by edge_type works
-- `test_load_probabilities` — full load, filter by task, filter by top_k
-- `test_load_probabilities_sums_to_one` — per (note, task) groups sum to 1.0
-- `test_load_hyperedges` — full load, filter by edge_type
-- `test_load_metadata` — expected keys, task_dict matches
-- `test_list_group_types` — returns `["onset", "beat", "measure"]` or subset
-- `test_list_tables` — returns at least `["notes", "edges", "probabilities", "hyperedges"]`
-- `test_export_csv` — exports to a temp CSV, reads back, matches
-- `test_argmax_summary` — correct shape, one row per note, task columns present
-
-**Prerequisite**: These tests depend on `outputs/Minuet_in_G_Major_K.1/` existing.
-If it does not exist, skip the tests with `pytest.mark.skipif`. Or alternatively,
-use a session-scoped fixture that calls the writer first (reusing the Step 1 fixture
-pattern).
-
-### 3. Jupyter Notebook: `notebooks/delta_lake_demo.ipynb`
-
-A demonstration notebook that walks through the full workflow. Structure:
-
-**Cell 1: Setup**
-```python
-import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath("")), ".."))
-# or however the project root is best added for notebook context
+analysisgnn/aggregation/
+├── __init__.py
+├── base.py          # Abstract AggregationStrategy interface
+├── registry.py      # Named strategy registry
+└── mean.py          # Mean aggregation (onset → beat → measure)
 ```
 
-**Cell 2: Run inference (with no aggregation)**
+#### `base.py`
+
 ```python
-from analysisgnn.models.analysis import ContinualAnalysisGNN
-model = ContinualAnalysisGNN.load_from_checkpoint(CHECKPOINT_PATH, map_location="cpu", strict=False)
-model.eval()
-predictions, intermediates = model.predict(SCORE_PATH, aggregation_spec={"mode": "none"}, return_intermediates=True)
+class AggregationStrategy(ABC):
+    """Abstract base class for aggregation strategies."""
+
+    @abstractmethod
+    def aggregate(
+        self,
+        probabilities: pd.DataFrame,   # Long-format probabilities from Delta Lake
+        notes: pd.DataFrame,            # Notes table from Delta Lake
+        hyperedges: pd.DataFrame,       # Hyperedges table from Delta Lake
+        metadata: dict,                 # metadata.json contents
+        tasks: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Aggregate probabilities and return an argmax summary DataFrame.
+
+        The returned DataFrame has one row per note and columns:
+        - All columns from the notes table
+        - For each task: <task> (argmax label) and <task>_confidence (max prob)
+
+        This matches the format of the Gradio display DataFrame and the
+        reference CSVs.
+        """
+        ...
 ```
 
-**Cell 3: Write Delta Lake**
+The key insight: the new aggregation strategies operate on **Delta Lake data**
+(pandas DataFrames), not on PyTorch tensors + PyG graphs. This decouples
+aggregation experimentation from the model inference pipeline.
+
+#### `mean.py`
+
+Re-implements the existing onset → beat → measure mean pipeline, but operating on
+the long-format `probabilities` DataFrame + `hyperedges` DataFrame rather than
+PyTorch tensors.
+
+The algorithm for each level (onset, beat, measure):
+
+1. Load the group memberships from `hyperedges` (filtered by `edge_type`)
+2. For each task in the level's task list:
+   a. Join probabilities with group memberships on `note_id`
+   b. For eligible notes (filtered by `tpc_in_label` argmax for RNA tasks at
+      onset/beat level):
+      - Compute the mean probability for each `(group_id, class_id)` combination
+      - Broadcast the group mean back to all member notes
+      - Replace the original probabilities with the group means
+3. The onset level also performs change-point detection (as in
+   `onsetwise_logit_aggregation` lines 420-452): after onset grouping, find
+   contiguous spans of identical argmax predictions and broadcast each span's
+   onset-group distribution to all notes in the span.
+
+The level → tasks mapping (from `DEFAULT_TASKS_BY_LEVEL` in `posthoc_aggregator.py`):
+
 ```python
-from analysisgnn.storage.delta_writer import write_analysis_results
-output_dir = write_analysis_results(
-    output_dir="outputs/Minuet_in_G_Major_K.1",
-    score=intermediates["score"],
-    note_array=intermediates["note_array"],
-    predictions=predictions,
-    data=intermediates["data"],
-    task_dict=model.task_dict,
-    metadata={"score_path": SCORE_PATH, "full_checkpoint": CHECKPOINT_PATH, "device": "cpu"},
-)
+{
+    "onset": ["cadence", "phrase", "root", "localkey", "quality",
+              "inversion", "degree1", "degree2", "romanNumeral", "section"],
+    "beat":  ["root", "localkey", "quality", "inversion",
+              "degree1", "degree2", "romanNumeral",
+              "cadence", "phrase", "section"],
+    "measure": ["localkey"],
+}
 ```
 
-**Cell 4: Load and inspect notes**
+#### `registry.py`
+
 ```python
-from analysisgnn.storage.delta_reader import load_notes
-notes = load_notes(output_dir)
-notes.head(10)
+_STRATEGIES: Dict[str, Type[AggregationStrategy]] = {}
+
+def register(name: str, cls: Type[AggregationStrategy]): ...
+def get(name: str) -> Type[AggregationStrategy]: ...
+def list_strategies() -> List[str]: ...
 ```
 
-**Cell 5: Inspect edges**
-```python
-from analysisgnn.storage.delta_reader import load_edges
-edges = load_edges(output_dir)
-edges.groupby("edge_type").size()
-```
+Pre-registers `"none"` (passthrough — returns `argmax_summary()` from
+`delta_reader`) and `"mean"` (the new mean aggregation).
 
-**Cell 6: Query top-3 predictions for romanNumeral**
-```python
-from analysisgnn.storage.delta_reader import load_probabilities
-top3_rn = load_probabilities(output_dir, task="romanNumeral", top_k=3)
-top3_rn.head(15)  # Shows top-3 candidates for the first 5 notes
-```
+### 4. Validation Test
 
-**Cell 7: Argmax summary (wide format)**
-```python
-from analysisgnn.storage.delta_reader import argmax_summary
-summary = argmax_summary(output_dir, tasks=["romanNumeral", "localkey", "quality", "cadence"])
-summary.head(10)
-```
+Create `tests/test_aggregation_mean.py`:
 
-**Cell 8: Inspect hyperedge groupings**
-```python
-from analysisgnn.storage.delta_reader import load_hyperedges, list_group_types
-print("Group types:", list_group_types(output_dir))
-beat_groups = load_hyperedges(output_dir, edge_type="beat")
-beat_groups.groupby("group_id").size().describe()
-```
+- Load the Delta Lake at `outputs/Minuet_in_G_Major_K.1/`
+- Load the reference CSV `outputs/Minuet_in_G_Major_K.1/reference_mean.csv`
+- Run the new `MeanAggregation` strategy on the Delta Lake data
+- Assert that the resulting DataFrame matches the reference CSV exactly
+  (for all 21 task columns and all 21 confidence columns, within float tolerance)
 
-**Cell 9: Metadata**
-```python
-from analysisgnn.storage.delta_reader import load_metadata
-meta = load_metadata(output_dir)
-print(f"Score: {meta['score_id']}, {meta['num_notes']} notes, {len(meta['task_dict'])} tasks")
-```
+Similarly, test `"none"`:
+- Run the `NoneAggregation` strategy
+- Assert it matches `reference_none.csv`
 
-**Cell 10: CSV export**
-```python
-from analysisgnn.storage.delta_reader import export_table_to_csv
-csv_path = export_table_to_csv(output_dir, "notes", "/tmp/notes.csv")
-print(f"Exported to {csv_path}")
-```
-
-The notebook should use **relative paths** (relative to the repo root) for the score
-and checkpoint, so it works when run from the `notebooks/` directory.
+Use `pytestmark = pytest.mark.skipif` if the output directory or reference CSVs
+don't exist.
 
 ## Files to Create/Modify
 
 | File | Action |
 |------|--------|
-| `analysisgnn/storage/delta_reader.py` | Create |
-| `tests/test_delta_reader.py` | Create |
-| `notebooks/delta_lake_demo.ipynb` | Create |
+| `analysisgnn/inference/hybrid_predictor.py` | Modify: update `_decode_task_predictions()` to use `resolve_task_vocabulary()` |
+| `examples/gradio_hybrid_analysis_app.py` | Modify: update `_convert_tpc_column_inplace()` to match unified vocab |
+| `scripts/generate_reference_csvs.py` | Create: script to generate reference CSVs |
+| `analysisgnn/aggregation/__init__.py` | Create |
+| `analysisgnn/aggregation/base.py` | Create |
+| `analysisgnn/aggregation/registry.py` | Create |
+| `analysisgnn/aggregation/mean.py` | Create |
+| `tests/test_aggregation_mean.py` | Create |
 
-No modifications to existing files needed.
+Optional if the missing-comma bug should be fixed:
+| `analysisgnn/utils/globals.py` | Modify: fix the missing comma in `SIMPLE_NUMERAL_VOCABULARY` |
 
 ## How to Verify
 
-1. `conda run -n analysisgnn python -m pytest tests/test_delta_reader.py -v` — all pass
-2. Open the notebook in Jupyter and run all cells — no errors, output tables display
-   correctly
-3. The CSV export produces a valid file
+1. `conda run -n analysisgnn python scripts/generate_reference_csvs.py` — produces
+   two CSVs without errors
+2. `conda run -n analysisgnn python -m pytest tests/test_aggregation_mean.py -v` —
+   all tests pass (new aggregation matches reference CSVs)
+3. The Gradio app still works correctly (no display regressions)
+4. `conda run -n analysisgnn python -m pytest tests/test_delta_writer.py tests/test_delta_reader.py -v` —
+   existing tests still pass
 
 ## Reference
 
-- Writer: `analysisgnn/storage/delta_writer.py`
-- Existing Delta Lake output: `outputs/Minuet_in_G_Major_K.1/`
+- Existing aggregation code: `analysisgnn/models/analysis.py` lines 296-540
+  (`_groupwise_mean_broadcast`, `_aggregate_with_mode`, `onsetwise_logit_aggregation`,
+  `beatwise_logit_aggregation`, `measurewise_logit_aggregation`,
+  `_aggregate_note_probs`, `_resolve_aggregation_runtime`)
+- `DEFAULT_TASKS_BY_LEVEL`: `analysisgnn/models/posthoc_aggregator.py` lines 11-37
+- Delta Lake reader: `analysisgnn/storage/delta_reader.py`
+- Delta Lake output: `outputs/Minuet_in_G_Major_K.1/`
 - Score: `notebooks/Minuet_in_G_Major_K.1.musicxml`
 - Checkpoint: `artifacts/gradio_checkpoints/uocj8f6y_full_last.ckpt`
-- AGENTS.md schema docs: lines 228-362 (table schemas + graph reconstruction)
+- Gradio app: `examples/gradio_hybrid_analysis_app.py`
+- `_decode_task_predictions`: `analysisgnn/inference/hybrid_predictor.py:248-295`
+- `resolve_task_vocabulary`: `analysisgnn/storage/delta_writer.py:44-103`
+- `CadenceEncoder`: `analysisgnn/utils/music.py:208-276`
+- `available_representations`: `analysisgnn/utils/chord_representations.py:529-541`
+- `NoteDegree49`: `analysisgnn/utils/chord_representations.py:489-491`
+- `SIMPLE_NUMERAL_VOCABULARY` (missing-comma bug): `analysisgnn/utils/globals.py:2314-2359`
