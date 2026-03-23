@@ -442,12 +442,12 @@ pyarrow>=14.0.0
 
 ## Phase 1: Implementation Plan
 
-### Step 1: Delta Lake Writer Module
+### Step 1: Delta Lake Writer Module — DONE
 
-Create `analysisgnn/storage/delta_writer.py`:
+Created `analysisgnn/storage/delta_writer.py`:
 
 - `write_analysis_results(output_dir, score, predictions, data, task_dict, metadata)`
-  - Writes `notes/`, `edges/`, `probabilities/` tables, `metadata.json`
+  - Writes `notes/`, `edges/`, `probabilities/`, `hyperedges/` tables + `metadata.json`
   - Resolves class labels via `resolve_task_vocabulary()` which chains through
     `available_representations`, key aliases, `CadenceEncoder`, `NoteDegree49`,
     known binary task semantics, integer-label tasks, and fallback
@@ -457,25 +457,35 @@ Create `analysisgnn/storage/delta_writer.py`:
   - Populates the `hyperedges` table with default groupings (`onset`, `beat`, `measure`)
     derived from the graph's onset_div, beat cluster, and measure cluster attributes
 
-Also:
+Also done:
 - `predict()` in `analysisgnn/models/analysis.py` gains `return_intermediates=True`
   to return the `score`, `note_array`, and `data` objects alongside predictions
 - `_resolve_aggregation_runtime()` gains support for `"none"` mode to skip
   aggregation entirely
+- 25 integration tests in `tests/test_delta_writer.py` (real inference on Mozart K.1)
+- Dependencies `deltalake>=0.22.0`, `pyarrow>=14.0.0` added to `requirements.txt`
 
-### Step 2: Delta Lake Reader Module
+### Step 2: Delta Lake Reader Module + Demo Notebook — DONE
 
-Create `analysisgnn/storage/delta_reader.py`:
+Created `analysisgnn/storage/delta_reader.py`:
 
 - `load_notes(output_dir) -> pd.DataFrame`
 - `load_edges(output_dir, edge_types=None) -> pd.DataFrame`
-- `load_task_probs(output_dir, task) -> pd.DataFrame`
-- `load_groups(output_dir, edge_type=None) -> pd.DataFrame`
+- `load_probabilities(output_dir, task=None, top_k=None) -> pd.DataFrame`
+- `load_hyperedges(output_dir, edge_type=None) -> pd.DataFrame`
+- `load_metadata(output_dir) -> dict`
 - `list_group_types(output_dir) -> List[str]`
-- `reconstruct_pyg_graph(output_dir, edge_types=None) -> HeteroData`
-- `reconstruct_rustworkx_graph(output_dir, edge_types=None) -> rx.PyDiGraph`
-- `list_aggregation_tables(output_dir) -> List[str]`
-- `export_table_to_csv(output_dir, table_name, csv_path)`
+- `list_tables(output_dir) -> List[str]` — scans for subdirectories with `_delta_log/`
+- `export_table_to_csv(output_dir, table_name, csv_path) -> str`
+- `argmax_summary(output_dir, tasks=None) -> pd.DataFrame` — wide-format pivot with
+  per-task argmax class label + confidence columns, joined with notes table
+
+Also done:
+- 19 tests in `tests/test_delta_reader.py` (reads existing Delta Lake at
+  `outputs/Minuet_in_G_Major_K.1/`; skipped via `pytestmark` if output absent)
+- Demo notebook `notebooks/delta_lake_demo.ipynb` — full predict → store → load →
+  inspect workflow. Write is guarded with an existence check to avoid Delta Log
+  version pollution (see Conventions below)
 
 ### Step 3: Aggregation Runtime Refactoring
 
@@ -553,3 +563,12 @@ runtime:
 - Class label columns use the **resolved human-readable names** from the task vocabulary,
   with whitespace replaced by underscores (e.g., `major_triad`, not `major triad`)
 - Delta Lake versioning tracks the evolution of aggregation experiments within a run
+- **Avoiding version pollution on re-write**: The writer uses `mode="overwrite"` which
+  replaces the table contents entirely. Each overwrite creates a new Delta Log entry
+  (version), even when the data is identical. To avoid polluting the version history
+  with redundant snapshots, callers should **check whether the output already exists**
+  before writing. The demo notebook and Gradio integration both guard the write step
+  with an existence check (e.g., `if not os.path.isdir(os.path.join(output_dir,
+  "notes", "_delta_log")): write_analysis_results(...)`). This keeps the Delta Log
+  clean for meaningful experiments — each version should correspond to a genuinely new
+  inference run or aggregation result, not a duplicate of existing data.
