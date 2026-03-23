@@ -1,5 +1,19 @@
 # AGENTS.md — AnalysisGNN Aggregation Research
 
+## Environment Setup
+
+All commands (inference, tests, scripts) **must** be run inside the `analysisgnn`
+conda environment:
+
+```bash
+conda activate analysisgnn
+```
+
+Without this, none of the project's dependencies (torch, graphmuse, partitura, etc.)
+will be available.
+
+---
+
 ## Project Context
 
 **AnalysisGNN** is a multi-task Graph Neural Network for music analysis. Given a MusicXML
@@ -175,9 +189,13 @@ Analysis results (raw probability distributions + graph structure) are stored in
 
 - **Columnar compression** via Parquet for large probability distributions
 - **Built-in versioning** to track aggregation iterations and experiments
-- **One table per task** for clean separation and manageable widths
-- **Resolved human-readable column names** (not integer indices; whitespace replaced
-  by underscores, e.g., `major_triad` instead of `major triad`)
+- **Single long-format probabilities table** — one row per (note, task, class)
+  combination, making it easy to query, filter, and aggregate across tasks without
+  dealing with heterogeneous column schemas
+- **Resolved human-readable class labels** via `resolve_task_vocabulary()` in
+  `analysisgnn/storage/delta_writer.py`, which resolves labels from
+  `available_representations`, `CadenceEncoder`, `NoteDegree49`, known binary task
+  semantics, and integer-label tasks (see the function for the full resolution chain)
 - **Organic growth**: new aggregation and grouping tables are added to the same Delta
   Lake over time
 
@@ -197,8 +215,8 @@ outputs/<score_id>/
 ├── hyperedges/            # Delta table: group memberships (all grouping types)
 │   ├── _delta_log/
 │   └── *.parquet
-├── probs_<task>/          # Delta table per task: one row per note
-│   ├── _delta_log/        #   columns = resolved class labels (underscored)
+├── probabilities/         # Delta table: one row per (note, task, class)
+│   ├── _delta_log/
 │   └── *.parquet
 ├── agg_<method>_<task>/   # Aggregation result tables (added over time)
 │   ├── _delta_log/
@@ -266,28 +284,39 @@ Optional additional columns depending on the grouping type:
 | `onset_start`   | int     | Start onset_div of the group span (optional)     |
 | `onset_end`     | int     | End onset_div of the group span (optional)       |
 
-#### `probs_<task>` tables (one per task)
+#### `probabilities` table (long format)
 
-One row per note (same length and order as `notes`). Columns are the **resolved
-class labels** from the task's vocabulary, with whitespace replaced by underscores
-(e.g., for `probs_quality`: `major_triad`, `minor_triad`, `diminished_triad`, etc.),
-plus metadata columns.
+One row per (note, task, class) combination. For a score with N notes and T tasks
+averaging C classes each, this produces N * T * C rows. The long format makes it
+easy to query, filter, and aggregate across tasks without heterogeneous column schemas.
 
-| Column            | Type    | Description                              |
-|-------------------|---------|------------------------------------------|
-| `note_id`         | string  | Note ID (join key to `notes` table)      |
-| `<class_label_0>` | float32 | Probability for class 0                  |
-| `<class_label_1>` | float32 | Probability for class 1                  |
-| ...               | ...     | ...                                      |
-| `<class_label_k>` | float32 | Probability for class k                  |
-| `argmax`          | string  | Resolved label of the most probable class|
-| `confidence`      | float32 | max(probabilities) for this note         |
-| `entropy`         | float32 | Shannon entropy of the distribution      |
+| Column        | Type    | Description                                        |
+|---------------|---------|----------------------------------------------------|
+| `note_id`     | string  | Note ID (join key to `notes` table)                |
+| `task`        | string  | Task name, e.g., `romanNumeral`, `cadence`         |
+| `class_id`    | int32   | Integer index in the softmax output (0-based)      |
+| `class_label` | string  | Resolved human-readable label (see below)          |
+| `probability` | float32 | Softmax probability for this class                 |
+| `is_argmax`   | bool    | True for the class with highest probability        |
+| `rank`        | int32   | Rank by probability (1 = highest)                  |
 
-The class label columns are derived from each task's `classList` (from
-`available_representations` in `analysisgnn/utils/chord_representations.py`) or
-`CadenceEncoder.accepted_cadences` for the cadence task. All labels are converted
-to strings and whitespace is replaced with underscores to produce valid column names.
+Invariants:
+- For each `(note_id, task)` group, `probability` sums to 1.0
+- Exactly one row per group has `is_argmax = True`
+- The row with `rank = 1` always has `is_argmax = True`
+
+**Class label resolution** is handled by `resolve_task_vocabulary()` in
+`analysisgnn/storage/delta_writer.py`. The resolution chain:
+1. `available_representations` (canonical vocabularies from `chord_representations.py`)
+2. Key aliases (e.g., model key `hrythm` maps to `hrhythm` in `available_representations`)
+3. `CadenceEncoder.accepted_cadences` (for the `cadence` task)
+4. Extra representation classes not in `available_representations` (e.g., `NoteDegree49`)
+5. Known binary task semantics (e.g., `phrase` -> `["no_boundary", "phrase_end"]`)
+6. Known integer-label tasks (e.g., `downbeat` -> `["0", "1", ..., "44"]`)
+7. Fallback: `class_0`, `class_1`, ...
+
+The `class_label` column can be empty string (e.g., cadence class 0 = no cadence)
+but is never null/NaN.
 
 #### `agg_<method>_<task>` tables (added over time)
 
@@ -391,15 +420,14 @@ Any Delta Lake table can be exported to CSV on demand:
 
 ```python
 # From the Gradio app or CLI
-df = pq.read_table("outputs/score_id/probs_romanNumeral").to_pandas()
-df.to_csv("romanNumeral_probs.csv", index=False)
+df = pq.read_table("outputs/score_id/probabilities").to_pandas()
+df.to_csv("probabilities.csv", index=False)
 
 # Or with argmax-only summary
 notes_df = pq.read_table("outputs/score_id/notes").to_pandas()
-for task in tasks:
-    probs_df = pq.read_table(f"outputs/score_id/probs_{task}").to_pandas()
-    notes_df[task] = probs_df["argmax"]
-    notes_df[f"{task}_confidence"] = probs_df["confidence"]
+probs_df = pq.read_table("outputs/score_id/probabilities").to_pandas()
+argmax = probs_df[probs_df["is_argmax"]].pivot(index="note_id", columns="task", values="class_label")
+notes_df = notes_df.merge(argmax, on="note_id", how="left")
 notes_df.to_csv("notes_summary.csv", index=False)
 ```
 
@@ -419,12 +447,21 @@ pyarrow>=14.0.0
 Create `analysisgnn/storage/delta_writer.py`:
 
 - `write_analysis_results(output_dir, score, predictions, data, task_dict, metadata)`
-  - Writes `notes/`, `edges/`, `probs_<task>/` tables, `metadata.json`
-  - Resolves class labels via `available_representations` / `CadenceEncoder`
-  - Converts whitespace in class labels to underscores for column names
-  - Computes entropy alongside argmax and confidence
+  - Writes `notes/`, `edges/`, `probabilities/` tables, `metadata.json`
+  - Resolves class labels via `resolve_task_vocabulary()` which chains through
+    `available_representations`, key aliases, `CadenceEncoder`, `NoteDegree49`,
+    known binary task semantics, integer-label tasks, and fallback
+  - `probabilities` table uses **long format**: one row per (note, task, class),
+    with columns `note_id`, `task`, `class_id`, `class_label`, `probability`,
+    `is_argmax`, `rank`
   - Populates the `hyperedges` table with default groupings (`onset`, `beat`, `measure`)
     derived from the graph's onset_div, beat cluster, and measure cluster attributes
+
+Also:
+- `predict()` in `analysisgnn/models/analysis.py` gains `return_intermediates=True`
+  to return the `score`, `note_array`, and `data` objects alongside predictions
+- `_resolve_aggregation_runtime()` gains support for `"none"` mode to skip
+  aggregation entirely
 
 ### Step 2: Delta Lake Reader Module
 
@@ -508,8 +545,9 @@ runtime:
 
 - Always say **note**, never "vertex" or "node" — since groupings are hyperedges (not
   hypernodes), there is no ambiguity
-- Tables are named `probs_<task>` for raw distributions, `agg_<method>_<task>` for
-  aggregated results, `hyperedges` for group memberships (all grouping types)
+- Tables are named `probabilities` for raw distributions (long format),
+  `agg_<method>_<task>` for aggregated results, `hyperedges` for group memberships
+  (all grouping types)
 - All per-note tables share the same row ordering (by `onset_div, pitch` sort)
   and are joined via `note_id`
 - Class label columns use the **resolved human-readable names** from the task vocabulary,
