@@ -527,22 +527,31 @@ Also: `scripts/generate_reference_csvs.py` produces `reference_none.csv` and
 `reference_mean.csv`; 8 tests in `tests/test_aggregation_mean.py`; demo notebook
 updated. All 52 tests pass.
 
-### Step 4: Gradio Integration
+### Step 4: Gradio Restructuring + Delta Lake Integration — DONE
 
-In `examples/gradio_hybrid_analysis_app.py`:
+Rewrote `examples/gradio_hybrid_analysis_app.py` into a 3-module layout:
+- **Module 1** — Data Source: "Analyse Score" tab (inference with `aggregation=none`,
+  `return_intermediates=True`, auto-writes Delta Lake via merge) and "Load Delta Lake"
+  tab (`gr.FileExplorer` for `metadata.json` selection)
+- **Module 2** — Analysis Results: aggregation dropdown (`list_strategies()`), cached
+  post-hoc aggregation via `Aggregate!` button, `gr.DownloadButton` auto-updated CSV,
+  `Save Delta Lake` button, editable predictions table, Verovio visual score tab
+- **Module 3** — Edit-Conditioned Re-Inference: grayed out until Module 1a runs;
+  tasks CSV override lives here
 
-- Add an output directory selector or auto-generate path from score name
-- After inference, write Delta Lake automatically
-- Add a "Browse Delta Lake" section: list tables, inspect contents, export to CSV
-- Aggregation experiments: load raw probs from Delta Lake, apply new aggregation,
-  write result as new `agg_*` table
-- **Verovio note colouring**: Support flexible per-note colouring in the visual score
-  display, e.g., to show homogeneous regions (where nearby notes' predictions agree)
-  in green shades and heterogeneous/contradictory regions in red shades. The colouring
-  data can be computed from prediction agreement metrics and passed in the visual
-  payload.
-- The aggregation mode dropdown is extended to include `"none"` and any registered
-  strategies.
+Key changes in `hybrid_predictor.py`:
+- `HybridAnalysisPredictor.predict()` now forwards `return_intermediates=True`
+
+Key changes in `delta_writer.py`:
+- `_merge_or_create()` replaces `write_deltalake(mode="overwrite")`: standard Delta
+  Lake merge (`when_matched_update_all` / `when_not_matched_insert_all` /
+  `when_not_matched_by_source_delete`) + `vacuum(retention_hours=0)` after each merge
+
+Also done: voter logic commented out; `_extract_graph_edges_from_score` replaced by
+`_edges_from_pyg_data()` reading `intermediates["data"].edge_index_dict`; single log
+textbox replaces all status fields; aggregation results cached in-memory per strategy
+name; `_precompute_delta_dfs()` converts raw predictions to long-format DataFrames
+once after inference. All 52 tests pass.
 
 ### Step 5: Aggregation Experimentation Framework
 
@@ -571,12 +580,8 @@ Remaining work for this step:
 - Class label columns use the **resolved human-readable names** from the task vocabulary
   as-is (e.g., `major triad` with space, not `major_triad`)
 - Delta Lake versioning tracks the evolution of aggregation experiments within a run
-- **Avoiding version pollution on re-write**: The writer uses `mode="overwrite"` which
-  replaces the table contents entirely. Each overwrite creates a new Delta Log entry
-  (version), even when the data is identical. To avoid polluting the version history
-  with redundant snapshots, callers should **check whether the output already exists**
-  before writing. The demo notebook and Gradio integration both guard the write step
-  with an existence check (e.g., `if not os.path.isdir(os.path.join(output_dir,
-  "notes", "_delta_log")): write_analysis_results(...)`). This keeps the Delta Log
-  clean for meaningful experiments — each version should correspond to a genuinely new
-  inference run or aggregation result, not a duplicate of existing data.
+- **Merge-based writes**: `delta_writer.py` uses `_merge_or_create()` which performs
+  a standard Delta Lake merge (upsert + delete stale rows) followed by
+  `vacuum(retention_hours=0)` to remove orphaned parquet files. First write to a
+  non-existent table uses plain `write_deltalake`. Callers do not need existence
+  guards — the merge handles both creation and update.
