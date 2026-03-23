@@ -17,10 +17,6 @@ import torch
 import partitura as pt
 
 from analysisgnn.models.analysis import ContinualAnalysisGNN
-from analysisgnn.utils.chord_representations import available_representations
-from analysisgnn.utils.music import CadenceEncoder
-
-
 DEFAULT_EDITABLE_TASKS: Tuple[str, ...] = (
     "romanNumeral",
     "localkey",
@@ -29,8 +25,6 @@ DEFAULT_EDITABLE_TASKS: Tuple[str, ...] = (
     "degree1",
     "degree2",
 )
-
-_CADENCE_ENCODER = CadenceEncoder()
 
 
 @dataclass
@@ -246,7 +240,15 @@ def score_note_table(score: pt.score.Score) -> pd.DataFrame:
 
 
 def _decode_task_predictions(task: str, probs_or_ids: torch.Tensor) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
-    """Decode task predictions into label strings + confidence + class ids."""
+    """Decode task predictions into label strings + confidence + class ids.
+
+    Uses :func:`resolve_task_vocabulary` from
+    ``analysisgnn.utils.chord_representations`` as the single source of truth
+    for class-label resolution, ensuring consistent labels across Gradio
+    display, Delta Lake storage, and reference CSVs.
+    """
+    from analysisgnn.utils.chord_representations import resolve_task_vocabulary
+
     tensor = probs_or_ids.detach().cpu()
     if tensor.ndim == 1:
         class_ids = tensor.long().numpy()
@@ -267,30 +269,11 @@ def _decode_task_predictions(task: str, probs_or_ids: torch.Tensor) -> Tuple[np.
         class_ids = torch.argmax(probs, dim=-1).long().numpy()
         confidence = torch.max(probs, dim=-1).values.numpy()
 
-    # Cadence is not in `available_representations`; decode explicitly.
-    if task == "cadence":
-        safe_ids = np.clip(np.asarray(class_ids, dtype=int), 0, len(_CADENCE_ENCODER.accepted_cadences) - 1)
-        decoded = np.asarray(_CADENCE_ENCODER.decode(safe_ids), dtype=object).reshape(-1)
-        decoded = np.where(decoded == "", "", decoded)
-        return decoded, confidence, np.asarray(class_ids)
+    num_classes = int(tensor.shape[-1]) if tensor.ndim >= 2 else int(class_ids.max() + 1) if len(class_ids) > 0 else 1
+    vocab = resolve_task_vocabulary(task, num_classes)
 
-    decoded: np.ndarray
-    if task in available_representations:
-        try:
-            decoded_obj = available_representations[task].decode(np.asarray(class_ids).reshape(-1, 1))
-            decoded = np.asarray(decoded_obj, dtype=object).reshape(-1)
-            if task == "pcset":
-                # Make heterogeneous tuple/list representations display-safe.
-                def _pcset_to_str(v: Any) -> str:
-                    if isinstance(v, (list, tuple, np.ndarray)):
-                        seq = [str(int(x)) for x in np.asarray(v).reshape(-1).tolist()]
-                        return "{" + ",".join(seq) + "}"
-                    return str(v)
-                decoded = np.asarray([_pcset_to_str(v) for v in decoded], dtype=object)
-        except Exception:
-            decoded = np.asarray(class_ids, dtype=object)
-    else:
-        decoded = np.asarray(class_ids, dtype=object)
+    safe_ids = np.clip(np.asarray(class_ids, dtype=int), 0, len(vocab) - 1)
+    decoded = np.asarray([vocab[i] for i in safe_ids], dtype=object)
 
     return decoded, confidence, np.asarray(class_ids)
 

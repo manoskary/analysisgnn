@@ -35,6 +35,7 @@ from analysisgnn.inference.hybrid_predictor import (
     parse_task_csv,
     predictions_to_dataframe,
 )
+from analysisgnn.utils.chord_representations import format_table_output
 from analysisgnn.utils.roman_decode import decode_roman_numeral
 
 
@@ -136,48 +137,6 @@ def _resolve_selected_tasks(task_labels: List[str], tasks_csv: str) -> List[str]
     if not normalized:
         normalized = [t for t in DEFAULT_EDITABLE_TASKS if t in supported_tasks]
     return normalized
-
-
-def _convert_tpc_column_inplace(df: pd.DataFrame) -> None:
-    if "tpc_in_label" not in df.columns:
-        return
-    numeric = pd.to_numeric(df["tpc_in_label"], errors="coerce")
-    mapped = np.where(numeric.fillna(1).astype(int) == 0, "NCT", "Chord Tone")
-    keep_original_mask = numeric.isna()
-    if keep_original_mask.any():
-        original = df.loc[keep_original_mask, "tpc_in_label"].astype(str)
-        cleaned = original.str.strip()
-        mapped = pd.Series(mapped, index=df.index, dtype=object)
-        mapped.loc[keep_original_mask] = cleaned
-        df["tpc_in_label"] = mapped.values
-    else:
-        df["tpc_in_label"] = mapped
-
-
-def _format_table_output(df: pd.DataFrame, tasks: List[str]) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return df
-    out = df.copy()
-    if "note_id" not in out.columns:
-        out.insert(0, "note_id", np.arange(len(out)))
-    _convert_tpc_column_inplace(out)
-
-    timing_cols = [
-        col for col in ["row", "note_id", "onset_beat", "measure", "duration_beat", "pitch_spelling", "pitch_midi"]
-        if col in out.columns
-    ]
-    prediction_cols = [task for task in tasks if task in out.columns]
-    confidence_cols = [col for col in out.columns if col.endswith("_confidence")]
-
-    ordered_cols: List[str] = timing_cols.copy()
-    for pred_col in prediction_cols:
-        ordered_cols.append(pred_col)
-        conf_col = f"{pred_col}_confidence"
-        if conf_col in confidence_cols:
-            ordered_cols.append(conf_col)
-    remaining_cols = [col for col in out.columns if col not in ordered_cols and not col.endswith("_id")]
-    out = out[ordered_cols + remaining_cols]
-    return out
 
 
 def _apply_timing_from_predictions(df: pd.DataFrame, predictions: Dict[str, torch.Tensor]) -> pd.DataFrame:
@@ -696,7 +655,7 @@ def run_full_inference(
             include_class_ids=False,
         )
         full_df = _apply_timing_from_predictions(full_df, predictions)
-        display_df = _format_table_output(full_df, tasks)
+        display_df = format_table_output(full_df, tasks)
 
         status = (
             f"Full inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
@@ -784,7 +743,7 @@ def run_partial_rerender(
             include_class_ids=False,
         )
         out_df = _apply_timing_from_predictions(out_df, predictions)
-        display_df = _format_table_output(out_df, tasks)
+        display_df = format_table_output(out_df, tasks)
 
         status = (
             f"Partial inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
