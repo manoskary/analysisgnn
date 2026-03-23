@@ -1972,6 +1972,8 @@ class ContinualAnalysisGNN(LightningModule):
         aggregation_bundle: Optional[PosthocAggregationBundle] = None,
     ) -> Dict[str, torch.Tensor]:
         mode = str(aggregation_mode or self.aggregation_mode or "mean").lower().strip()
+        if mode == "none":
+            return {k: v.clone() for k, v in note_prob_dict.items()}
         out = {k: v.clone() for k, v in note_prob_dict.items()}
         out = onsetwise_logit_aggregation(
             out,
@@ -2030,6 +2032,8 @@ class ContinualAnalysisGNN(LightningModule):
     ) -> Tuple[str, Optional[PosthocAggregationBundle]]:
         spec = aggregation_spec or {}
         mode = str(spec.get("mode", self.aggregation_mode or "mean")).lower().strip()
+        if mode == "none":
+            return "none", None
         if mode not in {"mean", "voter"}:
             mode = "mean"
         path = spec.get("voter_path", None)
@@ -5038,6 +5042,7 @@ class ContinualAnalysisGNN(LightningModule):
         iterative_spec: Optional[Dict[str, Any]] = None,
         aggregation_spec: Optional[Dict[str, Any]] = None,
         return_iterative_trace: bool = False,
+        return_intermediates: bool = False,
     ):
         """Predict analysis for a musical score.
         
@@ -5049,6 +5054,8 @@ class ContinualAnalysisGNN(LightningModule):
             iterative_spec: Optional iterative masked-refinement configuration.
             aggregation_spec: Optional aggregation override {"mode": "mean|voter", "voter_path": "..."}.
             return_iterative_trace: If True, append iterative trace to output.
+            return_intermediates: If True, append intermediates dict with keys
+                ``"score"``, ``"note_array"``, ``"data"`` (the PyG graph).
             
         Returns:
             Dictionary of predictions for each task, or tuple with diagnostics.
@@ -5190,6 +5197,14 @@ class ContinualAnalysisGNN(LightningModule):
                 )
             if return_iterative_trace:
                 outputs.append(iterative_trace)
+            if return_intermediates:
+                outputs.append(
+                    {
+                        "score": score_obj,
+                        "note_array": note_array,
+                        "data": data,
+                    }
+                )
             if len(outputs) == 1:
                 return outputs[0]
             return tuple(outputs)
