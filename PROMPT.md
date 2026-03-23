@@ -1,253 +1,205 @@
-# PROMPT: Phase 1, Step 3 — Reference CSVs + Aggregation Package
+# PROMPT: Phase 1, Step 4 — Gradio GUI Restructuring + Delta Lake Integration
 
 ## Goal
 
-Produce ground-truth reference CSVs for two aggregation modes (`none` and `mean`)
-using the existing inference pipeline on Mozart K.1, then create a new
-`analysisgnn/aggregation/` package whose `mean` strategy reproduces the exact same
-values from the pre-aggregation Delta Lake. Along the way, unify the label decoding
-across the codebase.
+Restructure the Gradio app into three clearly separated modules with proper data flow,
+integrate Delta Lake persistence, and enable post-hoc re-aggregation without re-running
+inference.  Replace the redundant `_extract_graph_edges_from_score` call with data from
+`intermediates["data"]`.
 
-## Context
+## Current App Structure (flat, to be replaced)
 
-### Two decoding systems exist today
+The app (`examples/gradio_hybrid_analysis_app.py`, ~1060 lines) currently has a flat
+layout with 28 widgets jumbled together: score upload, checkpoints, task selection,
+inference mode, iterative refinement, aggregation mode, voter path, edit-conditioned
+controls, predictions table, and Verovio — all stacked vertically with minimal
+separation.  See `AGENTS.md` Step 4 description for context.
 
-1. **Gradio / `_decode_task_predictions()`** in
-   `analysisgnn/inference/hybrid_predictor.py:248-295` — used for display. It decodes
-   argmax class IDs into human-readable labels via `available_representations[task].decode()`
-   or `CadenceEncoder.decode()`, falling back to raw integer IDs for tasks it doesn't
-   recognize.
+## New Layout
 
-2. **Delta Lake / `resolve_task_vocabulary()`** in
-   `analysisgnn/storage/delta_writer.py:44-103` — used when writing the `class_label`
-   column. It uses a richer resolution chain (aliases, binary task vocabularies,
-   `NoteDegree49`, integer-label tasks, fallback).
+Three modules, top to bottom.  Each module is visually separated with a header.
 
-The Delta Lake approach is more complete but has one legacy artefact: it was designed
-for wide-format tables where labels become column names, so spaces were replaced by
-underscores (e.g., `major_triad`). The Gradio approach uses the original `decode()`
-output, which preserves spaces (e.g., `major triad`).
+### Module 1: Data Source (tabs)
 
-### Known differences (per task)
+Two tabs: **"Analyse Score"** (1a) and **"Load Delta Lake"** (1b).
 
-| Task            | Gradio output                                                                                      | Delta output                           | Issue                                                                                                       |
-|-----------------|----------------------------------------------------------------------------------------------------|----------------------------------------|-------------------------------------------------------------------------------------------------------------|
-| `quality`       | `"major triad"` (space)                                                                            | `"major triad"` (space)                | Actually same — Delta uses `_class_list_to_strings(classList)` which calls `str()`, preserving the original |
-| `hrythm`        | Raw int `0`/`1`                                                                                    | `"True"`/`"False"`                     | Gradio has no alias `hrythm`→`hrhythm`; falls through to int                                                |
-| `section`       | Raw int `0`/`1`                                                                                    | `"no_section_start"`/`"section_start"` | Not in `available_representations`; Delta has `_BINARY_TASK_VOCABULARIES`                                   |
-| `phrase`        | Raw int `0`/`1`                                                                                    | `"no_boundary"`/`"phrase_end"`         | Same                                                                                                        |
-| `organ_point`   | Raw int `0`/`1`                                                                                    | `"no_pedal"`/`"pedal_present"`         | Same                                                                                                        |
-| `tpc_in_label`  | Raw int `0`/`1` → Gradio display remaps to `"NCT"`/`"Chord Tone"`                                  | `"NCT"`/`"chord_tone"`                 | Three-way inconsistency                                                                                     |
-| `tpc_is_root`   | Raw int `0`/`1`                                                                                    | `"not_root"`/`"is_root"`               | Same pattern                                                                                                |
-| `tpc_is_bass`   | Raw int `0`/`1`                                                                                    | `"not_bass"`/`"is_bass"`               | Same pattern                                                                                                |
-| `note_degree`   | Raw int `0`..`48`                                                                                  | `"bbb1"`, `"bb1"`, ..., `"###7"`       | Not in `available_representations`; Delta has `_EXTRA_REPRESENTATION_CLASSES`                               |
-| `inversion`     | `int` (0,1,2,3)                                                                                    | `str` ("0","1","2","3")                | Type difference only                                                                                        |
-| `downbeat`      | `int`                                                                                              | `str`                                  | Type difference only                                                                                        |
-| `staff`         | `int`                                                                                              | `str`                                  | Type difference only                                                                                        |
-| `romanNumeral`  | Works for class_ids 0..183; crashes for 184 (`classList` has 184 entries due to missing-comma bug) | Pads with `"class_184"` fallback       | Delta is more robust                                                                                        |
-| Everything else | Identical                                                                                          | Identical                              |                                                                                                             |
+**Tab 1a — Analyse Score:**
+- Checkpoint paths (`full_ckpt`, `masked_ckpt`), device dropdown
+- Score file upload
+- Task selection (checkbox group + CSV override)
+- "Enable Iterative Refinement" checkbox + steps/percentile controls
+  (the old `mode_selector` dropdown is **removed** — the checkbox suffices to
+  distinguish Full vs Iterative)
+- **"Run Inference"** button (green) — always runs with `aggregation_spec={"mode":
+  "none"}` and `return_intermediates=True`.  Stores the raw predictions, score,
+  note_array, and data in `gr.State`.  Writes Delta Lake to
+  `outputs/<score_id>/`.  Populates Module 2.
 
-### The `romanNumeral` missing-comma bug
+**Tab 1b — Load Delta Lake:**
+- A path textbox or directory browser to select an existing Delta Lake output dir
+- A **"Load"** button that reads notes, probabilities, hyperedges, and metadata
+  from the Delta Lake and populates Module 2
 
-`SIMPLE_NUMERAL_VOCABULARY` in `analysisgnn/utils/globals.py` has a missing comma at
-lines 2351-2354, concatenating `'#VII'` and `'bvio7'` into `'#VIIbvio7'`, producing
-184 items instead of 185. This means `SimpleRomanNumeral185.classList` actually has 184
-entries. When the model predicts class_id 184 (the 185th class), the Gradio decoder
-crashes and falls back to all-integer labels. The Delta writer pads with `"class_184"`.
+In both cases, after the button click, Module 2 becomes active and shows the results.
 
-## What to Build
+### Module 2: Analysis Results
 
-### 1. Unify Label Decoding
+Sits **below** Module 1.  Has a header bar with:
+- Aggregation strategy dropdown (populated from `list_strategies()`, default `"None"`)
+- **"Aggregate!"** button — re-applies the selected strategy to the raw probabilities
+  (stored in `gr.State` from Module 1) and updates both the table and Verovio views
+- **"Export CSV"** button — saves the current table to a user-specified path
+- **"Save Delta Lake"** button — writes/updates the Delta Lake, including any
+  aggregation results generated during this session (cached in state)
 
-**Do NOT modify files yet.** First, present the proposed unified vocabulary for each
-task (especially the binary tasks and `tpc_in_label`) so the user can review the
-musicological correctness before any code changes. The key decisions to get approval
-on:
+Below the header bar: two tabs, **"Analysis Results"** (renamed from "Inference &
+Edits") and **"Verovio Visual Score"**.
 
-- `tpc_in_label`: Currently three variants: int `0`/`1`, Delta `"NCT"`/`"chord_tone"`,
-  Gradio display `"NCT"`/`"Chord Tone"`. Propose one canonical form.
-- Binary tasks (`section`, `phrase`, `organ_point`, `tpc_is_root`, `tpc_is_bass`):
-  Are the Delta labels (`"no_boundary"`/`"phrase_end"`, etc.) musicologically accurate?
-- `hrythm`: The Delta label `"True"`/`"False"` comes from
-  `HarmonicRhythm2.classList = [True, False]`. Is there a better label?
-- `note_degree`: The Delta labels (`"bbb1"`, ..., `"###7"`) come from
-  `NoteDegree49.classList`. Are these correct?
-- `romanNumeral` class 184: Should this be `"class_184"`, or can we fix the
-  missing-comma bug and restore the intended label?
+**Tab: Analysis Results**
+- Editable `gr.Dataframe` ("Predictions") — shows the current aggregation result
+  (or raw predictions if aggregation is `"None"`)
+- Status textbox
 
-After getting approval, update `_decode_task_predictions()` in `hybrid_predictor.py`
-to use `resolve_task_vocabulary()` as its label source. This means:
+**Tab: Verovio Visual Score**
+- Edge type visibility checkboxes
+- **"Refresh Visual"** button (for Verovio-specific display settings like edges;
+  the prediction data shown on note-click updates automatically with aggregation)
+- Verovio HTML iframe
+- Visual status textbox
 
-- Remove the per-task `if task in available_representations: cls.decode(...)` chain
-- Instead: `vocab = resolve_task_vocabulary(task, num_classes)` then
-  `decoded = np.array([vocab[i] for i in class_ids])`
-- Keep the confidence/argmax computation unchanged
-- Remove the `_pcset_to_str` special case (handled by `_class_list_to_strings`)
-- Keep cadence's empty-string-for-class-0 semantics
+**Aggregation data flow**: Whenever the user clicks "Aggregate!", the selected
+strategy's `aggregate()` runs on the stored raw probabilities.  The resulting
+DataFrame updates the predictions table immediately.  The Verovio note-click payload
+also updates (so clicking a note shows the aggregated values).  If the Verovio tab
+has been opened, the rendered score reflects the new data; if not, it renders on
+first visit.  The "Refresh Visual" button only re-renders Verovio display settings
+(edge types, etc.), not the underlying data.
 
-Also update `_convert_tpc_column_inplace()` in the Gradio app to match the unified
-vocabulary (or remove it if the unified vocab already handles tpc_in_label correctly).
+### Module 3: Edit-Conditioned Re-Inference
 
-### 2. Generate Reference CSVs
+Sits **below** Module 2.  **Grayed out** (all widgets `interactive=False`) until
+Module 1a has been used (i.e., inference has been run — not when loading from Delta
+Lake).
 
-Create a script `scripts/generate_reference_csvs.py` that:
+Contains:
+- "Target-only overwrite (partial mode)" checkbox
+- "Known Rows" and "Target Rows" textboxes
+- **"Update Analysis"** button (big, orange) — runs edit-conditioned masked inference
+  using the edits made in the Module 2 table.  Updates Module 2 with the new
+  predictions.
 
-1. Loads the model and runs inference on `notebooks/Minuet_in_G_Major_K.1.musicxml`
-2. For each mode in `["none", "mean"]`:
-   a. Calls `model.predict(score, aggregation_spec={"mode": mode}, return_intermediates=True)`
-   b. Calls `predictions_to_dataframe(score, predictions, tasks=ALL_TASKS, include_confidence=True, include_class_ids=False)`
-   c. Applies `_format_table_output(df, tasks)` for consistent column ordering
-   d. Saves to `outputs/Minuet_in_G_Major_K.1/reference_<mode>.csv`
+### Bottom: Diagnostic Output
 
-The CSVs have columns: `row`, `note_id`, `onset_beat`, `measure`, `duration_beat`,
-`pitch_spelling`, `pitch_midi`, then for each of the 21 tasks: `<task>`, `<task>_confidence`.
+Below Module 3:
+- "Show Iteration Trace" checkbox
+- Iteration trace textbox (used by both iterative inference and edit-conditioned
+  updates)
 
-### 3. Create `analysisgnn/aggregation/` Package
+### Voter Checkpoint Path
 
-```
-analysisgnn/aggregation/
-├── __init__.py
-├── base.py          # Abstract AggregationStrategy interface
-├── registry.py      # Named strategy registry
-└── mean.py          # Mean aggregation (onset → beat → measure)
-```
+**Comment out** the `voter_checkpoint_path` textbox and all voter-related logic.
+The voter aggregation is not implemented in the new `analysisgnn/aggregation/`
+package yet.
 
-#### `base.py`
+## Key Implementation Changes
 
-```python
-class AggregationStrategy(ABC):
-    """Abstract base class for aggregation strategies."""
+### 1. Capture intermediates from inference
 
-    @abstractmethod
-    def aggregate(
-        self,
-        probabilities: pd.DataFrame,   # Long-format probabilities from Delta Lake
-        notes: pd.DataFrame,            # Notes table from Delta Lake
-        hyperedges: pd.DataFrame,       # Hyperedges table from Delta Lake
-        metadata: dict,                 # metadata.json contents
-        tasks: Optional[List[str]] = None,
-    ) -> pd.DataFrame:
-        """Aggregate probabilities and return an argmax summary DataFrame.
+`HybridAnalysisPredictor.predict()` needs to support `return_intermediates=True`.
+Currently it does not forward this to `model.predict()`.  Add the passthrough so
+that `run_full_inference()` receives `intermediates` containing `score`, `note_array`,
+and `data`.
 
-        The returned DataFrame has one row per note and columns:
-        - All columns from the notes table
-        - For each task: <task> (argmax label) and <task>_confidence (max prob)
+Store these in `gr.State` objects:
+- `raw_predictions_state`: the raw `Dict[str, torch.Tensor]` (always `"none"` mode)
+- `intermediates_state`: `{"score": ..., "note_array": ..., "data": ...}`
 
-        This matches the format of the Gradio display DataFrame and the
-        reference CSVs.
-        """
-        ...
-```
+### 2. Replace `_extract_graph_edges_from_score`
 
-The key insight: the new aggregation strategies operate on **Delta Lake data**
-(pandas DataFrames), not on PyTorch tensors + PyG graphs. This decouples
-aggregation experimentation from the model inference pipeline.
+The function at line 385 re-creates the score graph independently to extract edge
+indices.  This duplicates what `model.predict()` already does.  Replace it:
 
-#### `mean.py`
+- `_build_graph_overlay_payload()` should take edges from
+  `intermediates["data"].edge_index_dict` instead of calling
+  `_extract_graph_edges_from_score(score, note_array)`
+- This eliminates a redundant `create_score_graph` call and ensures the visual
+  overlay matches exactly what the model used
 
-Re-implements the existing onset → beat → measure mean pipeline, but operating on
-the long-format `probabilities` DataFrame + `hyperedges` DataFrame rather than
-PyTorch tensors.
+When loading from Delta Lake (Module 1b), edges come from `delta_reader.load_edges()`.
 
-The algorithm for each level (onset, beat, measure):
+### 3. Run inference always with `aggregation_spec={"mode": "none"}`
 
-1. Load the group memberships from `hyperedges` (filtered by `edge_type`)
-2. For each task in the level's task list:
-   a. Join probabilities with group memberships on `note_id`
-   b. For eligible notes (filtered by `tpc_in_label` argmax for RNA tasks at
-      onset/beat level):
-      - Compute the mean probability for each `(group_id, class_id)` combination
-      - Broadcast the group mean back to all member notes
-      - Replace the original probabilities with the group means
-3. The onset level also performs change-point detection (as in
-   `onsetwise_logit_aggregation` lines 420-452): after onset grouping, find
-   contiguous spans of identical argmax predictions and broadcast each span's
-   onset-group distribution to all notes in the span.
+The "Run Inference" button always gets raw per-note probabilities (no aggregation).
+Aggregation is applied post-hoc in Module 2 via the "Aggregate!" button.  This means:
 
-The level → tasks mapping (from `DEFAULT_TASKS_BY_LEVEL` in `posthoc_aggregator.py`):
+- Remove `aggregation_mode` from inference controls (it moves to Module 2)
+- `_build_aggregation_spec()` always returns `{"mode": "none"}` for inference
+- The default aggregation in Module 2 is `"None"` (raw predictions)
 
-```python
-{
-    "onset": ["cadence", "phrase", "root", "localkey", "quality",
-              "inversion", "degree1", "degree2", "romanNumeral", "section"],
-    "beat":  ["root", "localkey", "quality", "inversion",
-              "degree1", "degree2", "romanNumeral",
-              "cadence", "phrase", "section"],
-    "measure": ["localkey"],
-}
-```
+### 4. Post-hoc aggregation in Module 2
 
-#### `registry.py`
+When "Aggregate!" is clicked:
 
-```python
-_STRATEGIES: Dict[str, Type[AggregationStrategy]] = {}
+1. Read the selected strategy name from the dropdown
+2. If raw Delta Lake data is available (from `gr.State`):
+   a. Convert raw predictions to the long-format probabilities DataFrame
+   b. Run `get_strategy(name).aggregate(probabilities, notes, hyperedges, metadata)`
+   c. Apply `format_table_output()` and update the predictions table
+3. Cache each aggregation result so that "Save Delta Lake" can persist all of them
 
-def register(name: str, cls: Type[AggregationStrategy]): ...
-def get(name: str) -> Type[AggregationStrategy]: ...
-def list_strategies() -> List[str]: ...
-```
+### 5. Delta Lake writing
 
-Pre-registers `"none"` (passthrough — returns `argmax_summary()` from
-`delta_reader`) and `"mean"` (the new mean aggregation).
+**On initial inference** (Module 1a "Run Inference"):
+- Write the raw predictions, notes, edges, hyperedges to Delta Lake under
+  `outputs/<score_id>/`
+- Guard: only write if Delta Lake does not already exist
 
-### 4. Validation Test
+**On "Save Delta Lake"** (Module 2):
+- Write/update the Delta Lake with any new aggregation results generated during the
+  session
 
-Create `tests/test_aggregation_mean.py`:
+### 6. Loading from Delta Lake (Module 1b)
 
-- Load the Delta Lake at `outputs/Minuet_in_G_Major_K.1/`
-- Load the reference CSV `outputs/Minuet_in_G_Major_K.1/reference_mean.csv`
-- Run the new `MeanAggregation` strategy on the Delta Lake data
-- Assert that the resulting DataFrame matches the reference CSV exactly
-  (for all 21 task columns and all 21 confidence columns, within float tolerance)
+When "Load" is clicked:
+- Read notes, probabilities, hyperedges, edges, metadata from the given path
+- Store them in the same `gr.State` objects used by inference
+- Populate the Module 2 table with the `"none"` aggregation (raw argmax)
+- **Set Module 3 to disabled** (no model available for edit-conditioned inference)
 
-Similarly, test `"none"`:
-- Run the `NoneAggregation` strategy
-- Assert it matches `reference_none.csv`
-
-Use `pytestmark = pytest.mark.skipif` if the output directory or reference CSVs
-don't exist.
-
-## Files to Create/Modify
+## Files to Modify
 
 | File | Action |
 |------|--------|
-| `analysisgnn/inference/hybrid_predictor.py` | Modify: update `_decode_task_predictions()` to use `resolve_task_vocabulary()` |
-| `examples/gradio_hybrid_analysis_app.py` | Modify: update `_convert_tpc_column_inplace()` to match unified vocab |
-| `scripts/generate_reference_csvs.py` | Create: script to generate reference CSVs |
-| `analysisgnn/aggregation/__init__.py` | Create |
-| `analysisgnn/aggregation/base.py` | Create |
-| `analysisgnn/aggregation/registry.py` | Create |
-| `analysisgnn/aggregation/mean.py` | Create |
-| `tests/test_aggregation_mean.py` | Create |
+| `examples/gradio_hybrid_analysis_app.py` | Major restructure: 3-module layout, Delta Lake integration, intermediates capture |
+| `analysisgnn/inference/hybrid_predictor.py` | Add `return_intermediates` passthrough to `HybridAnalysisPredictor.predict()` |
 
-Optional if the missing-comma bug should be fixed:
-| `analysisgnn/utils/globals.py` | Modify: fix the missing comma in `SIMPLE_NUMERAL_VOCABULARY` |
+Files that should NOT need changes: `delta_writer.py`, `delta_reader.py`,
+`analysisgnn/aggregation/`, `verovio_score_graph.js`, `verovio_score_graph.css`.
 
 ## How to Verify
 
-1. `conda run -n analysisgnn python scripts/generate_reference_csvs.py` — produces
-   two CSVs without errors
-2. `conda run -n analysisgnn python -m pytest tests/test_aggregation_mean.py -v` —
-   all tests pass (new aggregation matches reference CSVs)
-3. The Gradio app still works correctly (no display regressions)
-4. `conda run -n analysisgnn python -m pytest tests/test_delta_writer.py tests/test_delta_reader.py -v` —
-   existing tests still pass
+1. Launch the Gradio app, upload Mozart K.1, run inference → see raw predictions in
+   Module 2, Delta Lake written to `outputs/Minuet_in_G_Major_K.1/`
+2. Change aggregation to "Mean", click "Aggregate!" → table updates, Verovio
+   note-click data updates
+3. Switch back to "None" → raw predictions again
+4. Click "Export CSV" → CSV matches what the table shows
+5. In a new session, use "Load Delta Lake" tab → load the output dir → see results
+   in Module 2, Module 3 is grayed out
+6. All 52 tests still pass:
+   ```
+   conda run -n analysisgnn python -m pytest tests/test_delta_writer.py tests/test_delta_reader.py tests/test_aggregation_mean.py -v
+   ```
 
 ## Reference
 
-- Existing aggregation code: `analysisgnn/models/analysis.py` lines 296-540
-  (`_groupwise_mean_broadcast`, `_aggregate_with_mode`, `onsetwise_logit_aggregation`,
-  `beatwise_logit_aggregation`, `measurewise_logit_aggregation`,
-  `_aggregate_note_probs`, `_resolve_aggregation_runtime`)
-- `DEFAULT_TASKS_BY_LEVEL`: `analysisgnn/models/posthoc_aggregator.py` lines 11-37
+- Current Gradio app: `examples/gradio_hybrid_analysis_app.py` (~1060 lines)
+- `HybridAnalysisPredictor.predict()`: `analysisgnn/inference/hybrid_predictor.py:379-414`
+- `_extract_graph_edges_from_score()`: `examples/gradio_hybrid_analysis_app.py:385-438`
+- `_build_graph_overlay_payload()`: `examples/gradio_hybrid_analysis_app.py:441-516`
+- `run_full_inference()`: `examples/gradio_hybrid_analysis_app.py:603-675`
+- `run_partial_rerender()`: `examples/gradio_hybrid_analysis_app.py:678-764`
+- `build_demo()` (all widgets): `examples/gradio_hybrid_analysis_app.py:821-1051`
+- Delta Lake writer: `analysisgnn/storage/delta_writer.py`
 - Delta Lake reader: `analysisgnn/storage/delta_reader.py`
-- Delta Lake output: `outputs/Minuet_in_G_Major_K.1/`
-- Score: `notebooks/Minuet_in_G_Major_K.1.musicxml`
-- Checkpoint: `artifacts/gradio_checkpoints/uocj8f6y_full_last.ckpt`
-- Gradio app: `examples/gradio_hybrid_analysis_app.py`
-- `_decode_task_predictions`: `analysisgnn/inference/hybrid_predictor.py:248-295`
-- `resolve_task_vocabulary`: `analysisgnn/storage/delta_writer.py:44-103`
-- `CadenceEncoder`: `analysisgnn/utils/music.py:208-276`
-- `available_representations`: `analysisgnn/utils/chord_representations.py:529-541`
-- `NoteDegree49`: `analysisgnn/utils/chord_representations.py:489-491`
-- `SIMPLE_NUMERAL_VOCABULARY` (missing-comma bug): `analysisgnn/utils/globals.py:2314-2359`
+- Aggregation package: `analysisgnn/aggregation/`
