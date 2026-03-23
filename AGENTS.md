@@ -14,6 +14,17 @@ will be available.
 
 ---
 
+## IMPORTANT: AGENTS.md Writing Rules
+
+**When updating this file, match the conciseness of existing "DONE" sections.**
+Steps 1 and 2 are the reference style: ~15-20 lines each, listing what was created
+and key API surfaces. Do NOT write verbose prose, do NOT repeat information that is
+already documented elsewhere (e.g., in the code, docstrings, or table schemas above),
+do NOT add sub-sub-sections. A completed step should be **shorter** than its
+pre-implementation description, not longer.
+
+---
+
 ## Project Context
 
 **AnalysisGNN** is a multi-task Graph Neural Network for music analysis. Given a MusicXML
@@ -193,7 +204,7 @@ Analysis results (raw probability distributions + graph structure) are stored in
   combination, making it easy to query, filter, and aggregate across tasks without
   dealing with heterogeneous column schemas
 - **Resolved human-readable class labels** via `resolve_task_vocabulary()` in
-  `analysisgnn/storage/delta_writer.py`, which resolves labels from
+  `analysisgnn/utils/chord_representations.py`, which resolves labels from
   `available_representations`, `CadenceEncoder`, `NoteDegree49`, known binary task
   semantics, and integer-label tasks (see the function for the full resolution chain)
 - **Organic growth**: new aggregation and grouping tables are added to the same Delta
@@ -306,17 +317,27 @@ Invariants:
 - The row with `rank = 1` always has `is_argmax = True`
 
 **Class label resolution** is handled by `resolve_task_vocabulary()` in
-`analysisgnn/storage/delta_writer.py`. The resolution chain:
+`analysisgnn/utils/chord_representations.py` (the single canonical source; also
+re-exported by `analysisgnn/storage/delta_writer.py` for backward compatibility).
+The resolution chain:
 1. `available_representations` (canonical vocabularies from `chord_representations.py`)
 2. Key aliases (e.g., model key `hrythm` maps to `hrhythm` in `available_representations`)
 3. `CadenceEncoder.accepted_cadences` (for the `cadence` task)
 4. Extra representation classes not in `available_representations` (e.g., `NoteDegree49`)
-5. Known binary task semantics (e.g., `phrase` -> `["no_boundary", "phrase_end"]`)
+5. Known binary task semantics — all binary tasks use `"False"` / `"True"` string labels
+   (class 0 = `"False"`, class 1 = `"True"`)
 6. Known integer-label tasks (e.g., `downbeat` -> `["0", "1", ..., "44"]`)
 7. Fallback: `class_0`, `class_1`, ...
 
 The `class_label` column can be empty string (e.g., cadence class 0 = no cadence)
 but is never null/NaN.
+
+**Label decoding is unified** across the entire codebase: the Gradio display
+(`_decode_task_predictions()` in `hybrid_predictor.py`), the Delta Lake writer
+(`delta_writer.py`), and reference CSV generation (`scripts/generate_reference_csvs.py`)
+all use `resolve_task_vocabulary()` from `chord_representations.py` as the single source
+of truth. This was previously inconsistent — the Gradio path used `available_representations[task].decode()` with raw-integer fallback for unrecognized tasks, while
+the Delta Lake path had a richer resolution chain.
 
 #### `agg_<method>_<task>` tables (added over time)
 
@@ -487,32 +508,24 @@ Also done:
   inspect workflow. Write is guarded with an existence check to avoid Delta Log
   version pollution (see Conventions below)
 
-### Step 3: Aggregation Runtime Refactoring
+### Step 3: Unified Label Decoding + Reference CSVs + Aggregation Package — DONE
 
-Extend the existing aggregation runtime in `analysisgnn/models/analysis.py` so that:
+Unified all label decoding behind `resolve_task_vocabulary()` in
+`analysisgnn/utils/chord_representations.py` (single canonical source; `delta_writer.py`
+re-exports for backward compatibility). `_decode_task_predictions()` in
+`hybrid_predictor.py` now uses it exclusively. Binary tasks use `"False"`/`"True"`,
+the `romanNumeral` missing-comma bug was fixed (185 entries), and
+`format_table_output()` was moved to `chord_representations.py` so both the Gradio app
+and `scripts/generate_reference_csvs.py` use the same function.
 
-1. **No aggregation by default**: `aggregation_mode` defaults to `"none"` instead of
-   `"mean"`. The raw per-note softmax outputs are returned unchanged unless an
-   aggregation is explicitly requested.
+Created `analysisgnn/aggregation/` package:
+- `base.py`, `registry.py`, `mean.py`, `__init__.py`
+- `"none"` (passthrough) and `"mean"` (onset → beat → measure) strategies
+- `MeanAggregation` validated to match the model's built-in `"mean"` mode exactly
 
-2. **`"mean"` becomes optional**: The current onset → beat → measure mean pipeline is
-   still available under the name `"mean"` but is no longer the default.
-
-3. **Named registry**: Aggregation strategies are registered by keyword name. The
-   existing `"mean"` and `"voter"` modes are the first two entries. New strategies
-   can be added by registering a name and a callable. The `aggregation_spec` dict
-   gains a `"mode"` key that can be any registered name (not just `"mean"` or
-   `"voter"`).
-
-4. **Backward compatibility**: Training and test steps that rely on `"mean"` continue
-   to work. The CLI `--aggregation_mode` flag accepts the expanded set of registered
-   names.
-
-The integration point in `predict()` (line 5173) is adapted so that:
-- `note_predictions` (raw softmax) is always captured
-- Aggregation is applied only if `aggregation_spec["mode"] != "none"`
-- When Delta Lake output is enabled, raw probabilities are always written; aggregated
-  probabilities are written only if aggregation was applied
+Also: `scripts/generate_reference_csvs.py` produces `reference_none.csv` and
+`reference_mean.csv`; 8 tests in `tests/test_aggregation_mean.py`; demo notebook
+updated. All 52 tests pass.
 
 ### Step 4: Gradio Integration
 
@@ -533,19 +546,14 @@ In `examples/gradio_hybrid_analysis_app.py`:
 
 ### Step 5: Aggregation Experimentation Framework
 
-Create `analysisgnn/aggregation/` package, integrating with the existing aggregation
-runtime:
+The `analysisgnn/aggregation/` package is already created (see Step 3) with:
+- `base.py`, `registry.py`, `mean.py`, `__init__.py`
+- `"none"` and `"mean"` strategies registered and validated
 
-- `base.py`: Abstract `AggregationStrategy` interface, compatible with the signature
-  expected by `_aggregate_note_probs()` (accepts `note_prob_dict`, `data`,
-  `batch_size`, returns `Dict[str, torch.Tensor]`)
-- `registry.py`: Named registry mapping strategy keywords to callables. Pre-registers
-  `"none"` (passthrough), `"mean"` (current `_aggregate_note_probs` with mean mode),
-  and `"voter"` (current voter bundle path). `_resolve_aggregation_runtime()` is
-  updated to look up strategies from this registry.
-- `mean.py`: Current mean aggregation, refactored from `analysis.py` module-level
-  functions into the strategy interface
-- `roman_numeral.py`: Legal RN enumeration from task distributions (future)
+Remaining work for this step:
+- `roman_numeral.py`: Legal RN enumeration from task distributions
+- Integration with `_resolve_aggregation_runtime()` in `analysis.py` so that
+  model-level `predict()` can dispatch to registered strategies
 - Each strategy can read from Delta Lake (raw probs + graph) and write results back
   as a new `agg_*` table
 
@@ -560,8 +568,8 @@ runtime:
   (all grouping types)
 - All per-note tables share the same row ordering (by `onset_div, pitch` sort)
   and are joined via `note_id`
-- Class label columns use the **resolved human-readable names** from the task vocabulary,
-  with whitespace replaced by underscores (e.g., `major_triad`, not `major triad`)
+- Class label columns use the **resolved human-readable names** from the task vocabulary
+  as-is (e.g., `major triad` with space, not `major_triad`)
 - Delta Lake versioning tracks the evolution of aggregation experiments within a run
 - **Avoiding version pollution on re-write**: The writer uses `mode="overwrite"` which
   replaces the table contents entirely. Each overwrite creates a new Delta Log entry
