@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
-from deltalake import write_deltalake
+from deltalake import DeltaTable, write_deltalake
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +21,55 @@ from deltalake import write_deltalake
 # ---------------------------------------------------------------------------
 
 from analysisgnn.utils.chord_representations import resolve_task_vocabulary
+
+
+# ---------------------------------------------------------------------------
+# Merge-or-create helper
+# ---------------------------------------------------------------------------
+
+
+def _merge_or_create(
+    table_path: str,
+    new_data: pa.Table,
+    merge_keys: List[str],
+) -> None:
+    """Write *new_data* to a Delta table using merge (upsert) semantics.
+
+    If the table does **not** exist yet, it is created with a plain
+    ``write_deltalake``.  If it **does** exist, a standard Delta Lake
+    merge is performed:
+
+    * Matched rows are updated (``when_matched_update_all``).
+    * Unmatched source rows are inserted (``when_not_matched_insert_all``).
+    * Target rows absent from source are deleted
+      (``when_not_matched_by_source_delete``).
+
+    After the merge, ``vacuum`` is called to remove orphaned parquet files.
+    """
+    if not DeltaTable.is_deltatable(table_path):
+        write_deltalake(table_path, new_data)
+        return
+
+    dt = DeltaTable(table_path)
+
+    predicate = " AND ".join(f"s.{k} = t.{k}" for k in merge_keys)
+
+    (
+        dt.merge(
+            new_data,
+            predicate=predicate,
+            source_alias="s",
+            target_alias="t",
+        )
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .when_not_matched_by_source_delete()
+        .execute()
+    )
+
+    # Clean up orphaned parquet files left by the merge.
+    dt = DeltaTable(table_path)
+    dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
 
 
 # ---------------------------------------------------------------------------
@@ -396,18 +445,18 @@ def write_analysis_results(
 
     # ---- notes ----
     notes_table = _build_notes_table(note_array, score)
-    write_deltalake(
+    _merge_or_create(
         os.path.join(output_dir, "notes"),
         notes_table,
-        mode="overwrite",
+        merge_keys=["note_id"],
     )
 
     # ---- edges ----
     edges_table = _build_edges_table(data, note_ids)
-    write_deltalake(
+    _merge_or_create(
         os.path.join(output_dir, "edges"),
         edges_table,
-        mode="overwrite",
+        merge_keys=["src", "dst", "edge_type"],
     )
 
     # Edge counts for metadata
@@ -418,18 +467,18 @@ def write_analysis_results(
 
     # ---- probabilities (long format) ----
     probs_table = _build_probabilities_table(predictions, task_dict, note_ids)
-    write_deltalake(
+    _merge_or_create(
         os.path.join(output_dir, "probabilities"),
         probs_table,
-        mode="overwrite",
+        merge_keys=["note_id", "task", "class_id"],
     )
 
     # ---- hyperedges ----
     hyperedges_table, hyperedge_types = _build_hyperedges_table(data, note_ids)
-    write_deltalake(
+    _merge_or_create(
         os.path.join(output_dir, "hyperedges"),
         hyperedges_table,
-        mode="overwrite",
+        merge_keys=["group_id", "note_id", "edge_type"],
     )
 
     # ---- metadata.json ----

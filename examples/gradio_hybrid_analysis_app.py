@@ -3,7 +3,7 @@
 
 Three-module layout:
   Module 1 — Data Source: run inference (tab 1a) or load Delta Lake (tab 1b)
-  Module 2 — Analysis Results: aggregation, CSV export, Verovio, Delta Lake save
+  Module 2 — Analysis Results: aggregation, CSV download, Verovio, Delta Lake save
   Module 3 — Edit-Conditioned Re-Inference (requires live model from Module 1a)
 
 The workflow is designed for iterative editing:
@@ -91,7 +91,19 @@ EDGE_LABELS = {
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (unchanged from previous version)
+# Logging helper
+# ---------------------------------------------------------------------------
+
+
+def _log(existing: str, message: str) -> str:
+    """Append *message* as a new line to the running log text."""
+    if existing:
+        return f"{existing}\n{message}"
+    return message
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
 # ---------------------------------------------------------------------------
 
 
@@ -408,10 +420,7 @@ _EDGE_KEY_MAP = {
 
 
 def _edges_from_pyg_data(data: Any, num_notes: int) -> Dict[str, List[List[int]]]:
-    """Extract edge lists from a PyG HeteroData ``edge_index_dict``.
-
-    Returns a dict mapping edge type names to ``[src_list, dst_list]``.
-    """
+    """Extract edge lists from a PyG HeteroData ``edge_index_dict``."""
     edge_index_dict = getattr(data, "edge_index_dict", {})
     edges: Dict[str, List[List[int]]] = {}
     for edge_type, key in _EDGE_KEY_MAP.items():
@@ -433,10 +442,7 @@ def _edges_from_pyg_data(data: Any, num_notes: int) -> Dict[str, List[List[int]]
 
 
 def _edges_from_delta_lake_df(edges_df: pd.DataFrame, note_id_to_idx: Dict[str, int]) -> Dict[str, List[List[int]]]:
-    """Convert a Delta Lake edges DataFrame to the edge-list format used by Verovio.
-
-    ``note_id_to_idx`` maps note_id strings to integer indices.
-    """
+    """Convert a Delta Lake edges DataFrame to the edge-list format used by Verovio."""
     edges: Dict[str, List[List[int]]] = {}
     for etype in DEFAULT_EDGE_TYPES:
         sub = edges_df[edges_df["edge_type"] == etype] if len(edges_df) > 0 else edges_df
@@ -444,7 +450,6 @@ def _edges_from_delta_lake_df(edges_df: pd.DataFrame, note_id_to_idx: Dict[str, 
         dst_ids = sub["dst"].tolist() if len(sub) > 0 else []
         src_idx = [note_id_to_idx[s] for s in src_ids if s in note_id_to_idx]
         dst_idx = [note_id_to_idx[d] for d in dst_ids if d in note_id_to_idx]
-        # Ensure same length after filtering
         min_len = min(len(src_idx), len(dst_idx))
         edges[etype] = [src_idx[:min_len], dst_idx[:min_len]]
     return edges
@@ -462,12 +467,7 @@ def _build_graph_overlay_payload(
     edge_types: List[str],
     edges_all: Dict[str, List[List[int]]],
 ) -> Dict[str, Any]:
-    """Build the Verovio overlay payload.
-
-    ``edges_all`` must be pre-computed via ``_edges_from_pyg_data`` or
-    ``_edges_from_delta_lake_df`` — this function does NOT call
-    ``_extract_graph_edges_from_score`` any more.
-    """
+    """Build the Verovio overlay payload."""
     n = min(len(df), len(note_array))
     data = df.iloc[:n].reset_index(drop=True).copy()
     rn_full = _build_complete_rn_column(data)
@@ -605,16 +605,7 @@ def _build_iterative_spec(
 
 # Voter-related aggregation spec builder — commented out (voter not yet
 # implemented in analysisgnn/aggregation/).
-# def _build_aggregation_spec(aggregation_mode: str, voter_path: str) -> Tuple[Dict[str, Any], str]:
-#     mode_raw = str(aggregation_mode or "Mean").strip().lower()
-#     mode = "voter" if mode_raw == "voter" else "mean"
-#     path = (voter_path or "").strip()
-#     if mode == "voter" and not path:
-#         return {"mode": "mean"}, "Aggregation mode 'Voter' selected without checkpoint; falling back to mean."
-#     spec: Dict[str, Any] = {"mode": mode}
-#     if mode == "voter":
-#         spec["voter_path"] = path
-#     return spec, ""
+# def _build_aggregation_spec(aggregation_mode: str, voter_path: str) -> ...: ...
 
 
 def _format_trace(trace: Dict[str, Any], show_trace: bool) -> str:
@@ -638,6 +629,76 @@ def _derive_output_dir(score_path: str) -> str:
     return str(REPO_ROOT / "outputs" / _derive_score_id(score_path))
 
 
+def _write_csv_to_temp(df: pd.DataFrame, score_path: str) -> Optional[str]:
+    """Write *df* to a temp CSV file and return the path (or None on error)."""
+    if df is None or len(df) == 0:
+        return None
+    score_id = _derive_score_id(score_path) if score_path else "export"
+    csv_path = os.path.join(tempfile.gettempdir(), f"{score_id}_analysis.csv")
+    df.to_csv(csv_path, index=False)
+    return csv_path
+
+
+# ---------------------------------------------------------------------------
+# Precompute DataFrames once, cache for aggregation
+# ---------------------------------------------------------------------------
+
+
+def _precompute_delta_dfs(
+    raw_predictions: Dict[str, Any],
+    intermediates: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert raw predictions + intermediates to the long-format DataFrames
+    needed by aggregation strategies.  The result is cached in gr.State so
+    that switching aggregation strategy is instant.
+
+    Returns a dict with keys: ``probs_df``, ``notes_df``, ``hyperedges_df``, ``metadata``.
+    """
+    from analysisgnn.storage.delta_writer import (
+        _build_probabilities_table,
+        _build_notes_table,
+        _build_hyperedges_table,
+    )
+
+    score_obj = intermediates.get("score")
+    note_array = intermediates.get("note_array")
+    pyg_data = intermediates.get("data")
+    if score_obj is None or note_array is None:
+        raise ValueError("Missing score or note_array in intermediates.")
+
+    # Build task_dict from predictions
+    task_dict: Dict[str, int] = {}
+    for task_name, tensor in raw_predictions.items():
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+            task_dict[task_name] = tensor.shape[1]
+
+    # Build note_ids
+    n = len(note_array)
+    if "id" in note_array.dtype.names:
+        note_ids = np.array([str(x) for x in note_array["id"]], dtype=object)
+    else:
+        note_ids = np.array([f"note_{i}" for i in range(n)], dtype=object)
+
+    probs_table = _build_probabilities_table(raw_predictions, task_dict, note_ids)
+    probs_df = probs_table.to_pandas()
+
+    notes_table = _build_notes_table(note_array, score_obj)
+    notes_df = notes_table.to_pandas()
+
+    if pyg_data is not None:
+        hyperedges_table, _ = _build_hyperedges_table(pyg_data, note_ids)
+        hyperedges_df = hyperedges_table.to_pandas()
+    else:
+        hyperedges_df = pd.DataFrame(columns=["group_id", "note_id", "edge_type", "parent_group_id"])
+
+    return {
+        "probs_df": probs_df,
+        "notes_df": notes_df,
+        "hyperedges_df": hyperedges_df,
+        "metadata": {"task_dict": task_dict},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Module 1a: Run Inference
 # ---------------------------------------------------------------------------
@@ -654,15 +715,17 @@ def run_full_inference(
     iterative_steps: int,
     keep_percentile_per_step: float,
     show_trace: bool,
+    log_text: str,
 ):
     """Run inference with aggregation_spec={"mode": "none"} and return_intermediates=True.
 
     Returns:
-        (display_df, status, trace_str, visual_payload,
-         raw_predictions_state, intermediates_state, tasks_state,
-         score_path_state, edges_state, model_available_flag)
+        (display_df, log_text, visual_payload, csv_path,
+         raw_predictions_state, intermediates_state, delta_dfs_state,
+         tasks_state, score_path_state, edges_state, model_available_flag)
     """
     try:
+        log_text = _log(log_text, "Starting inference...")
         score_path = _resolve_score_path(score_file)
         score = _load_score(score_path)
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
@@ -677,7 +740,7 @@ def run_full_inference(
             zero_known_start=True,
         )
 
-        # Always run with no aggregation — aggregation is post-hoc in Module 2
+        # Always run with no aggregation
         aggregation_spec = {"mode": "none"}
 
         with torch.no_grad():
@@ -691,18 +754,12 @@ def run_full_inference(
                 return_intermediates=True,
             )
 
-        # Unpack: model.predict returns (predictions, [trace], intermediates)
-        # then HybridAnalysisPredictor wraps as (output, routing)
         output, routing = result
-        # output is a tuple because we asked for return_intermediates (and
-        # optionally return_iterative_trace).
         if isinstance(output, tuple):
             parts = list(output)
         else:
             parts = [output]
 
-        # The order of extras in model.predict():
-        #   predictions, [iterative_trace if requested], [intermediates if requested]
         predictions = parts[0]
         trace = {"enabled": False, "steps": []}
         intermediates = {}
@@ -738,6 +795,17 @@ def run_full_inference(
         else:
             edges_all = {k: [[], []] for k in DEFAULT_EDGE_TYPES}
 
+        # State objects
+        intermediates_state = {
+            "score": score_obj,
+            "note_array": note_array,
+            "data": pyg_data,
+            "score_path": score_path,
+        }
+
+        # Precompute DataFrames for aggregation (cached)
+        delta_dfs = _precompute_delta_dfs(predictions, intermediates_state)
+
         # Build visual payload
         visual_payload = _build_visual_payload(
             score_path=score_path,
@@ -748,65 +816,60 @@ def run_full_inference(
             edges_all=edges_all,
         )
 
-        # Write Delta Lake (guard: only if it doesn't already exist)
+        # Write Delta Lake
         output_dir = _derive_output_dir(score_path)
-        dl_status = ""
-        if not os.path.isdir(os.path.join(output_dir, "notes", "_delta_log")):
-            try:
-                # Get task_dict from the model
-                model = predictor.get_full_model()
-                task_dict = dict(model.task_dict)
-                write_analysis_results(
-                    output_dir=output_dir,
-                    score=score_obj,
-                    note_array=note_array,
-                    predictions=predictions,
-                    data=pyg_data,
-                    task_dict=task_dict,
-                    metadata={
-                        "full_checkpoint": full_ckpt,
-                        "masked_checkpoint": masked_ckpt,
-                        "device": device,
-                        "score_path": score_path,
-                    },
-                )
-                dl_status = f" Delta Lake written to {output_dir}."
-            except Exception as dl_exc:
-                dl_status = f" Delta Lake write failed: {dl_exc}"
-        else:
-            dl_status = f" Delta Lake already exists at {output_dir} (not overwritten)."
+        try:
+            model = predictor.get_full_model()
+            task_dict = dict(model.task_dict)
+            write_analysis_results(
+                output_dir=output_dir,
+                score=score_obj,
+                note_array=note_array,
+                predictions=predictions,
+                data=pyg_data,
+                task_dict=task_dict,
+                metadata={
+                    "full_checkpoint": full_ckpt,
+                    "masked_checkpoint": masked_ckpt,
+                    "device": device,
+                    "score_path": score_path,
+                },
+            )
+            log_text = _log(log_text, f"Delta Lake written to {output_dir}.")
+        except Exception as dl_exc:
+            log_text = _log(log_text, f"Delta Lake write failed: {dl_exc}")
 
-        status = (
+        log_text = _log(
+            log_text,
             f"Inference done (route={routing.route}). "
-            f"Rows={len(display_df)} tasks={','.join(tasks)} aggregation=none.{dl_status}"
+            f"Rows={len(display_df)} tasks={','.join(tasks)} aggregation=none.",
         )
+        trace_str = _format_trace(trace, show_trace)
+        if trace_str:
+            log_text = _log(log_text, f"Trace:\n{trace_str}")
 
-        # State objects to pass downstream
-        raw_predictions_state = predictions
-        intermediates_state = {
-            "score": score_obj,
-            "note_array": note_array,
-            "data": pyg_data,
-            "score_path": score_path,
-        }
+        csv_path = _write_csv_to_temp(display_df, score_path)
 
         return (
             display_df,
-            status,
-            _format_trace(trace, show_trace),
+            log_text,
             visual_payload,
-            raw_predictions_state,
+            csv_path,
+            predictions,
             intermediates_state,
+            delta_dfs,
             tasks,
             score_path,
             edges_all,
             True,  # model_available
         )
     except Exception as exc:
+        log_text = _log(log_text, f"Error: {exc}")
         return (
             pd.DataFrame(),
-            f"Error: {exc}",
-            "",
+            log_text,
+            {},
+            None,
             {},
             {},
             {},
@@ -822,26 +885,27 @@ def run_full_inference(
 # ---------------------------------------------------------------------------
 
 
-def load_from_delta_lake(metadata_file: Any) -> tuple:
-    """Load a Delta Lake output dir from a metadata.json file selection.
+def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
+    """Load a Delta Lake output dir from a FileExplorer selection.
 
-    Returns the same shape of outputs as ``run_full_inference`` for seamless
-    integration with the same gr.State objects.
+    ``delta_lake_path`` is either a string path to metadata.json or a list
+    containing one such path (FileExplorer with file_count='single' returns
+    a string).
     """
     try:
-        if metadata_file is None:
+        # Normalise FileExplorer output
+        if isinstance(delta_lake_path, list):
+            delta_lake_path = delta_lake_path[0] if delta_lake_path else None
+        if delta_lake_path is None:
             raise ValueError("Please select a metadata.json file.")
-        if isinstance(metadata_file, (str, os.PathLike)):
-            meta_path = str(metadata_file)
-        elif isinstance(metadata_file, dict) and "name" in metadata_file:
-            meta_path = str(metadata_file["name"])
-        else:
-            meta_path = str(getattr(metadata_file, "name", ""))
-
-        if not meta_path or not os.path.exists(meta_path):
-            raise ValueError("metadata.json path is invalid.")
+        meta_path = str(delta_lake_path)
+        if not os.path.isabs(meta_path):
+            meta_path = str(REPO_ROOT / meta_path)
+        if not os.path.exists(meta_path):
+            raise ValueError(f"Path does not exist: {meta_path}")
 
         output_dir = str(Path(meta_path).parent)
+        log_text = _log(log_text, f"Loading Delta Lake from {output_dir}...")
 
         notes_df = load_notes(output_dir)
         probs_df = load_probabilities(output_dir)
@@ -859,49 +923,51 @@ def load_from_delta_lake(metadata_file: Any) -> tuple:
         # Build "none" aggregation: argmax summary
         strategy = get_strategy("none")
         display_df = strategy.aggregate(probs_df, notes_df, hyperedges_df, metadata, tasks=tasks)
-
-        # Apply format_table_output
         display_df = format_table_output(display_df, tasks)
 
-        status = (
+        log_text = _log(
+            log_text,
             f"Loaded Delta Lake from {output_dir}. "
-            f"Rows={len(display_df)} tasks={','.join(tasks)}."
+            f"Rows={len(display_df)} tasks={','.join(tasks)}.",
         )
 
-        # Build a minimal note_array-like structure for Verovio from notes_df
-        # (We don't have the original partitura score, so Verovio won't render
-        # the score — but the table and data are available.)
-        # Store the probs_df + notes_df + hyperedges_df in intermediates for
-        # post-hoc aggregation.
         intermediates_state = {
             "score": None,
             "note_array": None,
             "data": None,
             "score_path": score_path,
             "delta_lake_dir": output_dir,
-            "notes_df": notes_df,
+        }
+
+        delta_dfs = {
             "probs_df": probs_df,
+            "notes_df": notes_df,
             "hyperedges_df": hyperedges_df,
             "metadata": metadata,
         }
 
+        csv_path = _write_csv_to_temp(display_df, score_path)
+
         return (
             display_df,
-            status,
-            "",  # trace
-            {},  # visual_payload (no score XML available)
+            log_text,
+            {},  # visual_payload (no score XML available without inference)
+            csv_path,
             {},  # raw_predictions (not available from Delta Lake)
             intermediates_state,
+            delta_dfs,
             tasks,
             score_path,
             edges_all,
             False,  # model NOT available
         )
     except Exception as exc:
+        log_text = _log(log_text, f"Error loading Delta Lake: {exc}")
         return (
             pd.DataFrame(),
-            f"Error loading Delta Lake: {exc}",
-            "",
+            log_text,
+            {},
+            None,
             {},
             {},
             {},
@@ -913,76 +979,55 @@ def load_from_delta_lake(metadata_file: Any) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Module 2: Post-hoc Aggregation
+# Module 2: Post-hoc Aggregation (with caching)
 # ---------------------------------------------------------------------------
+
+# Cache: maps strategy name -> display_df so repeat clicks are instant.
+_aggregation_cache: Dict[str, pd.DataFrame] = {}
+
+
+def _clear_aggregation_cache() -> None:
+    _aggregation_cache.clear()
 
 
 def run_aggregation(
     strategy_name: str,
-    raw_predictions_state: Any,
-    intermediates_state: Any,
+    delta_dfs_state: Any,
     tasks_state: Any,
     score_path_state: str,
     edges_state: Any,
+    intermediates_state: Any,
+    log_text: str,
 ):
-    """Apply an aggregation strategy to raw predictions and update the table.
+    """Apply an aggregation strategy.  Uses a cache so that toggling back and
+    forth between strategies is instant.
 
-    Returns: (display_df, status, visual_payload)
+    Returns: (display_df, log_text, visual_payload, csv_path)
     """
     try:
         strategy_name = (strategy_name or "none").strip().lower()
         tasks = tasks_state or []
+        delta_dfs = delta_dfs_state or {}
         intermediates = intermediates_state or {}
 
-        # Determine data source: Delta Lake loaded data or raw predictions
-        if "probs_df" in intermediates:
-            # Loaded from Delta Lake
-            probs_df = intermediates["probs_df"]
-            notes_df = intermediates["notes_df"]
-            hyperedges_df = intermediates["hyperedges_df"]
-            metadata = intermediates.get("metadata", {})
-        elif raw_predictions_state and isinstance(raw_predictions_state, dict):
-            # From live inference — need to convert raw predictions to long-format
-            from analysisgnn.storage.delta_writer import _build_probabilities_table, _build_notes_table, _build_hyperedges_table
-            score_obj = intermediates.get("score")
-            note_array = intermediates.get("note_array")
-            pyg_data = intermediates.get("data")
+        if not delta_dfs or "probs_df" not in delta_dfs:
+            raise ValueError("No data available. Run inference or load Delta Lake first.")
 
-            if score_obj is None or note_array is None:
-                raise ValueError("No raw data available for aggregation.")
-
-            # Build task_dict from predictions
-            task_dict = {}
-            for task_name, tensor in raw_predictions_state.items():
-                if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
-                    task_dict[task_name] = tensor.shape[1]
-
-            # Build note_ids
-            n = len(note_array)
-            if "id" in note_array.dtype.names:
-                note_ids = np.array([str(x) for x in note_array["id"]], dtype=object)
-            else:
-                note_ids = np.array([f"note_{i}" for i in range(n)], dtype=object)
-
-            # Build DataFrames using delta_writer's internal builders
-            import pyarrow as pa
-            probs_table = _build_probabilities_table(raw_predictions_state, task_dict, note_ids)
-            probs_df = probs_table.to_pandas()
-
-            notes_table = _build_notes_table(note_array, score_obj)
-            notes_df = notes_table.to_pandas()
-
-            hyperedges_table, _ = _build_hyperedges_table(pyg_data, note_ids)
-            hyperedges_df = hyperedges_table.to_pandas()
-
-            metadata = {}
+        # Check cache
+        if strategy_name in _aggregation_cache:
+            display_df = _aggregation_cache[strategy_name]
+            log_text = _log(log_text, f"Aggregation '{strategy_name}' (cached). Rows={len(display_df)}.")
         else:
-            raise ValueError("No predictions available. Run inference or load Delta Lake first.")
+            probs_df = delta_dfs["probs_df"]
+            notes_df = delta_dfs["notes_df"]
+            hyperedges_df = delta_dfs["hyperedges_df"]
+            metadata = delta_dfs.get("metadata", {})
 
-        # Apply aggregation
-        strategy = get_strategy(strategy_name)
-        result_df = strategy.aggregate(probs_df, notes_df, hyperedges_df, metadata, tasks=tasks)
-        display_df = format_table_output(result_df, tasks)
+            strategy = get_strategy(strategy_name)
+            result_df = strategy.aggregate(probs_df, notes_df, hyperedges_df, metadata, tasks=tasks)
+            display_df = format_table_output(result_df, tasks)
+            _aggregation_cache[strategy_name] = display_df
+            log_text = _log(log_text, f"Aggregation '{strategy_name}' applied. Rows={len(display_df)}.")
 
         # Build visual payload if score is available
         score_obj = intermediates.get("score")
@@ -1000,32 +1045,17 @@ def run_aggregation(
                 edges_all=edges_all,
             )
 
-        status = f"Aggregation '{strategy_name}' applied. Rows={len(display_df)}."
-        return display_df, status, visual_payload
+        csv_path = _write_csv_to_temp(display_df, score_path)
+        return display_df, log_text, visual_payload, csv_path
     except Exception as exc:
-        return pd.DataFrame(), f"Aggregation error: {exc}", {}
-
-
-def export_csv(table_data: Any, score_path_state: str):
-    """Export the current table to a CSV file and return it for download."""
-    try:
-        df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
-        if len(df) == 0:
-            raise ValueError("No data to export.")
-
-        score_id = _derive_score_id(score_path_state) if score_path_state else "export"
-        csv_path = os.path.join(tempfile.gettempdir(), f"{score_id}_analysis.csv")
-        df.to_csv(csv_path, index=False)
-        return csv_path, f"CSV exported to {csv_path}"
-    except Exception as exc:
-        return None, f"Export error: {exc}"
+        log_text = _log(log_text, f"Aggregation error: {exc}")
+        return pd.DataFrame(), log_text, {}, None
 
 
 def save_delta_lake(
     raw_predictions_state: Any,
     intermediates_state: Any,
-    tasks_state: Any,
-    score_path_state: str,
+    log_text: str,
 ):
     """Write/update Delta Lake with current data."""
     try:
@@ -1033,13 +1063,12 @@ def save_delta_lake(
         score_obj = intermediates.get("score")
         note_array = intermediates.get("note_array")
         pyg_data = intermediates.get("data")
-        score_path = score_path_state or intermediates.get("score_path", "")
+        score_path = intermediates.get("score_path", "")
 
         if score_obj is None or note_array is None or pyg_data is None:
-            # If loaded from Delta Lake, data already exists
             dl_dir = intermediates.get("delta_lake_dir", "")
             if dl_dir:
-                return f"Data was loaded from Delta Lake at {dl_dir}. No new data to write."
+                return _log(log_text, f"Data was loaded from Delta Lake at {dl_dir}. No new data to write.")
             raise ValueError("No inference data available to save.")
 
         if not score_path:
@@ -1047,12 +1076,11 @@ def save_delta_lake(
 
         output_dir = _derive_output_dir(score_path)
 
-        # Get task_dict from predictions
         predictions = raw_predictions_state
         if not predictions or not isinstance(predictions, dict):
             raise ValueError("No raw predictions available.")
 
-        task_dict = {}
+        task_dict: Dict[str, int] = {}
         for task_name, tensor in predictions.items():
             if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
                 task_dict[task_name] = tensor.shape[1]
@@ -1064,13 +1092,11 @@ def save_delta_lake(
             predictions=predictions,
             data=pyg_data,
             task_dict=task_dict,
-            metadata={
-                "score_path": score_path,
-            },
+            metadata={"score_path": score_path},
         )
-        return f"Delta Lake saved to {output_dir}."
+        return _log(log_text, f"Delta Lake saved to {output_dir}.")
     except Exception as exc:
-        return f"Save error: {exc}"
+        return _log(log_text, f"Save error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1095,14 +1121,14 @@ def run_edit_conditioned(
     show_trace: bool,
     intermediates_state: Any,
     edges_state: Any,
+    log_text: str,
 ):
-    """Run edit-conditioned masked inference using edits from Module 2 table.
+    """Run edit-conditioned masked inference.
 
-    Returns: (display_df, status, trace_str, visual_payload,
-              raw_predictions_state, intermediates_state, tasks_state,
-              score_path_state, edges_state, model_available_flag)
+    Returns same shape as run_full_inference.
     """
     try:
+        log_text = _log(log_text, "Starting edit-conditioned inference...")
         score_path = _resolve_score_path(score_file)
         score = _load_score(score_path)
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
@@ -1125,7 +1151,6 @@ def run_edit_conditioned(
             zero_known_start=False,
         )
 
-        # Always run with no aggregation
         aggregation_spec = {"mode": "none"}
 
         with torch.no_grad():
@@ -1173,12 +1198,22 @@ def run_edit_conditioned(
         out_df = _apply_timing_from_predictions(out_df, predictions)
         display_df = format_table_output(out_df, tasks)
 
-        # Use edges from intermediates
         num_notes = len(note_array)
         if pyg_data is not None:
             edges_all = _edges_from_pyg_data(pyg_data, num_notes)
         else:
             edges_all = edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES}
+
+        new_intermediates = {
+            "score": score_obj,
+            "note_array": note_array,
+            "data": pyg_data,
+            "score_path": score_path,
+        }
+
+        # Precompute DataFrames for aggregation
+        delta_dfs = _precompute_delta_dfs(predictions, new_intermediates)
+        _clear_aggregation_cache()
 
         visual_payload = _build_visual_payload(
             score_path=score_path,
@@ -1189,39 +1224,40 @@ def run_edit_conditioned(
             edges_all=edges_all,
         )
 
-        status = (
+        log_text = _log(
+            log_text,
             f"Edit-conditioned inference done (route={routing.route}). "
-            f"Known rows={info.get('num_known', 0)} target rows={info.get('num_targets', 0)} "
-            f"aggregation=none."
+            f"Known rows={info.get('num_known', 0)} target rows={info.get('num_targets', 0)}.",
         )
+        trace_str = _format_trace(trace, show_trace)
+        if trace_str:
+            log_text = _log(log_text, f"Trace:\n{trace_str}")
 
-        new_intermediates = {
-            "score": score_obj,
-            "note_array": note_array,
-            "data": pyg_data,
-            "score_path": score_path,
-        }
+        csv_path = _write_csv_to_temp(display_df, score_path)
 
         return (
             display_df,
-            status,
-            _format_trace(trace, show_trace),
+            log_text,
             visual_payload,
+            csv_path,
             predictions,
             new_intermediates,
+            delta_dfs,
             tasks,
             score_path,
             edges_all,
             True,
         )
     except Exception as exc:
+        log_text = _log(log_text, f"Error: {exc}")
         return (
             pd.DataFrame(),
-            f"Error: {exc}",
-            "",
+            log_text,
             {},
+            None,
             {},
             intermediates_state or {},
+            {},
             [],
             "",
             edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES},
@@ -1243,6 +1279,7 @@ def refresh_visual_tab(
     visual_state: Dict[str, Any],
     intermediates_state: Any,
     edges_state: Any,
+    log_text: str,
 ):
     try:
         selected_edge_types = [k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])]
@@ -1279,18 +1316,20 @@ def refresh_visual_tab(
 
         html_frame = _build_verovio_html(payload)
         note_count = len(payload.get("notes", []))
-        status = (
+        log_text = _log(
+            log_text,
             f"Visual refreshed: notes={note_count}, "
-            f"visible edges={','.join(selected_edge_types) if selected_edge_types else 'none'}."
+            f"visible edges={','.join(selected_edge_types) if selected_edge_types else 'none'}.",
         )
-        return html_frame, status, payload
+        return html_frame, log_text, payload
     except Exception as exc:
         fallback = (
             "<div style='padding:12px;border:1px solid #d1d5db;border-radius:10px;background:#fff;'>"
             f"Visual rendering error: {html_lib.escape(str(exc))}"
             "</div>"
         )
-        return fallback, f"Visual error: {exc}", visual_state if isinstance(visual_state, dict) else {}
+        log_text = _log(log_text, f"Visual error: {exc}")
+        return fallback, log_text, visual_state if isinstance(visual_state, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -1306,14 +1345,13 @@ def build_demo() -> gr.Blocks:
 **Module 1** — Data source: run inference on a score or load existing Delta Lake results.
 **Module 2** — Analysis results: view, aggregate, export, and visualise.
 **Module 3** — Edit-conditioned re-inference (requires live model from Module 1a).
-
-Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
 """)
 
         # ---- gr.State objects ----
         visual_payload_state = gr.State({})
         raw_predictions_state = gr.State({})
         intermediates_state = gr.State({})
+        delta_dfs_state = gr.State({})         # precomputed probs/notes/hyperedges DFs
         tasks_state = gr.State([])
         score_path_state = gr.State("")
         edges_state = gr.State({k: [[], []] for k in DEFAULT_EDGE_TYPES})
@@ -1338,14 +1376,9 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
 
                 task_selector = gr.CheckboxGroup(
                     choices=list(AVAILABLE_TASKS.values()),
-                    value=[AVAILABLE_TASKS[t] for t in DEFAULT_EDITABLE_TASKS if t in AVAILABLE_TASKS],
+                    value=list(AVAILABLE_TASKS.values()),  # All tasks selected by default
                     label="Select Analysis Tasks",
                     info="Choose which tasks to run and show in the editable table and visual tab.",
-                )
-                tasks_csv = gr.Textbox(
-                    label="Tasks Override (internal keys CSV, optional)",
-                    value=DEFAULT_TASKS,
-                    info="Used only if no task is selected above. Example: romanNumeral,localkey,quality",
                 )
 
                 with gr.Row():
@@ -1367,11 +1400,12 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
 
             # ------ Tab 1b: Load Delta Lake ------
             with gr.Tab("Load Delta Lake"):
-                gr.Markdown("Select the `metadata.json` file from an existing Delta Lake output directory.")
-                delta_lake_file = gr.File(
+                gr.Markdown("Select a `metadata.json` file from an existing Delta Lake output directory.")
+                delta_lake_explorer = gr.FileExplorer(
+                    glob="**/metadata.json",
+                    root_dir=str(REPO_ROOT),
+                    file_count="single",
                     label="Select metadata.json",
-                    file_types=[".json"],
-                    type="filepath",
                 )
                 load_delta_btn = gr.Button("Load", variant="primary")
 
@@ -1389,11 +1423,8 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 info="Select an aggregation strategy and click 'Aggregate!' to apply.",
             )
             aggregate_btn = gr.Button("Aggregate!", variant="secondary")
-            export_csv_btn = gr.Button("Export CSV", variant="secondary")
             save_delta_btn = gr.Button("Save Delta Lake", variant="secondary")
-
-        csv_download = gr.File(label="Download CSV", interactive=False, visible=True)
-        save_delta_status = gr.Textbox(label="Save Status", interactive=False, visible=True)
+            csv_download = gr.DownloadButton("Download CSV", variant="secondary")
 
         with gr.Tabs():
             # ------ Tab: Analysis Results ------
@@ -1403,7 +1434,6 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     interactive=True,
                     wrap=True,
                 )
-                status = gr.Textbox(label="Status", interactive=False)
 
             # ------ Tab: Verovio Visual Score ------
             with gr.Tab("Verovio Visual Score"):
@@ -1426,7 +1456,6 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     ),
                     label="Verovio Score + Graph",
                 )
-                visual_status = gr.Textbox(label="Visual Status", interactive=False)
 
         # ==================================================================
         # MODULE 3: EDIT-CONDITIONED RE-INFERENCE
@@ -1435,6 +1464,13 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
         gr.Markdown("## Module 3: Edit-Conditioned Re-Inference")
         gr.Markdown("*Requires a live model (run inference in Module 1a first). "
                      "Grayed out when loading from Delta Lake.*")
+
+        tasks_csv = gr.Textbox(
+            label="Tasks Override (internal keys CSV, optional)",
+            value=DEFAULT_TASKS,
+            info="Used only if no task is selected above. Example: romanNumeral,localkey,quality",
+            interactive=False,
+        )
 
         with gr.Row():
             target_only_update = gr.Checkbox(
@@ -1447,7 +1483,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             known_rows_expr = gr.Textbox(
                 label="Known Rows (1-based)",
                 value="",
-                info="Rows treated as known/corrected labels (context).",
+                info="Rows treated as known/corrected labels (context). Example: 1-8, 12, 20-24",
                 interactive=False,
             )
             target_rows_expr = gr.Textbox(
@@ -1460,12 +1496,12 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
         update_analysis_btn = gr.Button("Update Analysis", variant="stop", interactive=False)
 
         # ==================================================================
-        # DIAGNOSTIC OUTPUT
+        # DIAGNOSTICS (single log for everything)
         # ==================================================================
         gr.Markdown("---")
-        gr.Markdown("## Diagnostics")
+        gr.Markdown("## Log")
         show_trace = gr.Checkbox(label="Show Iteration Trace", value=False)
-        trace_output = gr.Textbox(label="Iteration Trace", interactive=False, lines=12)
+        log_output = gr.Textbox(label="Log", interactive=False, lines=12, max_lines=40)
 
         # ==================================================================
         # EVENT WIRING
@@ -1479,10 +1515,19 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 gr.update(interactive=interactive),  # known_rows_expr
                 gr.update(interactive=interactive),  # target_rows_expr
                 gr.update(interactive=interactive),  # update_analysis_btn
+                gr.update(interactive=interactive),  # tasks_csv
             )
+
+        # Clear aggregation cache on new inference
+        def _on_new_data(*args):
+            _clear_aggregation_cache()
 
         # ---- Module 1a: Run Inference ----
         run_inference_btn.click(
+            fn=_on_new_data,
+            inputs=[],
+            outputs=[],
+        ).then(
             fn=run_full_inference,
             inputs=[
                 score_file,
@@ -1495,14 +1540,16 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 iterative_steps,
                 keep_percentile_per_step,
                 show_trace,
+                log_output,
             ],
             outputs=[
                 table,
-                status,
-                trace_output,
+                log_output,
                 visual_payload_state,
+                csv_download,
                 raw_predictions_state,
                 intermediates_state,
+                delta_dfs_state,
                 tasks_state,
                 score_path_state,
                 edges_state,
@@ -1511,20 +1558,25 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
         ).then(
             fn=_update_module3_interactivity,
             inputs=[model_available_state],
-            outputs=[target_only_update, known_rows_expr, target_rows_expr, update_analysis_btn],
+            outputs=[target_only_update, known_rows_expr, target_rows_expr, update_analysis_btn, tasks_csv],
         )
 
         # ---- Module 1b: Load Delta Lake ----
         load_delta_btn.click(
+            fn=_on_new_data,
+            inputs=[],
+            outputs=[],
+        ).then(
             fn=load_from_delta_lake,
-            inputs=[delta_lake_file],
+            inputs=[delta_lake_explorer, log_output],
             outputs=[
                 table,
-                status,
-                trace_output,
+                log_output,
                 visual_payload_state,
+                csv_download,
                 raw_predictions_state,
                 intermediates_state,
+                delta_dfs_state,
                 tasks_state,
                 score_path_state,
                 edges_state,
@@ -1533,7 +1585,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
         ).then(
             fn=_update_module3_interactivity,
             inputs=[model_available_state],
-            outputs=[target_only_update, known_rows_expr, target_rows_expr, update_analysis_btn],
+            outputs=[target_only_update, known_rows_expr, target_rows_expr, update_analysis_btn, tasks_csv],
         )
 
         # ---- Module 2: Aggregate! ----
@@ -1541,20 +1593,14 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             fn=run_aggregation,
             inputs=[
                 aggregation_dropdown,
-                raw_predictions_state,
-                intermediates_state,
+                delta_dfs_state,
                 tasks_state,
                 score_path_state,
                 edges_state,
+                intermediates_state,
+                log_output,
             ],
-            outputs=[table, status, visual_payload_state],
-        )
-
-        # ---- Module 2: Export CSV ----
-        export_csv_btn.click(
-            fn=export_csv,
-            inputs=[table, score_path_state],
-            outputs=[csv_download, status],
+            outputs=[table, log_output, visual_payload_state, csv_download],
         )
 
         # ---- Module 2: Save Delta Lake ----
@@ -1563,10 +1609,9 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             inputs=[
                 raw_predictions_state,
                 intermediates_state,
-                tasks_state,
-                score_path_state,
+                log_output,
             ],
-            outputs=[save_delta_status],
+            outputs=[log_output],
         )
 
         # ---- Module 2: Refresh Visual ----
@@ -1581,12 +1626,17 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 visual_payload_state,
                 intermediates_state,
                 edges_state,
+                log_output,
             ],
-            outputs=[visual_html, visual_status, visual_payload_state],
+            outputs=[visual_html, log_output, visual_payload_state],
         )
 
         # ---- Module 3: Update Analysis (edit-conditioned) ----
         update_analysis_btn.click(
+            fn=_on_new_data,
+            inputs=[],
+            outputs=[],
+        ).then(
             fn=run_edit_conditioned,
             inputs=[
                 score_file,
@@ -1605,14 +1655,16 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 show_trace,
                 intermediates_state,
                 edges_state,
+                log_output,
             ],
             outputs=[
                 table,
-                status,
-                trace_output,
+                log_output,
                 visual_payload_state,
+                csv_download,
                 raw_predictions_state,
                 intermediates_state,
+                delta_dfs_state,
                 tasks_state,
                 score_path_state,
                 edges_state,
