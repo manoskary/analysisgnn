@@ -23,6 +23,7 @@ miditok>=3.0.0
 
 # Logging and experiment tracking
 wandb>=0.13.0
+huggingface_hub>=0.20.0
 
 # Utilities
 tqdm>=4.64.0

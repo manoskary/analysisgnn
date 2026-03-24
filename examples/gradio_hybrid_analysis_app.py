@@ -35,6 +35,7 @@ from analysisgnn.inference.hybrid_predictor import (
     parse_task_csv,
     predictions_to_dataframe,
 )
+from analysisgnn.inference.hf_bundle import HybridBundleResolutionError, resolve_hybrid_bundle
 from analysisgnn.utils.roman_decode import decode_roman_numeral
 
 
@@ -47,6 +48,8 @@ DEFAULT_MASKED_CKPT = os.environ.get(
     "ANALYSISGNN_MASKED_CKPT",
     str(REPO_ROOT / "artifacts" / "gradio_checkpoints" / "t7pxcwri_masked_last.ckpt"),
 )
+DEFAULT_HF_REPO = os.environ.get("ANALYSISGNN_HF_REPO", "").strip()
+DEFAULT_HF_REVISION = os.environ.get("ANALYSISGNN_HF_REVISION", "").strip()
 
 
 def _resolve_optional_default_path(env_key: str, fallback: Path) -> str:
@@ -103,6 +106,66 @@ DEFAULT_BEAT_TASKS = [
     "inversion",
     "localkey",
 ]
+
+
+@lru_cache(maxsize=8)
+def _resolve_hf_bundle_cached(repo_id: str, revision: str) -> Dict[str, str]:
+    bundle = resolve_hybrid_bundle(
+        source=repo_id,
+        revision=(revision or None),
+    )
+    return {
+        "full_ckpt": bundle.full_ckpt,
+        "masked_ckpt": bundle.masked_ckpt,
+        "voter_ckpt": bundle.voter_ckpt,
+        "beat_voter_ckpt": bundle.beat_voter_ckpt,
+    }
+
+
+def _resolve_runtime_artifact_paths(
+    *,
+    full_ckpt: str,
+    masked_ckpt: str,
+    voter_ckpt: str,
+    beat_voter_ckpt: str,
+) -> Tuple[Dict[str, str], str]:
+    resolved = {
+        "full_ckpt": (full_ckpt or "").strip(),
+        "masked_ckpt": (masked_ckpt or "").strip(),
+        "voter_ckpt": (voter_ckpt or "").strip(),
+        "beat_voter_ckpt": (beat_voter_ckpt or "").strip(),
+    }
+    missing = [k for k, v in resolved.items() if (not v) or (not os.path.exists(v))]
+    if not missing:
+        return resolved, ""
+
+    repo_id = DEFAULT_HF_REPO
+    revision = DEFAULT_HF_REVISION
+    if not repo_id:
+        return resolved, ""
+
+    try:
+        hf_paths = _resolve_hf_bundle_cached(repo_id, revision)
+    except HybridBundleResolutionError as exc:
+        return resolved, f"HF bundle resolution failed ({repo_id}): {exc}"
+
+    filled: List[str] = []
+    unresolved: List[str] = []
+    for key in missing:
+        candidate = hf_paths.get(key, "")
+        if candidate and os.path.exists(candidate):
+            resolved[key] = candidate
+            filled.append(key)
+        else:
+            unresolved.append(key)
+
+    notes: List[str] = []
+    if filled:
+        rev_txt = f"@{revision}" if revision else ""
+        notes.append(f"Loaded missing artifacts from HF bundle {repo_id}{rev_txt}: {','.join(filled)}")
+    if unresolved:
+        notes.append(f"Still missing artifacts: {','.join(unresolved)}")
+    return resolved, " | ".join(notes)
 
 
 def _resolve_score_path(score_file: Any) -> str:
@@ -788,7 +851,17 @@ def run_full_inference(
         score_path = _resolve_score_path(score_file)
         score = _load_score(score_path)
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
-        predictor = _get_predictor(full_ckpt, masked_ckpt, device)
+        resolved_paths, hf_resolution_note = _resolve_runtime_artifact_paths(
+            full_ckpt=full_ckpt,
+            masked_ckpt=masked_ckpt,
+            voter_ckpt=voter_checkpoint_path,
+            beat_voter_ckpt=beat_voter_checkpoint_path,
+        )
+        predictor = _get_predictor(
+            resolved_paths["full_ckpt"],
+            resolved_paths["masked_ckpt"],
+            device,
+        )
 
         iterative_spec = _build_iterative_spec(
             enable_iterative=enable_iterative,
@@ -800,7 +873,7 @@ def run_full_inference(
         )
         aggregation_spec, aggregation_warning = _build_aggregation_spec(
             aggregation_mode=aggregation_mode,
-            voter_path=voter_checkpoint_path,
+            voter_path=resolved_paths["voter_ckpt"],
         )
         with torch.no_grad():
             output, routing = predictor.predict(
@@ -831,6 +904,8 @@ def run_full_inference(
             f"Full inference done using route={routing.route} checkpoint={routing.checkpoint_path}. "
             f"Rows={len(display_df)} tasks={','.join(tasks)} aggregation={aggregation_spec.get('mode', 'mean')}"
         )
+        if hf_resolution_note:
+            status = f"{status} | {hf_resolution_note}"
         if aggregation_warning:
             status = f"{status} | {aggregation_warning}"
 
@@ -842,7 +917,7 @@ def run_full_inference(
                 selected_beat_tasks = list(DEFAULT_BEAT_TASKS)
             beat_agg_spec, beat_agg_warning = _build_aggregation_spec(
                 aggregation_mode=beat_aggregation_mode,
-                voter_path=beat_voter_checkpoint_path,
+                voter_path=resolved_paths["beat_voter_ckpt"],
                 beat_tasks=selected_beat_tasks,
             )
             with torch.no_grad():
@@ -866,6 +941,8 @@ def run_full_inference(
             beat_status = (
                 f"Beat-level table ready: rows={len(beat_df)} mode={beat_agg_spec.get('mode', 'mean')}"
             )
+            if hf_resolution_note:
+                beat_status = f"{beat_status} | {hf_resolution_note}"
             if beat_agg_warning:
                 beat_status = f"{beat_status} | {beat_agg_warning}"
 
@@ -907,7 +984,17 @@ def run_partial_rerender(
         score_path = _resolve_score_path(score_file)
         score = _load_score(score_path)
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
-        predictor = _get_predictor(full_ckpt, masked_ckpt, device)
+        resolved_paths, hf_resolution_note = _resolve_runtime_artifact_paths(
+            full_ckpt=full_ckpt,
+            masked_ckpt=masked_ckpt,
+            voter_ckpt=voter_checkpoint_path,
+            beat_voter_ckpt=beat_voter_checkpoint_path,
+        )
+        predictor = _get_predictor(
+            resolved_paths["full_ckpt"],
+            resolved_paths["masked_ckpt"],
+            device,
+        )
 
         edited_df = pd.DataFrame(edited_table) if edited_table is not None else pd.DataFrame()
         user_edits, masked_spec, info = build_mask_inputs_from_table_edits(
@@ -927,7 +1014,7 @@ def run_partial_rerender(
         )
         aggregation_spec, aggregation_warning = _build_aggregation_spec(
             aggregation_mode=aggregation_mode,
-            voter_path=voter_checkpoint_path,
+            voter_path=resolved_paths["voter_ckpt"],
         )
         with torch.no_grad():
             output, routing = predictor.predict(
@@ -960,6 +1047,8 @@ def run_partial_rerender(
             f"Known rows={info.get('num_known', 0)} target rows={info.get('num_targets', 0)} "
             f"aggregation={aggregation_spec.get('mode', 'mean')}"
         )
+        if hf_resolution_note:
+            status = f"{status} | {hf_resolution_note}"
         if aggregation_warning:
             status = f"{status} | {aggregation_warning}"
 
@@ -971,7 +1060,7 @@ def run_partial_rerender(
                 selected_beat_tasks = list(DEFAULT_BEAT_TASKS)
             beat_agg_spec, beat_agg_warning = _build_aggregation_spec(
                 aggregation_mode=beat_aggregation_mode,
-                voter_path=beat_voter_checkpoint_path,
+                voter_path=resolved_paths["beat_voter_ckpt"],
                 beat_tasks=selected_beat_tasks,
             )
             with torch.no_grad():
@@ -996,6 +1085,8 @@ def run_partial_rerender(
             beat_status = (
                 f"Beat-level table ready: rows={len(beat_df)} mode={beat_agg_spec.get('mode', 'mean')}"
             )
+            if hf_resolution_note:
+                beat_status = f"{beat_status} | {hf_resolution_note}"
             if beat_agg_warning:
                 beat_status = f"{beat_status} | {beat_agg_warning}"
 
