@@ -553,6 +553,25 @@ textbox replaces all status fields; aggregation results cached in-memory per str
 name; `_precompute_delta_dfs()` converts raw predictions to long-format DataFrames
 once after inference. All 52 tests pass.
 
+### Step 4a: Verovio Score Upload + Note Coloring — DONE
+
+The Verovio Visual Score tab now has its own `gr.File` upload, auto-filled from
+Module 1a's score file via `score_file.change()`. Users can upload an alternative
+edition; if note counts differ, a warning is logged and rendering uses
+`min(n_score, n_table)` notes.
+
+**Note coloring interface**: the visual payload accepts `note_colors` (dict of note
+index -> CSS color string). The JS applies colors via CSS custom property
+`--agn-note-color` + class `.agn-colored`, so the active-note highlight (`.agn-active`
+with `!important`) still overrides. Any future coloring scheme (e.g., aggregation
+confidence heatmaps) can populate `note_colors` the same way.
+
+**NCT coloring** ("Colour non-chord tones grey" checkbox): uses `tpc_in_label` and
+`tpc_in_label_confidence` from the predictions table. Effective in-label score =
+`P("True")` (confidence if argmax is "True", else 1-confidence). Color = linear
+interpolation from lightgrey `rgb(211,211,211)` at score=0 to black `rgb(0,0,0)` at
+score=1.
+
 ### Step 5: Aggregation Experimentation Framework
 
 The `analysisgnn/aggregation/` package is already created (see Step 3) with:

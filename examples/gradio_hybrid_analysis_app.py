@@ -1270,12 +1270,51 @@ def run_edit_conditioned(
 # ---------------------------------------------------------------------------
 
 
+def _compute_nct_note_colors(df: pd.DataFrame, n: int) -> Dict[int, str]:
+    """Compute per-note colors based on tpc_in_label predictions.
+
+    The colour encodes how confidently a note is classified as a chord tone
+    (in label) vs. a non-chord tone (out of label):
+    - Confidently in label ("True", high confidence) -> black (#000000)
+    - Confidently out of label ("False", high confidence) -> light grey (#d3d3d3)
+    - Low confidence in either direction -> middle grey
+
+    The effective "in-label score" is P("True"):
+      - If argmax is "True":  score = confidence
+      - If argmax is "False": score = 1 - confidence
+    Colour = linear interpolation from lightgrey (score=0) to black (score=1).
+    """
+    if "tpc_in_label" not in df.columns or "tpc_in_label_confidence" not in df.columns:
+        return {}
+    colors: Dict[int, str] = {}
+    for idx in range(min(n, len(df))):
+        row = df.iloc[idx]
+        label = str(_value_or_none(row.get("tpc_in_label")) or "")
+        conf_val = _value_or_none(row.get("tpc_in_label_confidence"))
+        if conf_val is None:
+            continue
+        try:
+            conf = float(conf_val)
+        except (ValueError, TypeError):
+            continue
+        # P("True") = score: 1.0 means certainly in-label, 0.0 means certainly out-of-label
+        if label == "True":
+            score = conf
+        else:
+            score = 1.0 - conf
+        # Interpolate: lightgrey (211,211,211) at score=0 -> black (0,0,0) at score=1
+        grey = int(round(211 * (1.0 - score)))
+        colors[idx] = f"rgb({grey},{grey},{grey})"
+    return colors
+
+
 def refresh_visual_tab(
-    score_file: Any,
+    verovio_score_file: Any,
     task_labels: List[str],
     tasks_csv: str,
     table_data: Any,
     edge_type_labels: List[str],
+    nct_color: bool,
     visual_state: Dict[str, Any],
     intermediates_state: Any,
     edges_state: Any,
@@ -1285,20 +1324,33 @@ def refresh_visual_tab(
         selected_edge_types = [k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])]
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
         intermediates = intermediates_state or {}
-        score_obj = intermediates.get("score")
-        note_array = intermediates.get("note_array")
-        score_path = intermediates.get("score_path", "")
         edges_all = edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES}
 
-        # Fall back to loading score from file if not in intermediates
-        if score_obj is None and score_file is not None:
-            score_path = _resolve_score_path(score_file)
+        # Resolve score: prefer the Verovio-tab file upload, fall back to intermediates
+        score_obj = None
+        note_array = None
+        score_path = ""
+        if verovio_score_file is not None:
+            score_path = _resolve_score_path(verovio_score_file)
             score_obj = _load_score(score_path)
             note_array = _sorted_note_array(score_obj)
+        if score_obj is None:
+            score_obj = intermediates.get("score")
+            note_array = intermediates.get("note_array")
+            score_path = intermediates.get("score_path", "")
 
         df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
 
         if score_obj is not None and note_array is not None and len(df) > 0:
+            # Check note-count mismatch between score and predictions
+            n_score = len(note_array)
+            n_table = len(df)
+            if n_score != n_table:
+                log_text = _log(
+                    log_text,
+                    f"Warning: score has {n_score} notes but predictions table has {n_table} rows. "
+                    f"Rendering min({n_score}, {n_table}) notes; overlay alignment may be approximate.",
+                )
             payload = _build_visual_payload(
                 score_path=score_path,
                 score=score_obj,
@@ -1307,19 +1359,28 @@ def refresh_visual_tab(
                 edge_types=selected_edge_types,
                 edges_all=edges_all,
             )
+            # Apply NCT coloring
+            if nct_color:
+                n = min(len(note_array), len(df))
+                note_colors = _compute_nct_note_colors(df, n)
+                payload["note_colors"] = {str(k): v for k, v in note_colors.items()}
         elif isinstance(visual_state, dict) and visual_state:
             payload = dict(visual_state)
             payload.setdefault("meta", {})
             payload["meta"]["visible_edge_types"] = selected_edge_types
         else:
-            raise ValueError("No predictions available yet. Run inference first to populate the visual tab.")
+            raise ValueError(
+                "No score available. Upload a score in the Verovio tab "
+                "(or run inference in Module 1a) and ensure predictions are loaded."
+            )
 
         html_frame = _build_verovio_html(payload)
         note_count = len(payload.get("notes", []))
         log_text = _log(
             log_text,
             f"Visual refreshed: notes={note_count}, "
-            f"visible edges={','.join(selected_edge_types) if selected_edge_types else 'none'}.",
+            f"visible edges={','.join(selected_edge_types) if selected_edge_types else 'none'}"
+            f"{', NCT coloring ON' if nct_color else ''}.",
         )
         return html_frame, log_text, payload
     except Exception as exc:
@@ -1439,7 +1500,13 @@ def build_demo() -> gr.Blocks:
             with gr.Tab("Verovio Visual Score"):
                 gr.Markdown(
                     "Render the uploaded score with graph overlays. "
-                    "Click a note in the score to inspect note-level predictions and complete RN decoding."
+                    "Click a note in the score to inspect note-level predictions and complete RN decoding. "
+                    "Upload a score below (auto-filled from Module 1a) or load an alternative edition."
+                )
+                verovio_score_file = gr.File(
+                    label="Score for Verovio (auto-filled from Module 1a)",
+                    file_types=[".xml", ".musicxml", ".mxl"],
+                    type="filepath",
                 )
                 visual_edge_types = gr.CheckboxGroup(
                     label="Visible Edge Types",
@@ -1447,11 +1514,17 @@ def build_demo() -> gr.Blocks:
                     value=[],
                     info="Edges are hidden by default; select one or more types and refresh.",
                 )
+                gr.Markdown("**Non-chord tones**")
+                nct_color_checkbox = gr.Checkbox(
+                    label="Colour non-chord tones grey",
+                    value=False,
+                    info="Chord tones -> black, non-chord tones -> light grey, scaled by confidence.",
+                )
                 refresh_visual_btn = gr.Button("Refresh Visual", variant="secondary")
                 visual_html = gr.HTML(
                     value=(
                         "<div style='padding:12px;border:1px solid #d1d5db;border-radius:10px;background:#fff;'>"
-                        "Run inference first, then click 'Refresh Visual'."
+                        "Run inference or load a Delta Lake, upload a score, then click 'Refresh Visual'."
                         "</div>"
                     ),
                     label="Verovio Score + Graph",
@@ -1560,6 +1633,12 @@ def build_demo() -> gr.Blocks:
             inputs=[model_available_state],
             outputs=[target_only_update, known_rows_expr, target_rows_expr, update_analysis_btn, tasks_csv],
         )
+        # Auto-fill Verovio score file from Module 1a
+        score_file.change(
+            fn=lambda f: f,
+            inputs=[score_file],
+            outputs=[verovio_score_file],
+        )
 
         # ---- Module 1b: Load Delta Lake ----
         load_delta_btn.click(
@@ -1618,11 +1697,12 @@ def build_demo() -> gr.Blocks:
         refresh_visual_btn.click(
             fn=refresh_visual_tab,
             inputs=[
-                score_file,
+                verovio_score_file,
                 task_selector,
                 tasks_csv,
                 table,
                 visual_edge_types,
+                nct_color_checkbox,
                 visual_payload_state,
                 intermediates_state,
                 edges_state,
