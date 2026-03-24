@@ -1314,7 +1314,7 @@ def refresh_visual_tab(
     tasks_csv: str,
     table_data: Any,
     edge_type_labels: List[str],
-    nct_color: bool,
+    nct_color_labels: List[str],
     visual_state: Dict[str, Any],
     intermediates_state: Any,
     edges_state: Any,
@@ -1322,6 +1322,7 @@ def refresh_visual_tab(
 ):
     try:
         selected_edge_types = [k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])]
+        nct_color = bool(nct_color_labels and "Colour non-chord tones grey" in nct_color_labels)
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
         intermediates = intermediates_state or {}
         edges_all = edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES}
@@ -1514,10 +1515,10 @@ def build_demo() -> gr.Blocks:
                     value=[],
                     info="Edges are hidden by default; select one or more types and refresh.",
                 )
-                gr.Markdown("**Non-chord tones**")
-                nct_color_checkbox = gr.Checkbox(
-                    label="Colour non-chord tones grey",
-                    value=False,
+                nct_color_group = gr.CheckboxGroup(
+                    label="Non-chord tones",
+                    choices=["Colour non-chord tones grey"],
+                    value=[],
                     info="Chord tones -> black, non-chord tones -> light grey, scaled by confidence.",
                 )
                 refresh_visual_btn = gr.Button("Refresh Visual", variant="secondary")
@@ -1702,7 +1703,7 @@ def build_demo() -> gr.Blocks:
                 tasks_csv,
                 table,
                 visual_edge_types,
-                nct_color_checkbox,
+                nct_color_group,
                 visual_payload_state,
                 intermediates_state,
                 edges_state,
