@@ -587,6 +587,93 @@ Remaining work for this step:
 
 ---
 
+## Verovio Integration Architecture
+
+### Overview
+
+The Gradio app embeds a Verovio-based score viewer in an iframe. Verovio renders
+MusicXML into SVG; the app's JS then overlays graph edges, note coloring, RN labels,
+and click-to-inspect interactivity on top of the rendered SVG.
+
+### Version & CDN
+
+Currently using **Verovio 5.0.0** via the CDN at
+`https://www.verovio.org/javascript/5.0.0/verovio-toolkit-wasm.js`
+(loaded in `examples/assets/verovio_score_graph.html`). To update, change the version
+number in the `<script src>` tag; available versions are at
+`https://www.verovio.org/javascript/<version>/` (not all releases have JS builds —
+e.g., 6.1.1 was CocoaPods-only). **Do not upgrade to Verovio 6.x without adapting
+the JS**: version 6.0.0 changed the SVG styling structure ("Remove default css
+scoping"), which breaks the `.page-margin` selector used by our JS to anchor edge
+overlays and RN labels.
+
+### File layout
+
+| File | Role |
+|------|------|
+| `examples/assets/verovio_score_graph.html` | Template: loads CSS, JS, payload, Verovio CDN script |
+| `examples/assets/verovio_score_graph.js` | All rendering logic: Verovio init, note mapping, edge overlay, RN labels, click handler |
+| `examples/assets/verovio_score_graph.css` | Styling: toolbar, note panel, `.agn-colored`/`.agn-active` note highlighting, edges, RN labels |
+
+### Data flow
+
+1. Python builds a **payload** dict (`_build_visual_payload()` in the Gradio app):
+   - `score_xml`: the **original** MusicXML text (read directly from the uploaded
+     file via `_read_score_xml_text()`; partitura re-export is only used as fallback
+     for non-XML formats like `.mxl`)
+   - `notes`: per-note metadata (pitch, onset, tasks, confidence, RN)
+   - `edges`: graph edge lists per type
+   - `meta.roman_spans`: RN label spans for the JS overlay
+   - `note_colors`: optional per-note CSS color strings (e.g., NCT coloring)
+2. The payload is JSON-serialized into the HTML template as `window.__AGN_PAYLOAD__`.
+3. The HTML is escaped and embedded as an `<iframe srcdoc="...">`.
+4. Inside the iframe, the JS:
+   - Waits for the Verovio WASM runtime to initialize (`ensureVerovioReady()`)
+   - Calls `tk.setOptions(...)` then `tk.loadData(payload.score_xml)`
+   - Renders SVG pages via `tk.renderToSVG(page)`
+   - Maps payload notes to SVG `<g class="note">` elements by ID (first by
+     `findNoteElementById()` which tries exact match, endsWith, includes; then
+     falls back to sequential order for unmapped notes)
+   - Draws edge overlays as SVG `<path>` elements
+   - Draws RN labels as SVG `<text>` elements from `meta.roman_spans`
+   - Applies `note_colors` via CSS custom property `--agn-note-color`
+
+### Important: always use the original MusicXML
+
+The score XML sent to Verovio **must** be the original uploaded MusicXML, not a
+partitura re-export. Partitura's `save_musicxml()` strips `<accidental>` elements
+(it writes `<alter>` inside `<pitch>` but not the display-controlling `<accidental>`),
+causing Verovio to render notes without accidental symbols. The original file
+preserves both. RN annotations are handled entirely by the JS overlay (not embedded
+in the MusicXML), so there is no reason to re-export.
+
+### Verovio options (current)
+
+```js
+tk.setOptions({
+  breaks: "none",        // horizontal continuous layout
+  footer: "none",
+  header: "none",
+  adjustPageHeight: true,
+  adjustPageWidth: true,
+  pageMarginBottom: 0,
+  pageMarginTop: 0,
+});
+```
+
+Full option reference: https://book.verovio.org/toolkit-reference/toolkit-options.html
+
+### Extending
+
+- **Note coloring**: set `payload.note_colors = { "<noteIndex>": "<css-color>" }`;
+  the JS applies class `.agn-colored` + CSS variable `--agn-note-color`
+- **Edge visibility**: controlled by `payload.meta.visible_edge_types` (list of
+  edge type strings); toggled via the Gradio checkboxes
+- **New overlays**: add SVG elements to `pageMargin` containers in the JS
+  (same pattern as `renderRomanNumeralOverlay()`)
+
+---
+
 ## Conventions
 
 - Always say **note**, never "vertex" or "node" — since groupings are hyperedges (not

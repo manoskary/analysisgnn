@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import json
 import html as html_lib
+import re
 import tempfile
 from functools import lru_cache
 from pathlib import Path
@@ -257,11 +258,66 @@ def _build_complete_rn_column(df: pd.DataFrame) -> pd.Series:
     return pd.Series(out, index=df.index, dtype=object)
 
 
+def _inject_note_ids(xml_text: str, score: pt.score.Score) -> str:
+    """Inject partitura note IDs into ``<note>`` elements of the original MusicXML.
+
+    Partitura assigns stable IDs (``p0n0``, ``p0n3``, ...) when loading a score.
+    The original MusicXML typically has no ``id`` attributes on ``<note>`` elements.
+    Verovio preserves ``id`` attributes in SVG output, so the JS overlay can match
+    payload notes to SVG note groups by ID.  Without IDs, the fallback sequential
+    mapping fails because our sort order (onset_div, pitch) differs from MusicXML
+    document order (onset, voice/staff).
+
+    Each partitura note has a ``doc_order`` attribute giving its 0-based index
+    among *all* ``<note>`` elements (including rests) in the MusicXML.  We build
+    a mapping from that index to the note ID and inject the ID when we encounter
+    the corresponding ``<note>`` element.
+    """
+    parts = list(getattr(score, "parts", []) or [])
+    if not parts:
+        return xml_text
+
+    # Map: doc_order -> note ID.
+    doc_order_to_id: Dict[int, str] = {}
+    for part in parts:
+        for n in part.notes_tied:
+            doc_ord = getattr(n, "doc_order", None)
+            if doc_ord is not None:
+                doc_order_to_id[doc_ord] = str(n.id)
+
+    if not doc_order_to_id:
+        return xml_text
+
+    # Regex: match ``<note`` followed by optional attributes and ``>``, then body,
+    # then ``</note>``.  Group 1 = any existing attributes + the closing ``>``.
+    # Group 2 = the body between ``>`` and ``</note>``.
+    _note_re = re.compile(r"<note(\s[^>]*)?>(.+?)</note>", re.DOTALL)
+    doc_idx = 0
+
+    def _replacer(m: re.Match) -> str:
+        nonlocal doc_idx
+        current_idx = doc_idx
+        doc_idx += 1
+        existing_attrs = m.group(1) or ""
+        body = m.group(2)
+        # If the tag already carries an id, leave it alone.
+        if "id=" in existing_attrs:
+            return m.group(0)
+        nid = doc_order_to_id.get(current_idx)
+        if nid is None:
+            # Rest or unmatched — return unchanged.
+            return m.group(0)
+        return f'<note id="{nid}"{existing_attrs}>{body}</note>'
+
+    return _note_re.sub(_replacer, xml_text)
+
+
 def _read_score_xml_text(score_path: str, score: pt.score.Score) -> str:
     suffix = Path(score_path).suffix.lower()
     if suffix in {".xml", ".musicxml"}:
         with open(score_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+            xml_text = f.read()
+        return _inject_note_ids(xml_text, score)
     with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -325,74 +381,6 @@ def _build_complete_rn_spans(df: pd.DataFrame) -> List[Tuple[int, int, str]]:
         final_end = max(current_start + 1, score_end)
         spans.append((current_start, final_end, current_rn))
     return spans
-
-
-def _read_score_xml_with_complete_rn(
-    score_path: str,
-    score: pt.score.Score,
-    df: pd.DataFrame,
-) -> str:
-    """Export MusicXML with RomanNumeral harmony spans inserted."""
-    if df is None or len(df) == 0:
-        return _read_score_xml_text(score_path, score)
-
-    note_array = _sorted_note_array(score)
-    n = min(len(df), len(note_array))
-    if n == 0:
-        return _read_score_xml_text(score_path, score)
-
-    work = df.iloc[:n].reset_index(drop=True).copy()
-    if "onset_div" in note_array.dtype.names:
-        work["onset_div"] = note_array["onset_div"][:n]
-    if "duration_div" in note_array.dtype.names:
-        work["duration_div"] = note_array["duration_div"][:n]
-    work["romanNumeral_full"] = _build_complete_rn_column(work)
-    spans = _build_complete_rn_spans(work)
-    if not spans:
-        return _read_score_xml_text(score_path, score)
-
-    try:
-        score_for_xml = _load_score(score_path)
-    except Exception:
-        score_for_xml = score
-    parts = list(getattr(score_for_xml, "parts", []) or [])
-    if not parts:
-        return _read_score_xml_text(score_path, score)
-
-    harmony_classes = tuple(
-        cls for cls in (pt.score.Harmony, pt.score.RomanNumeral, pt.score.ChordSymbol) if cls is not None
-    )
-    for part in parts:
-        for cls in harmony_classes:
-            try:
-                to_remove = list(part.iter_all(cls))
-            except Exception:
-                to_remove = []
-            for obj in to_remove:
-                try:
-                    part.remove(obj)
-                except Exception:
-                    pass
-
-    target_part = parts[0]
-    for start_div, end_div, rn_text in spans:
-        try:
-            rn_obj = pt.score.RomanNumeral(text=str(rn_text))
-            target_part.add(rn_obj, start=int(start_div), end=int(end_div))
-        except Exception:
-            continue
-
-    with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        pt.save_musicxml(score_for_xml, tmp_path)
-        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
 
 
 def _sorted_note_array(score: pt.score.Score) -> np.ndarray:
@@ -572,11 +560,7 @@ def _build_visual_payload(
     payload = _build_graph_overlay_payload(
         df=df, note_array=note_array, tasks=tasks, edge_types=edge_types, edges_all=edges_all,
     )
-    payload["score_xml"] = _read_score_xml_with_complete_rn(
-        score_path=score_path,
-        score=score,
-        df=df,
-    )
+    payload["score_xml"] = _read_score_xml_text(score_path, score)
     payload["score_format"] = "musicxml"
     return payload
 
