@@ -419,6 +419,29 @@ def get_parser():
     )
     parser.set_defaults(iterative_eval_zero_known=True)
     parser.add_argument(
+        "--beam_eval",
+        action="store_true",
+        help="Enable onset-level constrained beam decoding evaluation in parallel with baseline metrics.",
+    )
+    parser.add_argument(
+        "--beam_eval_during_fit",
+        action="store_true",
+        default=False,
+        help="Also compute beam-decoded validation metrics during fit (val_full_beam/*).",
+    )
+    parser.add_argument(
+        "--beam_width",
+        type=int,
+        default=8,
+        help="Beam width for onset-level RNA decoding.",
+    )
+    parser.add_argument(
+        "--beam_spec_json",
+        type=str,
+        default=None,
+        help="Optional JSON file with beam decoder overrides (topk_by_task, weights, penalties).",
+    )
+    parser.add_argument(
         "--aggregation_mode",
         type=str,
         default="mean",
@@ -854,6 +877,33 @@ def main():
         if unknown_eval_tasks:
             raise ValueError(f"Unknown iterative eval task(s): {unknown_eval_tasks}")
 
+    if int(config.get("beam_width", 8)) < 1:
+        raise ValueError("--beam_width must be >= 1.")
+    config["beam_width"] = int(config.get("beam_width", 8))
+    if config.get("beam_spec_json"):
+        beam_spec_path = Path(str(config["beam_spec_json"])).expanduser()
+        if not beam_spec_path.exists():
+            raise ValueError(f"--beam_spec_json path not found: {beam_spec_path}")
+        import json
+
+        with open(beam_spec_path, "r", encoding="utf-8") as f:
+            loaded_beam_spec = json.load(f)
+        if not isinstance(loaded_beam_spec, dict):
+            raise ValueError("--beam_spec_json must contain a JSON object.")
+        config["beam_spec_config"] = loaded_beam_spec
+    else:
+        config["beam_spec_config"] = None
+    if config.get("beam_eval_during_fit", False) and not config.get("beam_eval", False):
+        print("Warning: --beam_eval_during_fit requires --beam_eval; disabling beam_eval_during_fit.")
+        config["beam_eval_during_fit"] = False
+    if config.get("beam_eval", False) and config.get("iterative_eval", False):
+        print(
+            "Warning: --beam_eval with --iterative_eval is not supported in v1 test logging. "
+            "Disabling beam_eval for this run."
+        )
+        config["beam_eval"] = False
+        config["beam_eval_during_fit"] = False
+
     aggregation_mode = str(config.get("aggregation_mode", "mean")).lower().strip()
     if aggregation_mode not in {"mean", "voter", "voter_consistent_beat"}:
         print(f"Warning: unknown aggregation_mode '{aggregation_mode}', falling back to 'mean'.")
@@ -1202,6 +1252,16 @@ def main():
             if config.get("iterative_eval", False) and config.get("iterative_eval_zero_known", True)
             else "iternonzero"
         )
+        beam_tag = "beam_eval" if config.get("beam_eval", False) else "no_beam_eval"
+        beam_width_tag = f"beam_w{int(config.get('beam_width', 8))}"
+        beam_cfg_tag = ""
+        if config.get("beam_eval", False) and isinstance(config.get("beam_spec_config"), dict):
+            try:
+                beam_cfg_json = str(config["beam_spec_config"])
+                beam_cfg_hash = hashlib.sha1(beam_cfg_json.encode("utf-8")).hexdigest()[:8]
+                beam_cfg_tag = f"beam_cfg_{beam_cfg_hash}"
+            except Exception:
+                beam_cfg_tag = ""
         phase = "train+eval" if args.do_train and args.do_eval else ("train" if args.do_train else ("eval" if args.do_eval else "run"))
         ckpt_tag = ""
         if args.do_eval and not args.do_train and config.get("checkpoint_path"):
@@ -1252,6 +1312,9 @@ def main():
                 iterative_tag,
                 iterative_eval_tag,
                 iterative_eval_zero_known_tag,
+                beam_tag,
+                beam_width_tag,
+                beam_cfg_tag,
                 config["scheduler_type"],
                 config["mt_conflict_method"],
             ] + user_tags

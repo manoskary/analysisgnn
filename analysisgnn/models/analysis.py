@@ -34,6 +34,12 @@ from analysisgnn.models.posthoc_aggregator import (
     DEFAULT_BEAT_OUTPUT_TASKS,
     HARMONIC_BEAT_TASKS,
 )
+from analysisgnn.inference.beam_decoder import (
+    DEFAULT_BEAM_TASKS,
+    build_smoothed_note_probs_from_class_ids,
+    decode_onset_beam,
+    normalize_beam_spec,
+)
 
 
 def isin_pairwise(element,test_elements, assume_unique=True):
@@ -1614,6 +1620,10 @@ class ContinualAnalysisGNN(LightningModule):
             self.aggregation_mode = "mean"
         self.aggregation_voter_path = hparams.get("aggregation_voter_path", None)
         self.aggregation_compare_mean_in_test = bool(hparams.get("aggregation_compare_mean_in_test", False))
+        self.beam_eval = bool(hparams.get("beam_eval", False))
+        self.beam_eval_during_fit = bool(hparams.get("beam_eval_during_fit", False))
+        self.beam_width = max(1, int(hparams.get("beam_width", 8)))
+        self.beam_spec_config = hparams.get("beam_spec_config", None)
         self.__dict__["_aggregation_bundle"] = None
         self.__dict__["_aggregation_bundle_path"] = None
 
@@ -2083,6 +2093,81 @@ class ContinualAnalysisGNN(LightningModule):
         if bundle is None:
             return "mean", None
         return mode, bundle
+
+    def _resolve_beam_spec(
+        self,
+        beam_spec: Optional[Dict[str, Any]] = None,
+        *,
+        enabled_override: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        base_cfg = {}
+        if isinstance(self.beam_spec_config, dict):
+            base_cfg.update(self.beam_spec_config)
+        if isinstance(beam_spec, dict):
+            base_cfg.update(beam_spec)
+        if "beam_width" not in base_cfg:
+            base_cfg["beam_width"] = self.beam_width
+        if enabled_override is not None:
+            base_cfg["enabled"] = bool(enabled_override)
+        return normalize_beam_spec(base_cfg)
+
+    def _decode_beam_from_note_probs(
+        self,
+        *,
+        note_prob_dict: Dict[str, torch.Tensor],
+        data,
+        batch_size: int,
+        beam_spec: Optional[Dict[str, Any]] = None,
+        enabled_override: Optional[bool] = None,
+    ) -> Optional[Dict[str, Any]]:
+        cfg = self._resolve_beam_spec(beam_spec=beam_spec, enabled_override=enabled_override)
+        if not cfg.get("enabled", False):
+            return None
+        onset_ids = data["note"].onset_div[:batch_size]
+        legal_rn_set = self._legal_roman_numeral_set()
+        return decode_onset_beam(
+            note_prob_dict=note_prob_dict,
+            onset_ids=onset_ids,
+            task_num_classes=self.task_dict,
+            legal_rn_set=legal_rn_set,
+            spec=cfg,
+        )
+
+    def _build_beam_variant_logits(
+        self,
+        *,
+        base_logits: Dict[str, torch.Tensor],
+        beam_payload: Optional[Dict[str, Any]],
+        batch_size: int,
+        valid_label_mask: torch.Tensor,
+        mask_dict: Dict[str, torch.Tensor],
+        off_prob: float = 1e-3,
+    ) -> Dict[str, torch.Tensor]:
+        if not beam_payload or "note_class_ids" not in beam_payload:
+            return base_logits
+        out = {k: v for k, v in base_logits.items()}
+        note_class_ids = beam_payload.get("note_class_ids", {})
+        if not isinstance(note_class_ids, dict):
+            return out
+        for task, class_ids in note_class_ids.items():
+            if task not in out or task not in self.task_dict:
+                continue
+            if task not in mask_dict:
+                continue
+            if not isinstance(class_ids, torch.Tensor):
+                continue
+            class_ids = class_ids[:batch_size].to(device=out[task].device, dtype=torch.long)
+            num_classes = int(self.task_dict[task])
+            probs = build_smoothed_note_probs_from_class_ids(
+                class_ids=class_ids,
+                num_classes=num_classes,
+                off_prob=off_prob,
+            )
+            probs = probs.to(device=out[task].device, dtype=out[task].dtype)
+            probs = probs[valid_label_mask]
+            probs = probs[mask_dict[task]]
+            out[task] = torch.log(torch.clamp(probs, min=1e-8))
+        return out
 
     def _decode_task_class_id(self, task: str, class_id: int) -> str:
         if class_id < 0:
@@ -4331,7 +4416,7 @@ class ContinualAnalysisGNN(LightningModule):
                 prog_bar: bool = False,
                 include_preserve: bool = False,
                 include_legacy_alias: bool = False,
-            ) -> None:
+            ) -> Dict[str, Optional[float]]:
                 loss_dict_local = self.clf_loss(variant_logits, labels_dict, node_mask=node_mask_for_loss)
                 total_loss_local = loss_dict_local.pop("total") / len(labels_dict.keys())
                 accuracy_dict = {}
@@ -4450,14 +4535,99 @@ class ContinualAnalysisGNN(LightningModule):
                                 self.log(f"{metric_prefix}/total_rna_acc", total_rna_acc, batch_size=batch_size)
                                 if include_legacy_alias:
                                     self.log("val/total_rna_acc", total_rna_acc, batch_size=batch_size)
+                return {
+                    "total_loss": float(total_loss_local.detach().cpu().item()),
+                    "task_acc": {
+                        task: float(val.detach().cpu().item())
+                        for task, val in accuracy_dict.items()
+                    },
+                }
 
-            _log_validation_variant(
+            full_summary = _log_validation_variant(
                 metric_prefix="val_full",
                 variant_logits=logits_full,
                 prog_bar=True,
                 include_preserve=True,
                 include_legacy_alias=True,
             )
+
+            if self.beam_eval and self.beam_eval_during_fit and not self.iterative_eval:
+                beam_agg_mode, beam_agg_bundle = self._resolve_aggregation_runtime(aggregation_spec=None)
+                beam_payload = self._decode_beam_from_note_probs(
+                    note_prob_dict=self._aggregate_note_probs(
+                        note_prob_dict=self._predict_note_probs_once(
+                            data=batch,
+                            batch_size=batch_size,
+                            conditioning=batch_conditioning,
+                            overrides=None,
+                            x_dict_override=x_dict,
+                            neighbor_mask_node=num_sampled_nodes_dict,
+                            neighbor_mask_edge=num_sampled_edges_dict,
+                        ),
+                        data=batch,
+                        batch_size=batch_size,
+                        aggregation_mode=beam_agg_mode,
+                        aggregation_bundle=beam_agg_bundle,
+                    ),
+                    data=batch,
+                    batch_size=batch_size,
+                    enabled_override=True,
+                )
+                if beam_payload is not None:
+                    beam_logits = self._build_beam_variant_logits(
+                        base_logits=logits_full,
+                        beam_payload=beam_payload,
+                        batch_size=batch_size,
+                        valid_label_mask=valid_label_mask,
+                        mask_dict=mask_dict,
+                    )
+                    if self.constraint_mode == "hard" and node_mask_valid is not None:
+                        for task in labels_dict.keys():
+                            if task not in beam_logits:
+                                continue
+                            raw_mask = raw_task_node_masks.get(task)
+                            if raw_mask is None:
+                                continue
+                            _, context_indices, _ = split_nodes_by_mask(raw_mask)
+                            if context_indices.numel() == 0:
+                                continue
+                            valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                            context_indices = context_indices[valid_context]
+                            if context_indices.numel() == 0:
+                                continue
+                            beam_logits[task] = clamp_logits_to_labels(
+                                beam_logits[task],
+                                labels_dict[task],
+                                context_indices,
+                                num_classes=self.task_dict.get(task),
+                            )
+                    beam_summary = _log_validation_variant(
+                        metric_prefix="val_full_beam",
+                        variant_logits=beam_logits,
+                        prog_bar=False,
+                        include_preserve=False,
+                        include_legacy_alias=False,
+                    )
+                    if (
+                        full_summary.get("total_loss") is not None
+                        and beam_summary.get("total_loss") is not None
+                    ):
+                        self.log(
+                            f"val_beam_delta/total_loss_beam_minus_full_{k}",
+                            beam_summary["total_loss"] - full_summary["total_loss"],
+                            batch_size=batch_size,
+                        )
+                    key_tasks = ["romanNumeral", "localkey", "quality", "inversion", "degree1", "degree2"]
+                    full_task_acc = full_summary.get("task_acc", {}) or {}
+                    beam_task_acc = beam_summary.get("task_acc", {}) or {}
+                    for task in key_tasks:
+                        if task not in full_task_acc or task not in beam_task_acc:
+                            continue
+                        self.log(
+                            f"val_beam_delta/{task}_acc_beam_minus_full_{k}",
+                            beam_task_acc[task] - full_task_acc[task],
+                            batch_size=batch_size,
+                        )
 
             if self.iterative_eval and self.iterative_eval_during_fit:
                 iterative_cfg = {
@@ -5053,6 +5223,76 @@ class ContinualAnalysisGNN(LightningModule):
                         add_dataloader_idx=True,
                         batch_size=batch_size,
                     )
+                if self.beam_eval:
+                    beam_payload = self._decode_beam_from_note_probs(
+                        note_prob_dict=mean_probs,
+                        data=batch,
+                        batch_size=batch_size,
+                        enabled_override=True,
+                    )
+                    if beam_payload is not None:
+                        beam_logits = self._build_beam_variant_logits(
+                            base_logits=mean_logits,
+                            beam_payload=beam_payload,
+                            batch_size=batch_size,
+                            valid_label_mask=valid_label_mask,
+                            mask_dict=mask_dict,
+                        )
+                        if self.constraint_mode == "hard" and node_mask_valid is not None:
+                            for task in labels_dict.keys():
+                                if task not in beam_logits:
+                                    continue
+                                raw_mask = raw_task_node_masks.get(task)
+                                if raw_mask is None:
+                                    continue
+                                _, context_indices, _ = split_nodes_by_mask(raw_mask)
+                                if context_indices.numel() == 0:
+                                    continue
+                                valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                                context_indices = context_indices[valid_context]
+                                if context_indices.numel() == 0:
+                                    continue
+                                beam_logits[task] = clamp_logits_to_labels(
+                                    beam_logits[task],
+                                    labels_dict[task],
+                                    context_indices,
+                                    num_classes=self.task_dict.get(task),
+                                )
+                        beam_summary = _log_test_variant(
+                            metric_prefix="test_full_beam",
+                            variant_logits=beam_logits,
+                        )
+                        if (
+                            mean_summary.get("total_loss") is not None
+                            and beam_summary.get("total_loss") is not None
+                        ):
+                            self.log(
+                                f"test_beam_delta/total_loss_beam_minus_base_{gtask_key}",
+                                beam_summary["total_loss"] - mean_summary["total_loss"],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+                        if (
+                            mean_summary.get("rn_onset_acc") is not None
+                            and beam_summary.get("rn_onset_acc") is not None
+                        ):
+                            self.log(
+                                f"test_beam_delta/RN(Onset)_beam_minus_base_{gtask_key}",
+                                beam_summary["rn_onset_acc"] - mean_summary["rn_onset_acc"],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+                        mean_task_acc = mean_summary.get("task_acc", {}) or {}
+                        beam_task_acc = beam_summary.get("task_acc", {}) or {}
+                        for task in key_tasks:
+                            if task not in mean_task_acc or task not in beam_task_acc:
+                                continue
+                            self.log(
+                                f"test_beam_delta/{task}_acc_beam_minus_base_{gtask_key}",
+                                beam_task_acc[task] - mean_task_acc[task],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
                 continue
 
             if self.iterative_eval:
@@ -5150,11 +5390,140 @@ class ContinualAnalysisGNN(LightningModule):
                         batch_size=batch_size,
                     )
             else:
-                _log_test_variant(
+                base_summary = _log_test_variant(
                     metric_prefix="test",
                     variant_logits=logits_dict,
                     preserve_metrics=preserve_losses,
                 )
+                if self.beam_eval:
+                    beam_agg_mode, beam_agg_bundle = self._resolve_aggregation_runtime(aggregation_spec=None)
+                    beam_note_probs = self._aggregate_note_probs(
+                        note_prob_dict=self._predict_note_probs_once(
+                            data=batch,
+                            batch_size=batch_size,
+                            conditioning=batch_conditioning,
+                            overrides=None,
+                            x_dict_override=x_dict,
+                            neighbor_mask_node=num_sampled_nodes_dict,
+                            neighbor_mask_edge=num_sampled_edges_dict,
+                        ),
+                        data=batch,
+                        batch_size=batch_size,
+                        aggregation_mode=beam_agg_mode,
+                        aggregation_bundle=beam_agg_bundle,
+                    )
+                    beam_payload = self._decode_beam_from_note_probs(
+                        note_prob_dict=beam_note_probs,
+                        data=batch,
+                        batch_size=batch_size,
+                        enabled_override=True,
+                    )
+                    if beam_payload is not None:
+                        beam_logits = self._build_beam_variant_logits(
+                            base_logits=logits_dict,
+                            beam_payload=beam_payload,
+                            batch_size=batch_size,
+                            valid_label_mask=valid_label_mask,
+                            mask_dict=mask_dict,
+                        )
+                        if self.constraint_mode == "hard" and node_mask_valid is not None:
+                            for task in labels_dict.keys():
+                                if task not in beam_logits:
+                                    continue
+                                raw_mask = raw_task_node_masks.get(task)
+                                if raw_mask is None:
+                                    continue
+                                _, context_indices, _ = split_nodes_by_mask(raw_mask)
+                                if context_indices.numel() == 0:
+                                    continue
+                                valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                                context_indices = context_indices[valid_context]
+                                if context_indices.numel() == 0:
+                                    continue
+                                beam_logits[task] = clamp_logits_to_labels(
+                                    beam_logits[task],
+                                    labels_dict[task],
+                                    context_indices,
+                                    num_classes=self.task_dict.get(task),
+                                )
+                        beam_summary = _log_test_variant(
+                            metric_prefix="test_full_beam",
+                            variant_logits=beam_logits,
+                            preserve_metrics=None,
+                        )
+                        if (
+                            base_summary.get("total_loss") is not None
+                            and beam_summary.get("total_loss") is not None
+                        ):
+                            self.log(
+                                f"test_beam_delta/total_loss_beam_minus_base_{gtask_key}",
+                                beam_summary["total_loss"] - base_summary["total_loss"],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+                        if (
+                            base_summary.get("rn_onset_acc") is not None
+                            and beam_summary.get("rn_onset_acc") is not None
+                        ):
+                            self.log(
+                                f"test_beam_delta/RN(Onset)_beam_minus_base_{gtask_key}",
+                                beam_summary["rn_onset_acc"] - base_summary["rn_onset_acc"],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+                        key_tasks = [
+                            "romanNumeral",
+                            "localkey",
+                            "quality",
+                            "inversion",
+                            "degree1",
+                            "degree2",
+                        ]
+                        base_task_acc = base_summary.get("task_acc", {}) or {}
+                        beam_task_acc = beam_summary.get("task_acc", {}) or {}
+                        for task in key_tasks:
+                            if task not in base_task_acc or task not in beam_task_acc:
+                                continue
+                            self.log(
+                                f"test_beam_delta/{task}_acc_beam_minus_base_{gtask_key}",
+                                beam_task_acc[task] - base_task_acc[task],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+
+    def on_test_epoch_end(self) -> None:
+        if not self.beam_eval:
+            return
+        metrics = getattr(self.trainer, "callback_metrics", {})
+        if not isinstance(metrics, dict) or not metrics:
+            return
+
+        def _mean_prefix(prefix: str) -> Optional[torch.Tensor]:
+            vals: List[torch.Tensor] = []
+            for key, value in metrics.items():
+                if not str(key).startswith(prefix):
+                    continue
+                if isinstance(value, torch.Tensor):
+                    vals.append(value.detach().float())
+                else:
+                    try:
+                        vals.append(torch.tensor(float(value), device=self.device))
+                    except Exception:
+                        continue
+            if not vals:
+                return None
+            return torch.stack(vals).mean()
+
+        summary_map = {
+            "summary/test_beam_delta_total_loss": "test_beam_delta/total_loss_beam_minus_base_",
+            "summary/test_beam_delta_rn_onset_acc": "test_beam_delta/RN(Onset)_beam_minus_base_",
+            "summary/test_beam_delta_romanNumeral_acc": "test_beam_delta/romanNumeral_acc_beam_minus_base_",
+        }
+        for out_key, prefix in summary_map.items():
+            value = _mean_prefix(prefix)
+            if value is None:
+                continue
+            self.log(out_key, value, prog_bar=False, logger=True)
 
     def predict_step(self, batch, batch_idx):
         x_dict = self._maybe_encode_x_dict(batch, batch.x_dict)
@@ -5413,8 +5782,10 @@ class ContinualAnalysisGNN(LightningModule):
         return_edit_info: bool = False,
         iterative_spec: Optional[Dict[str, Any]] = None,
         aggregation_spec: Optional[Dict[str, Any]] = None,
+        beam_spec: Optional[Dict[str, Any]] = None,
         return_iterative_trace: bool = False,
         return_beat_predictions: bool = False,
+        return_beam_payload: bool = False,
     ):
         """Predict analysis for a musical score.
         
@@ -5426,8 +5797,11 @@ class ContinualAnalysisGNN(LightningModule):
             iterative_spec: Optional iterative masked-refinement configuration.
             aggregation_spec: Optional aggregation override
                 {"mode": "mean|voter|voter_consistent_beat", "voter_path": "...", "beat_tasks": [...]}.
+            beam_spec: Optional beam-decoding override
+                {"enabled": bool, "beam_width": int, ...}. Beam is additive and does not overwrite baseline outputs.
             return_iterative_trace: If True, append iterative trace to output.
             return_beat_predictions: If True, append optional beat-level parallel payload.
+            return_beam_payload: If True, append beam payload when beam decoding is enabled.
             
         Returns:
             Dictionary of predictions for each task, or tuple with diagnostics.
@@ -5557,6 +5931,17 @@ class ContinualAnalysisGNN(LightningModule):
                 aggregation_mode=aggregation_mode,
                 aggregation_bundle=aggregation_bundle,
             )
+            beam_output = self._decode_beam_from_note_probs(
+                note_prob_dict=predictions,
+                data=data,
+                batch_size=batch_size,
+                beam_spec=beam_spec,
+            )
+            if beam_output is not None:
+                beam_output = {
+                    "beam_enabled": True,
+                    **beam_output,
+                }
             beat_output = None
             if return_beat_predictions:
                 beat_tasks_cfg = []
@@ -5600,6 +5985,8 @@ class ContinualAnalysisGNN(LightningModule):
                 )
             if return_iterative_trace:
                 outputs.append(iterative_trace)
+            if return_beam_payload:
+                outputs.append(beam_output if beam_output is not None else {"beam_enabled": False})
             if return_beat_predictions:
                 outputs.append(beat_output)
             if len(outputs) == 1:
