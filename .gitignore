@@ -219,3 +219,4 @@ wandb/
 /AnalysisGNN/
 /AnalysisGNN-MusicBERT/
 logs/
+paper/
