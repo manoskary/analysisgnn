@@ -210,7 +210,7 @@ def score_note_table(score: pt.score.Score) -> pd.DataFrame:
 
     step = note_array["step"].astype(str)
     alter = note_array["alter"]
-    octave = note_array["octave"] - 1
+    octave = note_array["octave"]
     accidental = np.where(
         alter == 0,
         "",

@@ -93,7 +93,7 @@ def _build_notes_table(
     # pitch_spelling construction (matching score_note_table in hybrid_predictor.py)
     step = note_array["step"].astype(str)
     alter = note_array["alter"]
-    octave = note_array["octave"] - 1
+    octave = note_array["octave"]
     accidental = np.where(
         alter == 0,
         "",
