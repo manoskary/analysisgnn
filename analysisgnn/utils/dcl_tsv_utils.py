@@ -169,16 +169,18 @@ def create_graph_from_df(
     measure_offset_div = np.r_[offsets[change_indices[1:]], last_offset]
     # measures is tuples of (onset_div, offset_div)
     measures = np.vstack((measure_onset_div, measure_offset_div)).T
-    # graph = gm.create_score_graph(features, note_array, measures=measures, add_beats=True)  # Commented out due to missing graphmuse
-    
-    # Temporary replacement: try to use our local hetero_graph_from_note_array
     try:
-        from analysisgnn.utils.hgraph import hetero_graph_from_note_array
-        graph = hetero_graph_from_note_array(note_array)
+        graph = gm.create_score_graph(
+            features,
+            note_array=note_array,
+            measures=measures,
+            add_beats=True,
+        )
     except Exception:
-        # If that fails, return None - this will need to be properly implemented later
         return None
-        
+
+    if isinstance(graph, tuple):
+        graph = graph[0]
     if graph is None:
         return None
     pitch_spelling = pitch_encoder.encode(note_array).astype(int)
@@ -442,7 +444,6 @@ def create_labels_dlc(filtered_df, interval="P1", errors: ErrorHandling = ErrorH
         "valid_section_start_label": valid_section_start_label
     }
     return labels
-
 
 
 

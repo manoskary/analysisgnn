@@ -40,6 +40,7 @@ from analysisgnn.inference.beam_decoder import (
     decode_onset_beam,
     normalize_beam_spec,
 )
+from analysisgnn.inference.harmonic_state import COMPONENT_STATE_TASKS
 
 
 def isin_pairwise(element,test_elements, assume_unique=True):
@@ -61,6 +62,33 @@ def isin_pairwise(element,test_elements, assume_unique=True):
     element_cantor_proj = cantor_pairing(element[0], element[1])
     test_elements_cantor_proj = cantor_pairing(test_elements[0], test_elements[1])
     return torch.isin(element_cantor_proj, test_elements_cantor_proj, assume_unique=assume_unique)
+
+
+def combined_degree_accuracy(
+    logits_dict: Dict[str, torch.Tensor],
+    labels_dict: Dict[str, torch.Tensor],
+    task_dict: Dict[str, int],
+) -> Optional[torch.Tensor]:
+    """Exact-match accuracy for the joint (degree1, degree2) prediction."""
+    if "degree1" not in logits_dict or "degree2" not in logits_dict:
+        return None
+    if "degree1" not in labels_dict or "degree2" not in labels_dict:
+        return None
+
+    degree1_labels = labels_dict["degree1"]
+    degree2_labels = labels_dict["degree2"]
+    valid_degree1 = (degree1_labels >= 0) & (degree1_labels < task_dict["degree1"])
+    valid_degree2 = (degree2_labels >= 0) & (degree2_labels < task_dict["degree2"])
+    valid = valid_degree1 & valid_degree2
+    if not torch.any(valid):
+        return None
+
+    degree1_pred = logits_dict["degree1"].argmax(-1)
+    degree2_pred = logits_dict["degree2"].argmax(-1)
+    joint_correct = (degree1_pred[valid] == degree1_labels[valid]) & (
+        degree2_pred[valid] == degree2_labels[valid]
+    )
+    return joint_correct.float().mean()
 
 
 class PCGrad:
@@ -927,6 +955,7 @@ class TorchAnalysisGNN(nn.Module):
         use_rnn=False,
         encoder_type="hybridgnn",
         use_graph_encoder=True,
+        base_in_channels=None,
     ):
         super().__init__()
         self.pitch_embedding = nn.Embedding(35, 64)
@@ -934,22 +963,20 @@ class TorchAnalysisGNN(nn.Module):
         self.logit_fusion = logit_fusion
         self.use_rnn = use_rnn
         self.use_graph_encoder = use_graph_encoder
-        self.hidden_channels = hidden_channels        
-        self.project_dict = nn.ModuleDict({
-            k: (nn.Sequential(
-                nn.Linear(in_channels, hidden_channels),
+        self.hidden_channels = hidden_channels
+        self.base_in_channels = in_channels if base_in_channels is None else base_in_channels
+        self.project_dict = nn.ModuleDict()
+        for node_type in metadata[0]:
+            node_in_channels = in_channels if node_type == "note" else self.base_in_channels
+            if node_type == "note":
+                node_in_channels += 128
+            self.project_dict[node_type] = nn.Sequential(
+                nn.Linear(node_in_channels, hidden_channels),
                 nn.ReLU(),
                 nn.LayerNorm(hidden_channels),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_channels, hidden_channels),
-            ) if k != "note" else nn.Sequential(
-                nn.Linear(in_channels+128, hidden_channels),
-                nn.ReLU(),
-                nn.LayerNorm(hidden_channels),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_channels, hidden_channels),
-            )) for k in metadata[0]
-        })
+            )
         # In heads-only mode we still benefit from a learned projection block
         # before onset pooling / classification.
         self.no_gnn_note_mlp = nn.Sequential(
@@ -1414,6 +1441,7 @@ class ContinualAnalysisGNN(LightningModule):
         self.model = TorchAnalysisGNN(
             metadata=hparams["metadata"],
             in_channels=hparams["in_channels"],
+            base_in_channels=hparams.get("base_in_channels", hparams["in_channels"]),
             hidden_channels=hparams["hidden_channels"],
             out_channels=hparams["out_channels"],
             task_dict=hparams["task_dict"],
@@ -1624,6 +1652,39 @@ class ContinualAnalysisGNN(LightningModule):
         self.beam_eval_during_fit = bool(hparams.get("beam_eval_during_fit", False))
         self.beam_width = max(1, int(hparams.get("beam_width", 8)))
         self.beam_spec_config = hparams.get("beam_spec_config", None)
+        self.structured_beam_eval = bool(hparams.get("structured_beam_eval", False))
+        self.structured_beam_decoder_version = str(
+            hparams.get("structured_beam_decoder_version", "structured_v2")
+        ).lower().strip()
+        if self.structured_beam_decoder_version not in {"legacy", "structured_v2", "component_v3"}:
+            self.structured_beam_decoder_version = "structured_v2"
+        self.structured_beam_rescorer_path = hparams.get("structured_beam_rescorer_path", None)
+        self.structured_refine_train = bool(hparams.get("structured_refine_train", False))
+        self.structured_refine_eval = bool(hparams.get("structured_refine_eval", False))
+        self.structured_refine_teacher_checkpoint = hparams.get("structured_refine_teacher_checkpoint", None)
+        structured_refine_tasks_cfg = hparams.get("structured_refine_tasks", list(DEFAULT_BEAM_TASKS))
+        if isinstance(structured_refine_tasks_cfg, str):
+            structured_refine_tasks_cfg = [
+                t.strip() for t in structured_refine_tasks_cfg.split(",") if t.strip()
+            ]
+        self.structured_refine_tasks = [
+            t for t in structured_refine_tasks_cfg if t in self.task_dict
+        ]
+        if not self.structured_refine_tasks:
+            default_refine_tasks = (
+                list(COMPONENT_STATE_TASKS)
+                if self.structured_beam_decoder_version == "component_v3"
+                else list(DEFAULT_BEAM_TASKS)
+            )
+            self.structured_refine_tasks = [t for t in default_refine_tasks if t in self.task_dict]
+        self.structured_refine_oracle_epochs = int(hparams.get("structured_refine_oracle_epochs", 4))
+        self.structured_refine_teacher_epochs = int(hparams.get("structured_refine_teacher_epochs", 8))
+        self.structured_refine_conf_min = float(hparams.get("structured_refine_conf_min", 0.80))
+        self.structured_refine_keep_ratio = float(hparams.get("structured_refine_keep_ratio", 0.35))
+        self.structured_refine_boundary_max = float(hparams.get("structured_refine_boundary_max", 0.50))
+        self.structured_refine_consistency_lambda = float(
+            hparams.get("structured_refine_consistency_lambda", 0.05)
+        )
         self.__dict__["_aggregation_bundle"] = None
         self.__dict__["_aggregation_bundle_path"] = None
 
@@ -1664,6 +1725,9 @@ class ContinualAnalysisGNN(LightningModule):
         self.__dict__["_preserve_teacher_model"] = None
         self.__dict__["_preserve_teacher_musicbert_proj"] = None
         self.__dict__["_preserve_teacher_musicbert_gate"] = None
+        self.__dict__["_structured_refine_teacher_model"] = None
+        self.__dict__["_structured_refine_teacher_musicbert_proj"] = None
+        self.__dict__["_structured_refine_teacher_musicbert_gate"] = None
         self._preserve_l2sp_anchor_ready = False
         self._preserve_l2sp_anchor_params: Dict[str, torch.Tensor] = {}
         self._graph_encoder_frozen_state: Optional[bool] = None
@@ -1675,6 +1739,7 @@ class ContinualAnalysisGNN(LightningModule):
             self.memory_model = TorchAnalysisGNN(
                 metadata=hparams["metadata"],
                 in_channels=hparams["in_channels"],
+                base_in_channels=hparams.get("base_in_channels", hparams["in_channels"]),
                 hidden_channels=hparams["hidden_channels"],
                 out_channels=hparams["out_channels"],
                 task_dict=hparams["task_dict"],
@@ -2099,6 +2164,8 @@ class ContinualAnalysisGNN(LightningModule):
         beam_spec: Optional[Dict[str, Any]] = None,
         *,
         enabled_override: Optional[bool] = None,
+        version_override: Optional[str] = None,
+        rescorer_path_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         base_cfg = {}
         if isinstance(self.beam_spec_config, dict):
@@ -2107,9 +2174,40 @@ class ContinualAnalysisGNN(LightningModule):
             base_cfg.update(beam_spec)
         if "beam_width" not in base_cfg:
             base_cfg["beam_width"] = self.beam_width
+        if version_override is not None:
+            base_cfg["version"] = version_override
+        elif "version" not in base_cfg:
+            base_cfg["version"] = "legacy"
+        if rescorer_path_override is not None:
+            base_cfg["rescorer_path"] = rescorer_path_override
         if enabled_override is not None:
             base_cfg["enabled"] = bool(enabled_override)
         return normalize_beam_spec(base_cfg)
+
+    def _structured_decoder_version(self) -> str:
+        version = str(getattr(self, "structured_beam_decoder_version", "structured_v2")).lower().strip()
+        if version not in {"structured_v2", "component_v3"}:
+            return "structured_v2"
+        return version
+
+    def _aggregate_onset_only_note_probs(
+        self,
+        note_prob_dict: Dict[str, torch.Tensor],
+        data,
+        batch_size: int,
+        aggregation_mode: Optional[str] = None,
+        aggregation_bundle: Optional[PosthocAggregationBundle] = None,
+    ) -> Dict[str, torch.Tensor]:
+        mode = str(aggregation_mode or self.aggregation_mode or "mean").lower().strip()
+        out = {k: v.clone() for k, v in note_prob_dict.items()}
+        out = onsetwise_logit_aggregation(
+            out,
+            graph=data,
+            batch_size=batch_size,
+            aggregation_mode=mode,
+            aggregation_bundle=aggregation_bundle,
+        )
+        return out
 
     def _decode_beam_from_note_probs(
         self,
@@ -2119,8 +2217,15 @@ class ContinualAnalysisGNN(LightningModule):
         batch_size: int,
         beam_spec: Optional[Dict[str, Any]] = None,
         enabled_override: Optional[bool] = None,
+        version_override: Optional[str] = None,
+        rescorer_path_override: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        cfg = self._resolve_beam_spec(beam_spec=beam_spec, enabled_override=enabled_override)
+        cfg = self._resolve_beam_spec(
+            beam_spec=beam_spec,
+            enabled_override=enabled_override,
+            version_override=version_override,
+            rescorer_path_override=rescorer_path_override,
+        )
         if not cfg.get("enabled", False):
             return None
         onset_ids = data["note"].onset_div[:batch_size]
@@ -2168,6 +2273,51 @@ class ContinualAnalysisGNN(LightningModule):
             probs = probs[mask_dict[task]]
             out[task] = torch.log(torch.clamp(probs, min=1e-8))
         return out
+
+    def _note_probs_to_metric_logits(
+        self,
+        *,
+        note_prob_dict: Dict[str, torch.Tensor],
+        labels_dict: Dict[str, torch.Tensor],
+        mask_dict: Dict[str, torch.Tensor],
+        valid_label_mask: torch.Tensor,
+        raw_task_node_masks: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        logits_all = {
+            task: torch.log(torch.clamp(prob, min=1e-8))
+            for task, prob in note_prob_dict.items()
+            if task in labels_dict
+        }
+        logits_all = {
+            task: values[valid_label_mask]
+            for task, values in logits_all.items()
+        }
+        logits_variant = {
+            task: logits_all[task][mask_dict[task]]
+            for task in labels_dict.keys()
+            if task in logits_all
+        }
+        if self.constraint_mode == "hard" and raw_task_node_masks is not None:
+            for task in labels_dict.keys():
+                if task not in logits_variant:
+                    continue
+                raw_mask = raw_task_node_masks.get(task)
+                if raw_mask is None:
+                    continue
+                _, context_indices, _ = split_nodes_by_mask(raw_mask)
+                if context_indices.numel() == 0:
+                    continue
+                valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                context_indices = context_indices[valid_context]
+                if context_indices.numel() == 0:
+                    continue
+                logits_variant[task] = clamp_logits_to_labels(
+                    logits_variant[task],
+                    labels_dict[task],
+                    context_indices,
+                    num_classes=self.task_dict.get(task),
+                )
+        return logits_variant
 
     def _decode_task_class_id(self, task: str, class_id: int) -> str:
         if class_id < 0:
@@ -2374,13 +2524,21 @@ class ContinualAnalysisGNN(LightningModule):
         conditioning: Optional[MaskedConditioningSpec],
     ) -> Dict[str, Any]:
         spec = dict(iterative_spec or {})
+        version = str(spec.get("version", "legacy")).lower().strip()
+        if version not in {"legacy", "structured_v2", "component_v3"}:
+            version = "legacy"
         enabled = bool(spec.get("enabled", False))
-        steps = max(1, int(spec.get("steps", 10)))
+        default_steps = 3 if version == "component_v3" else 10
+        steps = max(1, int(spec.get("steps", default_steps)))
         keep_pct = float(spec.get("keep_percentile_per_step", 10.0))
         keep_pct = max(0.0, min(100.0, keep_pct))
         masked_tasks = spec.get("masked_tasks", None)
         if masked_tasks is None:
-            if conditioning is not None and conditioning.masked_tasks:
+            if version == "structured_v2":
+                masked_tasks = list(getattr(self, "structured_refine_tasks", []))
+            elif version == "component_v3":
+                masked_tasks = [t for t in COMPONENT_STATE_TASKS if t in self.task_dict]
+            elif conditioning is not None and conditioning.masked_tasks:
                 masked_tasks = list(conditioning.masked_tasks)
             elif self.masked_tasks:
                 masked_tasks = list(self.masked_tasks)
@@ -2402,8 +2560,19 @@ class ContinualAnalysisGNN(LightningModule):
         if confidence_temperature <= 0:
             confidence_temperature = 1.0
         zero_known_start = bool(spec.get("zero_known_start", False))
+        segment_keep_ratio = float(spec.get("segment_keep_ratio", getattr(self, "structured_refine_keep_ratio", 0.35)))
+        segment_keep_ratio = max(0.0, min(1.0, segment_keep_ratio))
+        segment_confidence_min = float(
+            spec.get("segment_confidence_min", getattr(self, "structured_refine_conf_min", 0.80))
+        )
+        segment_confidence_min = max(0.0, min(1.0, segment_confidence_min))
+        boundary_threshold = float(spec.get("boundary_threshold", getattr(self, "structured_refine_boundary_max", 0.50)))
+        boundary_threshold = max(0.0, min(1.0, boundary_threshold))
+        segment_margin_min = float(spec.get("segment_margin_min", 0.10 if version == "component_v3" else 0.0))
+        segment_margin_min = max(0.0, segment_margin_min)
         return {
             "enabled": enabled and len(masked_tasks) > 0,
+            "version": version,
             "steps": steps,
             "keep_percentile_per_step": keep_pct,
             "masked_tasks": masked_tasks,
@@ -2413,6 +2582,10 @@ class ContinualAnalysisGNN(LightningModule):
             "min_remaining_targets": min_remaining_targets,
             "confidence_temperature": confidence_temperature,
             "zero_known_start": zero_known_start,
+            "segment_keep_ratio": segment_keep_ratio,
+            "segment_confidence_min": segment_confidence_min,
+            "boundary_threshold": boundary_threshold,
+            "segment_margin_min": segment_margin_min,
         }
 
     def _iterative_eval_tasks_for_available_labels(self, available_tasks: List[str]) -> List[str]:
@@ -2481,6 +2654,1129 @@ class ContinualAnalysisGNN(LightningModule):
         if used == 0:
             return torch.zeros(candidate_indices.numel(), device=candidate_indices.device)
         return conf / float(used)
+
+    def _structured_refine_tasks_for_available_labels(self, available_tasks: List[str]) -> List[str]:
+        preferred = getattr(self, "structured_refine_tasks", None) or list(DEFAULT_BEAM_TASKS)
+        tasks = [t for t in preferred if t in self.task_dict and t in available_tasks]
+        if tasks:
+            return tasks
+        return [t for t in DEFAULT_BEAM_TASKS if t in available_tasks and t in self.task_dict]
+
+    def _component_refine_tasks_for_available_labels(self, available_tasks: List[str]) -> List[str]:
+        return [t for t in COMPONENT_STATE_TASKS if t in available_tasks and t in self.task_dict]
+
+    def _aggregate_onset_labels_from_labels(
+        self,
+        *,
+        labels_dict: Dict[str, torch.Tensor],
+        batch,
+        batch_size: int,
+        tasks: List[str],
+        device: torch.device,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        onset_ids = batch["note"].onset_div[:batch_size].to(device=device, dtype=torch.long)
+        unique_onsets, inverse = torch.unique(onset_ids, sorted=True, return_inverse=True)
+        num_onsets = int(unique_onsets.numel())
+        onset_labels = {
+            task: torch.full((num_onsets,), -1, dtype=torch.long, device=device) for task in tasks
+        }
+        stable_mask = torch.ones(num_onsets, dtype=torch.bool, device=device)
+        boundary_flags = torch.zeros(num_onsets, dtype=torch.bool, device=device)
+        tpc_labels = labels_dict.get("tpc_in_label", None)
+        if tpc_labels is not None:
+            tpc_labels = tpc_labels[:batch_size].to(device=device, dtype=torch.long)
+
+        for onset_idx in range(num_onsets):
+            note_idx = torch.where(inverse == onset_idx)[0]
+            if note_idx.numel() == 0:
+                stable_mask[onset_idx] = False
+                continue
+            if "cadence" in labels_dict:
+                cadence_vals = labels_dict["cadence"][:batch_size][note_idx]
+                valid = (cadence_vals >= 0) & (cadence_vals < self.task_dict.get("cadence", 1))
+                if torch.any(valid & (cadence_vals > 0)):
+                    boundary_flags[onset_idx] = True
+            if "phrase" in labels_dict:
+                phrase_vals = labels_dict["phrase"][:batch_size][note_idx]
+                valid = (phrase_vals >= 0) & (phrase_vals < self.task_dict.get("phrase", 1))
+                if torch.any(valid & (phrase_vals > 0)):
+                    boundary_flags[onset_idx] = True
+
+            for task in tasks:
+                task_idx = note_idx
+                if task in DEFAULT_BEAM_TASKS and tpc_labels is not None:
+                    ct_idx = note_idx[tpc_labels[note_idx] == 1]
+                    if ct_idx.numel() > 0:
+                        task_idx = ct_idx
+                labels = labels_dict[task][:batch_size][task_idx].to(device=device, dtype=torch.long)
+                valid = (labels >= 0) & (labels < self.task_dict[task])
+                labels = labels[valid]
+                if labels.numel() == 0:
+                    stable_mask[onset_idx] = False
+                    onset_labels[task][onset_idx] = -1
+                    continue
+                unique_vals = torch.unique(labels)
+                if unique_vals.numel() != 1:
+                    stable_mask[onset_idx] = False
+                    onset_labels[task][onset_idx] = -1
+                    continue
+                onset_labels[task][onset_idx] = int(unique_vals[0].item())
+        return onset_labels, stable_mask, unique_onsets, inverse, boundary_flags
+
+    def _merge_onset_segments(
+        self,
+        *,
+        onset_labels: Dict[str, torch.Tensor],
+        stable_mask: torch.Tensor,
+        boundary_flags: torch.Tensor,
+        tasks: List[str],
+        onset_confidence: Optional[torch.Tensor] = None,
+    ) -> List[Dict[str, Any]]:
+        segments: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        prev_boundary = False
+        num_onsets = int(stable_mask.numel())
+        for onset_idx in range(num_onsets):
+            if not bool(stable_mask[onset_idx]):
+                if current is not None:
+                    segments.append(current)
+                    current = None
+                prev_boundary = bool(boundary_flags[onset_idx])
+                continue
+            label_ids = {task: int(onset_labels[task][onset_idx].item()) for task in tasks}
+            if any(label < 0 for label in label_ids.values()):
+                if current is not None:
+                    segments.append(current)
+                    current = None
+                prev_boundary = bool(boundary_flags[onset_idx])
+                continue
+            label_key = tuple(label_ids[task] for task in tasks)
+            conf = float(onset_confidence[onset_idx].item()) if onset_confidence is not None else 1.0
+            boundary_now = bool(boundary_flags[onset_idx])
+            if (
+                current is not None
+                and current["label_key"] == label_key
+                and not prev_boundary
+                and not boundary_now
+            ):
+                current["onset_indices"].append(int(onset_idx))
+                current["confidence_total"] += conf
+                current["boundary_max"] = max(current["boundary_max"], 1.0 if boundary_now else 0.0)
+            else:
+                if current is not None:
+                    segments.append(current)
+                current = {
+                    "label_ids": label_ids,
+                    "label_key": label_key,
+                    "onset_indices": [int(onset_idx)],
+                    "confidence_total": conf,
+                    "boundary_max": 1.0 if boundary_now else 0.0,
+                }
+            prev_boundary = boundary_now
+        if current is not None:
+            segments.append(current)
+        for segment in segments:
+            segment["length"] = int(len(segment["onset_indices"]))
+            segment["confidence"] = float(segment["confidence_total"] / max(1, segment["length"]))
+        return segments
+
+    def _select_segments_for_structured_refine(
+        self,
+        *,
+        segments: List[Dict[str, Any]],
+        total_onsets: int,
+        keep_ratio: float,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        if not segments or total_onsets <= 0 or keep_ratio <= 0:
+            return [], {"selected_onsets": 0, "selected_segments": 0, "quota": 0}
+        quota = max(1, int(math.ceil(total_onsets * float(keep_ratio))))
+        sorted_segments = sorted(
+            segments,
+            key=lambda seg: (float(seg.get("confidence", 0.0)), int(seg.get("length", 0))),
+            reverse=True,
+        )
+        selected: List[Dict[str, Any]] = []
+        covered = 0
+        for segment in sorted_segments:
+            selected.append(segment)
+            covered += int(segment.get("length", 0))
+            if covered >= quota:
+                break
+        return selected, {
+            "selected_onsets": int(covered),
+            "selected_segments": int(len(selected)),
+            "quota": int(quota),
+        }
+
+    def _build_conditioning_from_segments(
+        self,
+        *,
+        segments: List[Dict[str, Any]],
+        inverse: torch.Tensor,
+        batch_size: int,
+        total_nodes: int,
+        device: torch.device,
+        tasks: List[str],
+        base_conditioning: Optional[MaskedConditioningSpec] = None,
+    ) -> Tuple[Optional[MaskedConditioningSpec], torch.Tensor, torch.Tensor]:
+        known_labels_by_task: Dict[str, torch.Tensor] = {}
+        known_indices_by_task: Dict[str, torch.Tensor] = {}
+        context_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for task in tasks:
+            known = torch.full((total_nodes,), -1, dtype=torch.long, device=device)
+            if base_conditioning is not None and task in base_conditioning.known_labels_by_task:
+                base_known = base_conditioning.known_labels_by_task[task][:total_nodes].to(
+                    device=device, dtype=torch.long
+                )
+                valid = (base_known >= 0) & (base_known < self.task_dict[task])
+                known[valid] = base_known[valid]
+                context_mask = context_mask | valid[:batch_size]
+            known_labels_by_task[task] = known
+
+        for segment in segments:
+            onset_tensor = torch.tensor(segment["onset_indices"], dtype=torch.long, device=device)
+            note_idx = torch.where(torch.isin(inverse, onset_tensor))[0]
+            if note_idx.numel() == 0:
+                continue
+            context_mask[note_idx] = True
+            for task in tasks:
+                label = int(segment["label_ids"][task])
+                known_labels_by_task[task][note_idx] = label
+
+        for task in tasks:
+            known_indices_by_task[task] = torch.where(known_labels_by_task[task] >= 0)[0]
+
+        context_indices = torch.where(context_mask)[0]
+        if context_indices.numel() == 0:
+            return base_conditioning, torch.arange(batch_size, device=device), torch.zeros(0, dtype=torch.long, device=device)
+        target_mask = ~context_mask
+        target_indices = torch.where(target_mask)[0]
+        node_mask_batch = create_node_mask(
+            num_nodes=batch_size,
+            target_indices=target_indices if target_indices.numel() > 0 else None,
+            context_indices=context_indices,
+            context_weight=0.1,
+            device=device,
+        )
+        node_mask = torch.zeros(total_nodes, dtype=torch.float32, device=device)
+        node_mask[:batch_size] = node_mask_batch
+        conditioning = MaskedConditioningSpec(
+            node_mask=node_mask,
+            known_labels_by_task=known_labels_by_task,
+            known_indices_by_task=known_indices_by_task,
+            masked_tasks=list(tasks),
+            constraint_mode=self.constraint_mode,
+            feedback_mode=self.feedback_mode,
+        )
+        return conditioning, target_indices, context_indices
+
+    def _get_structured_refine_teacher_runtime(self):
+        teacher_ckpt = self.structured_refine_teacher_checkpoint
+        if not teacher_ckpt and self.preserve_pretrained:
+            self._ensure_preservation_teacher_ready()
+            teacher_model = self.__dict__.get("_preserve_teacher_model", None)
+            if teacher_model is not None:
+                return (
+                    teacher_model,
+                    self.__dict__.get("_preserve_teacher_musicbert_proj", None),
+                    self.__dict__.get("_preserve_teacher_musicbert_gate", None),
+                )
+
+        if (
+            teacher_ckpt
+            and self.preserve_teacher_checkpoint
+            and teacher_ckpt == self.preserve_teacher_checkpoint
+            and self.__dict__.get("_preserve_teacher_model", None) is not None
+        ):
+            return (
+                self.__dict__.get("_preserve_teacher_model", None),
+                self.__dict__.get("_preserve_teacher_musicbert_proj", None),
+                self.__dict__.get("_preserve_teacher_musicbert_gate", None),
+            )
+
+        teacher_model = self.__dict__.get("_structured_refine_teacher_model", None)
+        if teacher_model is not None:
+            return (
+                teacher_model,
+                self.__dict__.get("_structured_refine_teacher_musicbert_proj", None),
+                self.__dict__.get("_structured_refine_teacher_musicbert_gate", None),
+            )
+        if not teacher_ckpt or not os.path.exists(teacher_ckpt):
+            return (None, None, None)
+
+        teacher_model = deepcopy(self.model)
+        teacher_musicbert_proj = deepcopy(self.musicbert_proj) if self.musicbert_proj is not None else None
+        teacher_musicbert_gate = deepcopy(self.musicbert_gate) if self.musicbert_gate is not None else None
+        try:
+            checkpoint = torch.load(teacher_ckpt, map_location="cpu")
+            ckpt_state = checkpoint.get("state_dict", checkpoint)
+            model_state = self._extract_prefixed_state_dict(ckpt_state, "model.")
+            if model_state:
+                teacher_model.load_state_dict(model_state, strict=False)
+            proj_state = self._extract_prefixed_state_dict(ckpt_state, "musicbert_proj.")
+            if teacher_musicbert_proj is not None and proj_state:
+                teacher_musicbert_proj.load_state_dict(proj_state, strict=False)
+            gate_state = self._extract_prefixed_state_dict(ckpt_state, "musicbert_gate.")
+            if teacher_musicbert_gate is not None and gate_state:
+                teacher_musicbert_gate.load_state_dict(gate_state, strict=False)
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to load structured refinement teacher checkpoint '{teacher_ckpt}': {exc}.",
+                RuntimeWarning,
+            )
+            return (None, None, None)
+        self._freeze_module_inplace(teacher_model)
+        self._freeze_module_inplace(teacher_musicbert_proj)
+        self._freeze_module_inplace(teacher_musicbert_gate)
+        self.__dict__["_structured_refine_teacher_model"] = teacher_model
+        self.__dict__["_structured_refine_teacher_musicbert_proj"] = teacher_musicbert_proj
+        self.__dict__["_structured_refine_teacher_musicbert_gate"] = teacher_musicbert_gate
+        return teacher_model, teacher_musicbert_proj, teacher_musicbert_gate
+
+    def _predict_note_probs_with_structured_teacher(
+        self,
+        *,
+        batch,
+        x_dict: Dict[str, torch.Tensor],
+        batch_size: int,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        teacher_model, teacher_proj, teacher_gate = self._get_structured_refine_teacher_runtime()
+        if teacher_model is None:
+            return None
+        pitch_spelling = batch["note"].pitch_spelling
+        key_signature = batch["note"].key_signature
+        edge_index_dict = batch.edge_index_dict
+        batch_dict = batch.batch_dict
+        try:
+            neighbor_mask_node = batch.num_sampled_nodes_dict
+        except Exception:
+            neighbor_mask_node = None
+        try:
+            neighbor_mask_edge = batch.num_sampled_edges_dict
+        except Exception:
+            neighbor_mask_edge = None
+        x_teacher = dict(x_dict)
+        if self.note_encoder is not None and not self.musicbert_use_cached_embeddings:
+            note_embeddings = self._encode_notes_with_musicbert(batch)
+            note_features = x_teacher.get("note")
+            if note_features is None or self.musicbert_fusion == "replace":
+                fused = note_embeddings
+            elif self.musicbert_fusion == "concat":
+                fused = torch.cat([note_features, note_embeddings.to(note_features.dtype)], dim=-1)
+            elif self.musicbert_fusion == "gate" and teacher_proj is not None and teacher_gate is not None:
+                projected = teacher_proj(note_embeddings.to(note_features.dtype))
+                gate = teacher_gate(torch.cat([note_features, projected], dim=-1))
+                fused = gate * projected + (1.0 - gate) * note_features
+            else:
+                fused = note_embeddings
+            x_teacher["note"] = fused
+        with torch.no_grad():
+            logits_dict = teacher_model(
+                pitch_spelling=pitch_spelling,
+                key_signature=key_signature,
+                x_dict=x_teacher,
+                edge_index_dict=edge_index_dict,
+                batch_dict=batch_dict,
+                batch_size=batch_size,
+                neighbor_mask_node=neighbor_mask_node,
+                neighbor_mask_edge=neighbor_mask_edge,
+                label_context=None,
+            )
+            return {k: torch.softmax(v, dim=-1) for k, v in logits_dict.items()}
+
+    def _select_component_segments_from_probs(
+        self,
+        *,
+        source_probs: Dict[str, torch.Tensor],
+        data,
+        batch_size: int,
+        tasks: List[str],
+        keep_ratio: float,
+        confidence_min: float,
+        boundary_threshold: float,
+        margin_min: float,
+        aggregation_mode: str = "mean",
+        aggregation_bundle: Optional[PosthocAggregationBundle] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[Dict[str, Any]], Optional[torch.Tensor]]:
+        onset_probs = self._aggregate_onset_only_note_probs(
+            note_prob_dict=source_probs,
+            data=data,
+            batch_size=batch_size,
+            aggregation_mode=aggregation_mode,
+            aggregation_bundle=aggregation_bundle,
+        )
+        beam_payload = self._decode_beam_from_note_probs(
+            note_prob_dict=onset_probs,
+            data=data,
+            batch_size=batch_size,
+            enabled_override=True,
+            version_override="component_v3",
+            rescorer_path_override=self.structured_beam_rescorer_path,
+        )
+        if beam_payload is None:
+            return [], {"selected_onsets": 0, "selected_segments": 0, "quota": 0}, None, None
+
+        onset_confidence = beam_payload.get("onset_confidence", None)
+        if onset_confidence is None or not isinstance(onset_confidence, torch.Tensor):
+            onset_confidence = torch.ones(
+                beam_payload["onset_values"].numel(),
+                dtype=torch.float32,
+                device=data["note"].x.device,
+            )
+        onset_margin = beam_payload.get("onset_margin", None)
+        if onset_margin is None or not isinstance(onset_margin, torch.Tensor):
+            onset_margin = torch.zeros_like(onset_confidence)
+        boundary_flags = torch.zeros_like(onset_confidence, dtype=torch.bool)
+        for step in beam_payload.get("beam_trace", {}).get("steps", []):
+            idx = int(step.get("onset_index", -1))
+            if 0 <= idx < boundary_flags.numel():
+                boundary_flags[idx] = float(step.get("boundary_signal", 0.0)) >= float(boundary_threshold)
+        onset_labels = {
+            task: beam_payload["onset_class_ids"][task].to(device=data["note"].x.device, dtype=torch.long)
+            for task in tasks
+            if task in beam_payload.get("onset_class_ids", {})
+        }
+        if len(onset_labels) != len(tasks):
+            tasks = list(onset_labels.keys())
+        stable_mask = (onset_confidence >= float(confidence_min)) & (onset_margin >= float(margin_min))
+        segments = self._merge_onset_segments(
+            onset_labels=onset_labels,
+            stable_mask=stable_mask,
+            boundary_flags=boundary_flags,
+            tasks=tasks,
+            onset_confidence=onset_confidence,
+        )
+        selected_segments, segment_trace = self._select_segments_for_structured_refine(
+            segments=segments,
+            total_onsets=int(onset_confidence.numel()),
+            keep_ratio=keep_ratio,
+        )
+        segment_trace["selected_confident_onsets"] = int(stable_mask.sum().item())
+        segment_trace["margin_min"] = float(margin_min)
+        return selected_segments, segment_trace, beam_payload, onset_margin
+
+    def _component_refine_v3(
+        self,
+        data,
+        batch_size: int,
+        base_conditioning: Optional[MaskedConditioningSpec],
+        overrides: Optional[Dict[str, Dict[str, torch.Tensor]]],
+        iterative_cfg: Dict[str, Any],
+        x_dict_override: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any], torch.Tensor]:
+        tasks = [t for t in iterative_cfg.get("masked_tasks", []) if t in self.task_dict]
+        if not tasks:
+            base_probs = self._predict_note_probs_once(
+                data=data,
+                batch_size=batch_size,
+                conditioning=base_conditioning,
+                overrides=overrides,
+                x_dict_override=x_dict_override if x_dict_override is not None else dict(data.x_dict),
+            )
+            return base_probs, {"enabled": False, "version": "component_v3", "reason": "no tasks"}, torch.arange(batch_size, device=data["note"].x.device)
+
+        if x_dict_override is None:
+            x_dict_override = dict(data.x_dict)
+        current_probs = self._predict_note_probs_once(
+            data=data,
+            batch_size=batch_size,
+            conditioning=base_conditioning,
+            overrides=overrides,
+            x_dict_override=x_dict_override,
+        )
+        if not iterative_cfg.get("enabled", False):
+            return current_probs, {"enabled": False, "version": "component_v3"}, torch.arange(batch_size, device=data["note"].x.device)
+
+        agg_mode, agg_bundle = self._resolve_aggregation_runtime(aggregation_spec=None)
+        trace_steps: List[Dict[str, Any]] = []
+        total_nodes = int(data["note"].x.size(0))
+        remaining_target_idx = torch.arange(batch_size, device=data["note"].x.device)
+        frozen_context_idx = torch.zeros(0, dtype=torch.long, device=data["note"].x.device)
+
+        num_passes = max(1, int(iterative_cfg.get("steps", 3)))
+        for pass_idx in range(num_passes - 1):
+            selected_segments, segment_trace, beam_payload, onset_margin = self._select_component_segments_from_probs(
+                source_probs=current_probs,
+                data=data,
+                batch_size=batch_size,
+                tasks=tasks,
+                keep_ratio=float(iterative_cfg.get("segment_keep_ratio", self.structured_refine_keep_ratio)),
+                confidence_min=float(iterative_cfg.get("segment_confidence_min", self.structured_refine_conf_min)),
+                boundary_threshold=float(iterative_cfg.get("boundary_threshold", self.structured_refine_boundary_max)),
+                margin_min=float(iterative_cfg.get("segment_margin_min", 0.10)),
+                aggregation_mode=agg_mode,
+                aggregation_bundle=agg_bundle,
+            )
+            if beam_payload is None or not selected_segments:
+                trace_steps.append(
+                    {
+                        "pass_index": int(pass_idx),
+                        "selected_segments": 0,
+                        "reason": "no stable component segments",
+                    }
+                )
+                break
+            conditioning_pass2, remaining_target_idx, frozen_context_idx = self._build_conditioning_from_segments(
+                segments=selected_segments,
+                inverse=beam_payload["note_inverse"].to(device=data["note"].x.device, dtype=torch.long),
+                batch_size=batch_size,
+                total_nodes=total_nodes,
+                device=data["note"].x.device,
+                tasks=tasks,
+                base_conditioning=(None if iterative_cfg.get("zero_known_start", False) else base_conditioning),
+            )
+            if conditioning_pass2 is None:
+                trace_steps.append(
+                    {
+                        "pass_index": int(pass_idx),
+                        "selected_segments": 0,
+                        "reason": "conditioning empty",
+                    }
+                )
+                break
+            current_probs = self._predict_note_probs_once(
+                data=data,
+                batch_size=batch_size,
+                conditioning=conditioning_pass2,
+                overrides=overrides,
+                x_dict_override=x_dict_override,
+            )
+            trace_steps.append(
+                {
+                    "pass_index": int(pass_idx),
+                    "selected_segments": int(len(selected_segments)),
+                    "num_remaining_targets": int(remaining_target_idx.numel()),
+                    "num_frozen_notes": int(frozen_context_idx.numel()),
+                    "segments": segment_trace,
+                    "beam_trace": beam_payload.get("beam_trace", {}),
+                    "onset_margin_mean": float(onset_margin.mean().item()) if onset_margin is not None and onset_margin.numel() > 0 else 0.0,
+                }
+            )
+        return current_probs, {
+            "enabled": True,
+            "version": "component_v3",
+            "passes": trace_steps,
+            "num_frozen_notes": int(frozen_context_idx.numel()),
+            "num_remaining_targets": int(remaining_target_idx.numel()),
+        }, remaining_target_idx
+
+    def _structured_refine_v2(
+        self,
+        data,
+        batch_size: int,
+        base_conditioning: Optional[MaskedConditioningSpec],
+        overrides: Optional[Dict[str, Dict[str, torch.Tensor]]],
+        iterative_cfg: Dict[str, Any],
+        x_dict_override: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any], torch.Tensor]:
+        tasks = [t for t in iterative_cfg.get("masked_tasks", []) if t in self.task_dict]
+        if not tasks:
+            base_probs = self._predict_note_probs_once(
+                data=data,
+                batch_size=batch_size,
+                conditioning=base_conditioning,
+                overrides=overrides,
+                x_dict_override=x_dict_override if x_dict_override is not None else dict(data.x_dict),
+            )
+            return base_probs, {"enabled": False, "version": "structured_v2", "reason": "no tasks"}, torch.zeros(0, dtype=torch.long, device=data["note"].x.device)
+        total_nodes = int(data["note"].x.size(0))
+        if x_dict_override is None:
+            x_dict_override = dict(data.x_dict)
+        base_probs = self._predict_note_probs_once(
+            data=data,
+            batch_size=batch_size,
+            conditioning=base_conditioning,
+            overrides=overrides,
+            x_dict_override=x_dict_override,
+        )
+        if not iterative_cfg.get("enabled", False):
+            return base_probs, {"enabled": False, "version": "structured_v2"}, torch.arange(batch_size, device=data["note"].x.device)
+
+        agg_mode, agg_bundle = self._resolve_aggregation_runtime(aggregation_spec=None)
+        onset_probs = self._aggregate_onset_only_note_probs(
+            note_prob_dict=base_probs,
+            data=data,
+            batch_size=batch_size,
+            aggregation_mode=agg_mode,
+            aggregation_bundle=agg_bundle,
+        )
+        beam_payload = self._decode_beam_from_note_probs(
+            note_prob_dict=onset_probs,
+            data=data,
+            batch_size=batch_size,
+            enabled_override=True,
+            version_override="structured_v2",
+            rescorer_path_override=self.structured_beam_rescorer_path,
+        )
+        if beam_payload is None:
+            return base_probs, {"enabled": True, "version": "structured_v2", "reason": "beam decode failed"}, torch.arange(batch_size, device=data["note"].x.device)
+
+        onset_confidence = beam_payload.get("onset_confidence", None)
+        if onset_confidence is None or not isinstance(onset_confidence, torch.Tensor):
+            onset_confidence = torch.ones(
+                beam_payload["onset_values"].numel(),
+                dtype=torch.float32,
+                device=data["note"].x.device,
+            )
+        boundary_flags = torch.zeros_like(onset_confidence, dtype=torch.bool)
+        for step in beam_payload.get("beam_trace", {}).get("steps", []):
+            idx = int(step.get("onset_index", -1))
+            if 0 <= idx < boundary_flags.numel():
+                boundary_flags[idx] = float(step.get("boundary_signal", 0.0)) >= float(
+                    iterative_cfg.get("boundary_threshold", self.structured_refine_boundary_max)
+                )
+        onset_labels = {
+            task: beam_payload["onset_class_ids"][task].to(device=data["note"].x.device, dtype=torch.long)
+            for task in tasks
+            if task in beam_payload.get("onset_class_ids", {})
+        }
+        if len(onset_labels) != len(tasks):
+            tasks = list(onset_labels.keys())
+        stable_mask = onset_confidence >= float(
+            iterative_cfg.get("segment_confidence_min", self.structured_refine_conf_min)
+        )
+        segments = self._merge_onset_segments(
+            onset_labels=onset_labels,
+            stable_mask=stable_mask,
+            boundary_flags=boundary_flags,
+            tasks=tasks,
+            onset_confidence=onset_confidence,
+        )
+        selected_segments, segment_trace = self._select_segments_for_structured_refine(
+            segments=segments,
+            total_onsets=int(onset_confidence.numel()),
+            keep_ratio=float(iterative_cfg.get("segment_keep_ratio", self.structured_refine_keep_ratio)),
+        )
+        conditioning_pass2, remaining_target_idx, frozen_context_idx = self._build_conditioning_from_segments(
+            segments=selected_segments,
+            inverse=beam_payload["note_inverse"].to(device=data["note"].x.device, dtype=torch.long),
+            batch_size=batch_size,
+            total_nodes=total_nodes,
+            device=data["note"].x.device,
+            tasks=tasks,
+            base_conditioning=(None if iterative_cfg.get("zero_known_start", False) else base_conditioning),
+        )
+        if conditioning_pass2 is None:
+            trace = {
+                "enabled": True,
+                "version": "structured_v2",
+                "beam_trace": beam_payload.get("beam_trace", {}),
+                "segments": segment_trace,
+                "reason": "no stable segments selected",
+            }
+            return base_probs, trace, torch.arange(batch_size, device=data["note"].x.device)
+        refined_probs = self._predict_note_probs_once(
+            data=data,
+            batch_size=batch_size,
+            conditioning=conditioning_pass2,
+            overrides=overrides,
+            x_dict_override=x_dict_override,
+        )
+        if iterative_cfg.get("target_only_update", False):
+            refined_probs = self._merge_target_only_predictions(
+                base_predictions=base_probs,
+                refined_predictions=refined_probs,
+                target_indices=remaining_target_idx,
+                tasks=tasks,
+            )
+        trace = {
+            "enabled": True,
+            "version": "structured_v2",
+            "beam_trace": beam_payload.get("beam_trace", {}),
+            "segments": segment_trace,
+            "num_frozen_notes": int(frozen_context_idx.numel()),
+            "num_remaining_targets": int(remaining_target_idx.numel()),
+        }
+        return refined_probs, trace, remaining_target_idx
+
+    def _structured_refine_training_losses(
+        self,
+        *,
+        batch,
+        x_dict: Dict[str, torch.Tensor],
+        batch_size: int,
+        total_nodes: int,
+        labels_dict: Dict[str, torch.Tensor],
+        labels_full: Dict[str, torch.Tensor],
+        mask_dict: Dict[str, torch.Tensor],
+        valid_label_mask: torch.Tensor,
+        logits_base: Dict[str, torch.Tensor],
+        logits_full_base: Optional[Dict[str, torch.Tensor]],
+        pitch_spelling: torch.Tensor,
+        key_signature: torch.Tensor,
+        edge_index_dict: Dict[Any, torch.Tensor],
+        batch_dict: Dict[str, torch.Tensor],
+        num_sampled_nodes_dict: Optional[Dict[str, torch.Tensor]],
+        num_sampled_edges_dict: Optional[Dict[str, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        zero = torch.tensor(0.0, device=x_dict["note"].device)
+        tasks = self._structured_refine_tasks_for_available_labels(list(labels_dict.keys()))
+        if not tasks:
+            return zero, {}
+
+        keep_ratio_sched = self._iterative_curriculum_value(
+            self.iterative_train_keep_ratio_start,
+            self.iterative_train_keep_ratio_end,
+            0,
+        )
+        keep_ratio_sched = max(float(self.structured_refine_keep_ratio), keep_ratio_sched)
+        pass2_weight_sched = self._iterative_curriculum_value(
+            self.iterative_train_pass2_weight_start,
+            self.iterative_train_pass2_weight_end,
+            0,
+        )
+        epoch = int(self.current_epoch)
+        if epoch < int(self.structured_refine_oracle_epochs):
+            stage = "oracle"
+        elif epoch < int(self.structured_refine_teacher_epochs):
+            stage = "teacher"
+        else:
+            stage = "self"
+        self.log("train/structured_refine_stage", float({"oracle": 0.0, "teacher": 1.0, "self": 2.0}[stage]), prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log("train/structured_refine_keep_ratio", keep_ratio_sched, prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log("train/structured_refine_pass2_weight", pass2_weight_sched, prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size)
+
+        inverse: Optional[torch.Tensor] = None
+        selected_segments: List[Dict[str, Any]] = []
+        if stage == "oracle":
+            onset_labels, stable_mask, _, inverse, boundary_flags = self._aggregate_onset_labels_from_labels(
+                labels_dict=labels_full,
+                batch=batch,
+                batch_size=batch_size,
+                tasks=tasks,
+                device=x_dict["note"].device,
+            )
+            segments = self._merge_onset_segments(
+                onset_labels=onset_labels,
+                stable_mask=stable_mask,
+                boundary_flags=boundary_flags,
+                tasks=tasks,
+                onset_confidence=None,
+            )
+            selected_segments, _ = self._select_segments_for_structured_refine(
+                segments=segments,
+                total_onsets=int(stable_mask.numel()),
+                keep_ratio=keep_ratio_sched,
+            )
+        else:
+            source_note_probs = None
+            if stage == "teacher":
+                source_note_probs = self._predict_note_probs_with_structured_teacher(
+                    batch=batch,
+                    x_dict=x_dict,
+                    batch_size=batch_size,
+                )
+            if source_note_probs is None:
+                stage = "self"
+                if logits_full_base is not None:
+                    source_note_probs = {
+                        task: torch.softmax(task_logits.detach(), dim=-1)
+                        for task, task_logits in logits_full_base.items()
+                    }
+                else:
+                    with torch.no_grad():
+                        source_note_probs = self._predict_note_probs_once(
+                            data=batch,
+                            batch_size=batch_size,
+                            conditioning=None,
+                            overrides=None,
+                            x_dict_override=x_dict,
+                            neighbor_mask_node=num_sampled_nodes_dict,
+                            neighbor_mask_edge=num_sampled_edges_dict,
+                        )
+            with torch.no_grad():
+                onset_source_probs = self._aggregate_onset_only_note_probs(
+                    note_prob_dict=source_note_probs,
+                    data=batch,
+                    batch_size=batch_size,
+                    aggregation_mode="mean",
+                    aggregation_bundle=None,
+                )
+                beam_payload = self._decode_beam_from_note_probs(
+                    note_prob_dict=onset_source_probs,
+                    data=batch,
+                    batch_size=batch_size,
+                    enabled_override=True,
+                    version_override="structured_v2",
+                    rescorer_path_override=self.structured_beam_rescorer_path,
+                )
+            if beam_payload is not None:
+                inverse = beam_payload["note_inverse"].to(device=x_dict["note"].device, dtype=torch.long)
+                onset_confidence = beam_payload.get("onset_confidence", None)
+                if onset_confidence is None or not isinstance(onset_confidence, torch.Tensor):
+                    onset_confidence = torch.ones(
+                        beam_payload["onset_values"].numel(),
+                        dtype=torch.float32,
+                        device=x_dict["note"].device,
+                    )
+                onset_labels = {
+                    task: beam_payload["onset_class_ids"][task].to(
+                        device=x_dict["note"].device, dtype=torch.long
+                    )
+                    for task in tasks
+                    if task in beam_payload.get("onset_class_ids", {})
+                }
+                boundary_flags = torch.zeros_like(onset_confidence, dtype=torch.bool)
+                for step in beam_payload.get("beam_trace", {}).get("steps", []):
+                    idx = int(step.get("onset_index", -1))
+                    if 0 <= idx < boundary_flags.numel():
+                        boundary_flags[idx] = float(step.get("boundary_signal", 0.0)) >= float(
+                            self.structured_refine_boundary_max
+                        )
+                stable_mask = onset_confidence >= float(self.structured_refine_conf_min)
+                segments = self._merge_onset_segments(
+                    onset_labels=onset_labels,
+                    stable_mask=stable_mask,
+                    boundary_flags=boundary_flags,
+                    tasks=list(onset_labels.keys()),
+                    onset_confidence=onset_confidence,
+                )
+                selected_segments, _ = self._select_segments_for_structured_refine(
+                    segments=segments,
+                    total_onsets=int(onset_confidence.numel()),
+                    keep_ratio=keep_ratio_sched,
+                )
+
+        self.log(
+            "train/structured_refine_selected_segments",
+            float(len(selected_segments)),
+            prog_bar=False,
+            batch_size=batch_size,
+        )
+        if inverse is None or not selected_segments:
+            return zero, {}
+
+        conditioning_pass2, remaining_target_idx, frozen_context_idx = self._build_conditioning_from_segments(
+            segments=selected_segments,
+            inverse=inverse,
+            batch_size=batch_size,
+            total_nodes=total_nodes,
+            device=x_dict["note"].device,
+            tasks=tasks,
+            base_conditioning=None,
+        )
+        self.log(
+            "train/structured_refine_frozen_nodes",
+            float(frozen_context_idx.numel()),
+            prog_bar=False,
+            batch_size=batch_size,
+        )
+        if conditioning_pass2 is None or remaining_target_idx.numel() == 0:
+            return zero, {}
+
+        label_context_pass2 = self._build_model_label_context(
+            conditioning=conditioning_pass2,
+            num_nodes=total_nodes,
+            dtype=x_dict["note"].dtype,
+            device=x_dict["note"].device,
+        )
+        x_pass2 = self.model.encode(
+            pitch_spelling=pitch_spelling,
+            key_signature=key_signature,
+            x_dict=x_dict,
+            edge_index_dict=edge_index_dict,
+            batch_dict=batch_dict,
+            batch_size=batch_size,
+            neighbor_mask_node=num_sampled_nodes_dict,
+            neighbor_mask_edge=num_sampled_edges_dict,
+            label_context=label_context_pass2,
+        )
+        x_pass2 = x_pass2[valid_label_mask]
+        logits_pass2_pre = self.model.forward_clf(x_pass2)
+        logits_pass2 = {k: logits_pass2_pre[k][mask_dict[k]] for k in labels_dict.keys()}
+
+        node_mask_pass2_batch = conditioning_pass2.node_mask[:batch_size].to(device=x_dict["note"].device, dtype=torch.float32)
+        node_mask_pass2_valid = node_mask_pass2_batch[valid_label_mask]
+        raw_task_node_masks_pass2 = {}
+        task_loss_masks_pass2 = {}
+        for task in labels_dict.keys():
+            raw_task_mask = node_mask_pass2_valid[mask_dict[task]]
+            raw_task_node_masks_pass2[task] = raw_task_mask
+            if task in tasks:
+                task_loss_masks_pass2[task] = torch.where(
+                    raw_task_mask > 0.9,
+                    torch.ones_like(raw_task_mask),
+                    torch.zeros_like(raw_task_mask),
+                )
+            else:
+                task_loss_masks_pass2[task] = raw_task_mask
+        if self.constraint_mode == "hard":
+            for task in labels_dict.keys():
+                _, context_indices, _ = split_nodes_by_mask(raw_task_node_masks_pass2[task])
+                if context_indices.numel() == 0:
+                    continue
+                valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                context_indices = context_indices[valid_context]
+                if context_indices.numel() == 0:
+                    continue
+                logits_pass2[task] = clamp_logits_to_labels(
+                    logits_pass2[task],
+                    labels_dict[task],
+                    context_indices,
+                    num_classes=self.task_dict.get(task),
+                )
+
+        loss_dict_pass2 = self.clf_loss(logits_pass2, labels_dict, node_mask=task_loss_masks_pass2)
+        pass2_losses = {task: loss_dict_pass2[task] for task in labels_dict.keys() if task in loss_dict_pass2}
+        structured_pass2_terms = [pass2_losses[task] for task in tasks if task in pass2_losses]
+        if not structured_pass2_terms:
+            return zero, {}
+
+        pass2_loss = torch.stack(structured_pass2_terms).mean()
+        extra_total = pass2_weight_sched * pass2_loss
+        task_deltas = {
+            task: pass2_weight_sched * pass2_losses[task]
+            for task in tasks
+            if task in pass2_losses
+        }
+        self.log("train/structured_refine_pass2_loss", pass2_loss, prog_bar=False, batch_size=batch_size)
+
+        consistency_loss = zero
+        if self.iterative_train_consistency_lambda > 0 and frozen_context_idx.numel() > 0:
+            valid_global_idx = torch.where(valid_label_mask)[0]
+            global_to_valid = torch.full((batch_size,), -1, dtype=torch.long, device=x_dict["note"].device)
+            global_to_valid[valid_global_idx] = torch.arange(valid_global_idx.numel(), device=x_dict["note"].device)
+            frozen_valid = global_to_valid[frozen_context_idx]
+            frozen_valid = frozen_valid[frozen_valid >= 0]
+            for task in tasks:
+                task_valid_positions = torch.where(mask_dict[task])[0]
+                inv_map = torch.full((mask_dict[task].numel(),), -1, dtype=torch.long, device=x_dict["note"].device)
+                inv_map[task_valid_positions] = torch.arange(task_valid_positions.numel(), device=x_dict["note"].device)
+                frozen_task_idx = inv_map[frozen_valid]
+                frozen_task_idx = frozen_task_idx[frozen_task_idx >= 0]
+                if frozen_task_idx.numel() == 0:
+                    continue
+                p1 = torch.softmax(logits_base[task][frozen_task_idx], dim=-1)
+                p2 = torch.softmax(logits_pass2[task][frozen_task_idx], dim=-1)
+                consistency_loss = consistency_loss + F.kl_div(
+                    torch.log(torch.clamp(p2, min=1e-8)),
+                    p1.detach(),
+                    reduction="batchmean",
+                )
+            if float(consistency_loss.detach().item()) > 0:
+                consistency_loss = consistency_loss / max(1, len(tasks))
+                extra_total = extra_total + self.iterative_train_consistency_lambda * consistency_loss
+                self.log("train/structured_refine_consistency_loss", consistency_loss, prog_bar=False, batch_size=batch_size)
+
+        segment_consistency = zero
+        valid_global_idx = torch.where(valid_label_mask)[0]
+        global_to_valid = torch.full((batch_size,), -1, dtype=torch.long, device=x_dict["note"].device)
+        global_to_valid[valid_global_idx] = torch.arange(valid_global_idx.numel(), device=x_dict["note"].device)
+        for segment in selected_segments:
+            onset_tensor = torch.tensor(segment["onset_indices"], dtype=torch.long, device=x_dict["note"].device)
+            note_idx = torch.where(torch.isin(inverse, onset_tensor))[0]
+            note_valid = global_to_valid[note_idx]
+            note_valid = note_valid[note_valid >= 0]
+            if note_valid.numel() < 2:
+                continue
+            for task in tasks:
+                task_valid_positions = torch.where(mask_dict[task])[0]
+                inv_map = torch.full((mask_dict[task].numel(),), -1, dtype=torch.long, device=x_dict["note"].device)
+                inv_map[task_valid_positions] = torch.arange(task_valid_positions.numel(), device=x_dict["note"].device)
+                seg_task_idx = inv_map[note_valid]
+                seg_task_idx = seg_task_idx[seg_task_idx >= 0]
+                if seg_task_idx.numel() < 2:
+                    continue
+                seg_probs = torch.softmax(logits_pass2[task][seg_task_idx], dim=-1)
+                seg_mean = seg_probs.mean(dim=0, keepdim=True)
+                segment_consistency = segment_consistency + F.mse_loss(
+                    seg_probs,
+                    seg_mean.expand_as(seg_probs),
+                )
+        if float(segment_consistency.detach().item()) > 0:
+            segment_consistency = segment_consistency / max(1, len(selected_segments) * max(1, len(tasks)))
+            extra_total = extra_total + self.structured_refine_consistency_lambda * segment_consistency
+            self.log("train/structured_refine_segment_loss", segment_consistency, prog_bar=False, batch_size=batch_size)
+        return extra_total, task_deltas
+
+    def _component_refine_training_losses(
+        self,
+        *,
+        batch,
+        x_dict: Dict[str, torch.Tensor],
+        batch_size: int,
+        total_nodes: int,
+        labels_dict: Dict[str, torch.Tensor],
+        labels_full: Dict[str, torch.Tensor],
+        mask_dict: Dict[str, torch.Tensor],
+        valid_label_mask: torch.Tensor,
+        logits_base: Dict[str, torch.Tensor],
+        logits_full_base: Optional[Dict[str, torch.Tensor]],
+        pitch_spelling: torch.Tensor,
+        key_signature: torch.Tensor,
+        edge_index_dict: Dict[Any, torch.Tensor],
+        batch_dict: Dict[str, torch.Tensor],
+        num_sampled_nodes_dict: Optional[Dict[str, torch.Tensor]],
+        num_sampled_edges_dict: Optional[Dict[str, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        zero = torch.tensor(0.0, device=x_dict["note"].device)
+        tasks = self._component_refine_tasks_for_available_labels(list(labels_dict.keys()))
+        if not tasks:
+            return zero, {}
+
+        keep_ratio_sched = 0.25
+        pass2_weight_sched = self._iterative_curriculum_value(0.5, 1.0, 0)
+        epoch = int(self.current_epoch)
+        if epoch < int(self.structured_refine_oracle_epochs):
+            stage = "oracle"
+        elif epoch < int(self.structured_refine_teacher_epochs):
+            stage = "teacher"
+        else:
+            stage = "self"
+        self.log("train/component_refine_stage", float({"oracle": 0.0, "teacher": 1.0, "self": 2.0}[stage]), prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log("train/component_refine_keep_ratio", keep_ratio_sched, prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log("train/component_refine_pass2_weight", pass2_weight_sched, prog_bar=False, on_step=False, on_epoch=True, batch_size=batch_size)
+
+        inverse: Optional[torch.Tensor] = None
+        selected_segments: List[Dict[str, Any]] = []
+        if stage == "oracle":
+            onset_labels, stable_mask, _, inverse, boundary_flags = self._aggregate_onset_labels_from_labels(
+                labels_dict=labels_full,
+                batch=batch,
+                batch_size=batch_size,
+                tasks=tasks,
+                device=x_dict["note"].device,
+            )
+            segments = self._merge_onset_segments(
+                onset_labels=onset_labels,
+                stable_mask=stable_mask,
+                boundary_flags=boundary_flags,
+                tasks=tasks,
+                onset_confidence=None,
+            )
+            selected_segments, _ = self._select_segments_for_structured_refine(
+                segments=segments,
+                total_onsets=int(stable_mask.numel()),
+                keep_ratio=keep_ratio_sched,
+            )
+        else:
+            source_note_probs: Optional[Dict[str, torch.Tensor]] = None
+            if stage == "teacher":
+                source_note_probs = self._predict_note_probs_with_structured_teacher(
+                    batch=batch,
+                    x_dict=x_dict,
+                    batch_size=batch_size,
+                )
+            if source_note_probs is None:
+                stage = "self"
+                if logits_full_base is not None:
+                    source_note_probs = {
+                        task: torch.softmax(task_logits.detach(), dim=-1)
+                        for task, task_logits in logits_full_base.items()
+                    }
+                else:
+                    with torch.no_grad():
+                        source_note_probs = self._predict_note_probs_once(
+                            data=batch,
+                            batch_size=batch_size,
+                            conditioning=None,
+                            overrides=None,
+                            x_dict_override=x_dict,
+                            neighbor_mask_node=num_sampled_nodes_dict,
+                            neighbor_mask_edge=num_sampled_edges_dict,
+                        )
+            with torch.no_grad():
+                selected_segments, _, beam_payload, _ = self._select_component_segments_from_probs(
+                    source_probs=source_note_probs,
+                    data=batch,
+                    batch_size=batch_size,
+                    tasks=tasks,
+                    keep_ratio=keep_ratio_sched,
+                    confidence_min=max(0.75, float(self.structured_refine_conf_min)),
+                    boundary_threshold=float(self.structured_refine_boundary_max),
+                    margin_min=0.10,
+                    aggregation_mode="mean",
+                    aggregation_bundle=None,
+                )
+            if beam_payload is not None:
+                inverse = beam_payload["note_inverse"].to(device=x_dict["note"].device, dtype=torch.long)
+
+        self.log("train/component_refine_selected_segments", float(len(selected_segments)), prog_bar=False, batch_size=batch_size)
+        if inverse is None or not selected_segments:
+            return zero, {}
+
+        conditioning_pass2, remaining_target_idx, frozen_context_idx = self._build_conditioning_from_segments(
+            segments=selected_segments,
+            inverse=inverse,
+            batch_size=batch_size,
+            total_nodes=total_nodes,
+            device=x_dict["note"].device,
+            tasks=tasks,
+            base_conditioning=None,
+        )
+        self.log("train/component_refine_frozen_nodes", float(frozen_context_idx.numel()), prog_bar=False, batch_size=batch_size)
+        if conditioning_pass2 is None:
+            return zero, {}
+
+        label_context_pass2 = self._build_model_label_context(
+            conditioning=conditioning_pass2,
+            num_nodes=total_nodes,
+            dtype=x_dict["note"].dtype,
+            device=x_dict["note"].device,
+        )
+        x_pass2 = self.model.encode(
+            pitch_spelling=pitch_spelling,
+            key_signature=key_signature,
+            x_dict=x_dict,
+            edge_index_dict=edge_index_dict,
+            batch_dict=batch_dict,
+            batch_size=batch_size,
+            neighbor_mask_node=num_sampled_nodes_dict,
+            neighbor_mask_edge=num_sampled_edges_dict,
+            label_context=label_context_pass2,
+        )
+        x_pass2 = x_pass2[valid_label_mask]
+        logits_pass2_pre = self.model.forward_clf(x_pass2)
+        logits_pass2 = {k: logits_pass2_pre[k][mask_dict[k]] for k in labels_dict.keys()}
+
+        task_loss_masks_pass2: Dict[str, torch.Tensor] = {}
+        for task in labels_dict.keys():
+            if task in tasks:
+                task_loss_masks_pass2[task] = torch.ones_like(labels_dict[task], dtype=torch.float32)
+            else:
+                task_loss_masks_pass2[task] = torch.zeros_like(labels_dict[task], dtype=torch.float32)
+
+        loss_dict_pass2 = self.clf_loss(logits_pass2, labels_dict, node_mask=task_loss_masks_pass2)
+        pass2_losses = {task: loss_dict_pass2[task] for task in tasks if task in loss_dict_pass2}
+        if not pass2_losses:
+            return zero, {}
+        pass2_loss = torch.stack(list(pass2_losses.values())).mean()
+        extra_total = pass2_weight_sched * pass2_loss
+        self.log("train/component_refine_pass2_loss", pass2_loss, prog_bar=False, batch_size=batch_size)
+
+        task_deltas = {
+            task: pass2_weight_sched * pass2_losses[task]
+            for task in tasks
+        }
+        consistency_loss = zero
+        if self.iterative_train_consistency_lambda > 0 and frozen_context_idx.numel() > 0:
+            valid_global_idx = torch.where(valid_label_mask)[0]
+            global_to_valid = torch.full((batch_size,), -1, dtype=torch.long, device=x_dict["note"].device)
+            global_to_valid[valid_global_idx] = torch.arange(valid_global_idx.numel(), device=x_dict["note"].device)
+            frozen_valid = global_to_valid[frozen_context_idx]
+            frozen_valid = frozen_valid[frozen_valid >= 0]
+            for task in tasks:
+                task_valid_positions = torch.where(mask_dict[task])[0]
+                inv_map = torch.full((mask_dict[task].numel(),), -1, dtype=torch.long, device=x_dict["note"].device)
+                inv_map[task_valid_positions] = torch.arange(task_valid_positions.numel(), device=x_dict["note"].device)
+                frozen_task_idx = inv_map[frozen_valid]
+                frozen_task_idx = frozen_task_idx[frozen_task_idx >= 0]
+                if frozen_task_idx.numel() == 0:
+                    continue
+                p1 = torch.softmax(logits_base[task][frozen_task_idx], dim=-1)
+                p2 = torch.softmax(logits_pass2[task][frozen_task_idx], dim=-1)
+                consistency_loss = consistency_loss + F.kl_div(
+                    torch.log(torch.clamp(p2, min=1e-8)),
+                    p1.detach(),
+                    reduction="batchmean",
+                )
+            if float(consistency_loss.detach().item()) > 0:
+                consistency_loss = consistency_loss / max(1, len(tasks))
+                extra_total = extra_total + self.iterative_train_consistency_lambda * consistency_loss
+                self.log("train/component_refine_consistency_loss", consistency_loss, prog_bar=False, batch_size=batch_size)
+
+        return extra_total, task_deltas
 
     def _iterative_masked_refinement(
         self,
@@ -3027,6 +4323,7 @@ class ContinualAnalysisGNN(LightningModule):
         labels_valid = {k: v[valid_label_mask] for k, v in labels_dict.items()}
         mask_valid = {k: v[valid_label_mask] for k, v in mask_dict.items()}
         node_mask_valid = node_mask[valid_label_mask] if node_mask is not None else None
+        labels_full = {k: v.clone() for k, v in labels_dict.items()}
         labels_dict = {}
         mask_dict = {}
         for task, values in labels_valid.items():
@@ -3050,7 +4347,7 @@ class ContinualAnalysisGNN(LightningModule):
             }
             return {}, zero, zero, zero, preserve_zero
 
-        x = self.model.encode(
+        x_full = self.model.encode(
             pitch_spelling=pitch_spelling,
             key_signature=key_signature,
             x_dict=x_dict,
@@ -3061,9 +4358,9 @@ class ContinualAnalysisGNN(LightningModule):
             neighbor_mask_edge=num_sampled_edges_dict,
             label_context=label_context,
         )
-        feature_loss = x.pow(2).mean()
+        feature_loss = x_full.pow(2).mean()
 
-        edge_loss = torch.tensor(0.0, device=x.device)
+        edge_loss = torch.tensor(0.0, device=x_full.device)
         rna_keys = ["quality", "inversion", "degree1", "degree2", "localkey"]
         if self.use_edge_loss and all(rna_key in labels_dict.keys() for rna_key in rna_keys):
             target_edge_index_dict = {
@@ -3077,8 +4374,8 @@ class ContinualAnalysisGNN(LightningModule):
                 else:
                     target_edge_index_dict[k] = v
 
-            ground_truth_same_label_edge_dict = {
-                k: torch.zeros(v.shape[-1], device=x.device) for k, v in target_edge_index_dict.items()
+                ground_truth_same_label_edge_dict = {
+                k: torch.zeros(v.shape[-1], device=x_full.device) for k, v in target_edge_index_dict.items()
             }
             for k, v in target_edge_index_dict.items():
                 if k[0] == "note" and k[-1] == "note":
@@ -3086,14 +4383,15 @@ class ContinualAnalysisGNN(LightningModule):
                     tgt_labels = torch.stack([labels_dict[rna_key][v[1]] for rna_key in rna_keys], dim=1)
                     same_label_mask = (src_labels == tgt_labels).all(dim=1)
                     ground_truth_same_label_edge_dict[k] = same_label_mask.long()
-            edge_logits_dict = self.edge_clf(target_edge_index_dict, x)
+            edge_logits_dict = self.edge_clf(target_edge_index_dict, x_full)
             edge_loss = torch.tensor(0.0, device=self.device)
             for k, v in edge_logits_dict.items():
                 if k in ground_truth_same_label_edge_dict.keys():
                     edge_loss += self.edge_loss(v, ground_truth_same_label_edge_dict[k])
             edge_loss /= len(edge_logits_dict.keys())
 
-        x = x[valid_label_mask]
+        logits_pre_full = self.model.forward_clf(x_full)
+        x = x_full[valid_label_mask]
 
         if "cadence" in labels_dict.keys() and len(labels_dict.keys()) == 1 and self.use_smote:
             y = labels_dict["cadence"]
@@ -3105,7 +4403,10 @@ class ContinualAnalysisGNN(LightningModule):
             if node_mask_valid is not None:
                 node_mask_valid = torch.ones_like(y_over, dtype=torch.float32)
 
-        logits_pre_mask = self.model.forward_clf(x)
+        logits_pre_mask = {
+            k: v[valid_label_mask]
+            for k, v in logits_pre_full.items()
+        }
         logits_dict = {k: logits_pre_mask[k][mask_dict[k]] for k in labels_dict.keys()}
         logits_for_preserve = {k: v for k, v in logits_dict.items()}
 
@@ -3161,6 +4462,49 @@ class ContinualAnalysisGNN(LightningModule):
         loss_dict = self.clf_loss(logits_dict, labels_dict, node_mask=node_mask_for_loss)
         task_losses = {k: loss_dict[k] for k in labels_dict.keys()}
         total_task_loss = loss_dict["total"] / len(labels_dict.keys())
+        if self.structured_refine_train and not force_unmasked_batch:
+            if self._structured_decoder_version() == "component_v3":
+                structured_extra_loss, structured_task_deltas = self._component_refine_training_losses(
+                    batch=batch,
+                    x_dict=x_dict,
+                    batch_size=batch_size,
+                    total_nodes=total_nodes,
+                    labels_dict=labels_dict,
+                    labels_full=labels_full,
+                    mask_dict=mask_dict,
+                    valid_label_mask=valid_label_mask,
+                    logits_base=logits_dict,
+                    logits_full_base=logits_pre_full,
+                    pitch_spelling=pitch_spelling,
+                    key_signature=key_signature,
+                    edge_index_dict=edge_index_dict,
+                    batch_dict=batch_dict,
+                    num_sampled_nodes_dict=num_sampled_nodes_dict,
+                    num_sampled_edges_dict=num_sampled_edges_dict,
+                )
+            else:
+                structured_extra_loss, structured_task_deltas = self._structured_refine_training_losses(
+                    batch=batch,
+                    x_dict=x_dict,
+                    batch_size=batch_size,
+                    total_nodes=total_nodes,
+                    labels_dict=labels_dict,
+                    labels_full=labels_full,
+                    mask_dict=mask_dict,
+                    valid_label_mask=valid_label_mask,
+                    logits_base=logits_dict,
+                    logits_full_base=logits_pre_full,
+                    pitch_spelling=pitch_spelling,
+                    key_signature=key_signature,
+                    edge_index_dict=edge_index_dict,
+                    batch_dict=batch_dict,
+                    num_sampled_nodes_dict=num_sampled_nodes_dict,
+                    num_sampled_edges_dict=num_sampled_edges_dict,
+                )
+            total_task_loss = total_task_loss + structured_extra_loss
+            for task, delta in structured_task_deltas.items():
+                if task in task_losses:
+                    task_losses[task] = task_losses[task] + delta
         if (
             self.iterative_refine_train
             and self.masked_prediction_train
@@ -4294,6 +5638,7 @@ class ContinualAnalysisGNN(LightningModule):
                 )
                 for k in labels_dict.keys()
             }
+            labels_full = {k: v.clone() for k, v in labels_dict.items()}
             edge_index_dict = batch.edge_index_dict
             batch_dict = batch.batch_dict
 
@@ -4629,6 +5974,152 @@ class ContinualAnalysisGNN(LightningModule):
                             batch_size=batch_size,
                         )
 
+            if self.structured_beam_eval or self.structured_refine_eval:
+                structured_eval_agg_mode, structured_eval_agg_bundle = self._resolve_aggregation_runtime(
+                    aggregation_spec=None
+                )
+                structured_raw_probs = self._predict_note_probs_once(
+                    data=batch,
+                    batch_size=batch_size,
+                    conditioning=batch_conditioning,
+                    overrides=None,
+                    x_dict_override=x_dict,
+                    neighbor_mask_node=num_sampled_nodes_dict,
+                    neighbor_mask_edge=num_sampled_edges_dict,
+                )
+                structured_onset_probs = self._aggregate_onset_only_note_probs(
+                    note_prob_dict=structured_raw_probs,
+                    data=batch,
+                    batch_size=batch_size,
+                    aggregation_mode=structured_eval_agg_mode,
+                    aggregation_bundle=structured_eval_agg_bundle,
+                )
+            else:
+                structured_raw_probs = None
+                structured_onset_probs = None
+
+            if self.structured_beam_eval and structured_onset_probs is not None:
+                beam_v2_payload = self._decode_beam_from_note_probs(
+                    note_prob_dict=structured_onset_probs,
+                    data=batch,
+                    batch_size=batch_size,
+                    enabled_override=True,
+                    version_override=self.structured_beam_decoder_version,
+                    rescorer_path_override=self.structured_beam_rescorer_path,
+                )
+                if beam_v2_payload is not None:
+                    beam_v2_logits = self._build_beam_variant_logits(
+                        base_logits=logits_full,
+                        beam_payload=beam_v2_payload,
+                        batch_size=batch_size,
+                        valid_label_mask=valid_label_mask,
+                        mask_dict=mask_dict,
+                    )
+                    if self.constraint_mode == "hard" and node_mask_valid is not None:
+                        for task in labels_dict.keys():
+                            if task not in beam_v2_logits:
+                                continue
+                            raw_mask = raw_task_node_masks.get(task)
+                            if raw_mask is None:
+                                continue
+                            _, context_indices, _ = split_nodes_by_mask(raw_mask)
+                            if context_indices.numel() == 0:
+                                continue
+                            valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                            context_indices = context_indices[valid_context]
+                            if context_indices.numel() == 0:
+                                continue
+                            beam_v2_logits[task] = clamp_logits_to_labels(
+                                beam_v2_logits[task],
+                                labels_dict[task],
+                                context_indices,
+                                num_classes=self.task_dict.get(task),
+                            )
+                    structured_beam_prefix = (
+                        "val_component_beam"
+                        if self._structured_decoder_version() == "component_v3"
+                        else "val_beam_v2"
+                    )
+                    beam_v2_summary = _log_validation_variant(
+                        metric_prefix=structured_beam_prefix,
+                        variant_logits=beam_v2_logits,
+                        prog_bar=False,
+                        include_preserve=False,
+                        include_legacy_alias=False,
+                    )
+                    if (
+                        full_summary.get("total_loss") is not None
+                        and beam_v2_summary.get("total_loss") is not None
+                    ):
+                        self.log(
+                            f"{structured_beam_prefix}_delta/total_loss_beam_minus_full_{k}",
+                            beam_v2_summary["total_loss"] - full_summary["total_loss"],
+                            batch_size=batch_size,
+                        )
+
+            if self.structured_refine_eval and structured_raw_probs is not None:
+                structured_refine_version = self._structured_decoder_version()
+                refine_cfg = {
+                    "enabled": True,
+                    "version": structured_refine_version,
+                    "masked_tasks": (
+                        self._component_refine_tasks_for_available_labels(list(labels_dict.keys()))
+                        if structured_refine_version == "component_v3"
+                        else self._structured_refine_tasks_for_available_labels(list(labels_dict.keys()))
+                    ),
+                    "target_only_update": False,
+                    "zero_known_start": True,
+                    "segment_keep_ratio": self.structured_refine_keep_ratio,
+                    "segment_confidence_min": self.structured_refine_conf_min,
+                    "boundary_threshold": self.structured_refine_boundary_max,
+                }
+                if structured_refine_version == "component_v3":
+                    refine_probs, _, _ = self._component_refine_v3(
+                        data=batch,
+                        batch_size=batch_size,
+                        base_conditioning=None,
+                        overrides=None,
+                        iterative_cfg=refine_cfg,
+                        x_dict_override=x_dict,
+                    )
+                else:
+                    refine_probs, _, _ = self._structured_refine_v2(
+                        data=batch,
+                        batch_size=batch_size,
+                        base_conditioning=None,
+                        overrides=None,
+                        iterative_cfg=refine_cfg,
+                        x_dict_override=x_dict,
+                    )
+                logits_refine = self._note_probs_to_metric_logits(
+                    note_prob_dict=refine_probs,
+                    labels_dict=labels_dict,
+                    mask_dict=mask_dict,
+                    valid_label_mask=valid_label_mask,
+                    raw_task_node_masks=raw_task_node_masks,
+                )
+                structured_refine_prefix = (
+                    "val_component_refine"
+                    if structured_refine_version == "component_v3"
+                    else "val_refine_v2"
+                )
+                refine_summary = _log_validation_variant(
+                    metric_prefix=structured_refine_prefix,
+                    variant_logits=logits_refine,
+                    prog_bar=False,
+                    include_preserve=False,
+                    include_legacy_alias=False,
+                )
+                if (
+                    full_summary.get("total_loss") is not None
+                    and refine_summary.get("total_loss") is not None
+                ):
+                    self.log(
+                        f"{structured_refine_prefix}_delta/total_loss_refine_minus_full_{k}",
+                        refine_summary["total_loss"] - full_summary["total_loss"],
+                        batch_size=batch_size,
+                    )
+
             if self.iterative_eval and self.iterative_eval_during_fit:
                 iterative_cfg = {
                     "enabled": True,
@@ -4772,6 +6263,7 @@ class ContinualAnalysisGNN(LightningModule):
                 )
                 for k in labels_dict.keys()
             }
+            labels_full = {k: v.clone() for k, v in labels_dict.items()}
             edge_index_dict = batch.edge_index_dict
             batch_dict = batch.batch_dict
             num_sampled_edges_dict = batch.num_sampled_edges_dict
@@ -5084,6 +6576,19 @@ class ContinualAnalysisGNN(LightningModule):
                             batch_size=batch_size,
                         )
 
+                degree_acc = combined_degree_accuracy(
+                    variant_logits,
+                    labels_dict,
+                    self.task_dict,
+                )
+                if degree_acc is not None:
+                    self.log(
+                        f"{metric_prefix}/degree_{gtask_key}_acc",
+                        degree_acc,
+                        add_dataloader_idx=True,
+                        batch_size=batch_size,
+                    )
+
                 nct_rna_acc: Optional[torch.Tensor] = None
                 if "tpc_in_label" in variant_logits.keys():
                     rna_keys_nct = ["quality", "inversion", "degree1", "degree2", "localkey"]
@@ -5120,6 +6625,7 @@ class ContinualAnalysisGNN(LightningModule):
                     ),
                     "rn_onset_acc": float(onset_rna_acc.detach().cpu().item()) if onset_rna_acc is not None else None,
                     "rn_nct_acc": float(nct_rna_acc.detach().cpu().item()) if nct_rna_acc is not None else None,
+                    "degree_acc": float(degree_acc.detach().cpu().item()) if degree_acc is not None else None,
                     "task_acc": {
                         task: float(val.detach().cpu().item())
                         for task, val in accuracy_dict.items()
@@ -5293,6 +6799,149 @@ class ContinualAnalysisGNN(LightningModule):
                                 add_dataloader_idx=True,
                                 batch_size=batch_size,
                             )
+                if self.structured_beam_eval:
+                    beam_v2_input = self._aggregate_onset_only_note_probs(
+                        note_prob_dict=note_probs,
+                        data=batch,
+                        batch_size=batch_size,
+                        aggregation_mode="mean",
+                        aggregation_bundle=None,
+                    )
+                    beam_v2_payload = self._decode_beam_from_note_probs(
+                        note_prob_dict=beam_v2_input,
+                        data=batch,
+                        batch_size=batch_size,
+                        enabled_override=True,
+                        version_override=self.structured_beam_decoder_version,
+                        rescorer_path_override=self.structured_beam_rescorer_path,
+                    )
+                    if beam_v2_payload is not None:
+                        beam_v2_logits = self._build_beam_variant_logits(
+                            base_logits=mean_logits,
+                            beam_payload=beam_v2_payload,
+                            batch_size=batch_size,
+                            valid_label_mask=valid_label_mask,
+                            mask_dict=mask_dict,
+                        )
+                        if self.constraint_mode == "hard" and node_mask_valid is not None:
+                            for task in labels_dict.keys():
+                                if task not in beam_v2_logits:
+                                    continue
+                                raw_mask = raw_task_node_masks.get(task)
+                                if raw_mask is None:
+                                    continue
+                                _, context_indices, _ = split_nodes_by_mask(raw_mask)
+                                if context_indices.numel() == 0:
+                                    continue
+                                valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                                context_indices = context_indices[valid_context]
+                                if context_indices.numel() == 0:
+                                    continue
+                                beam_v2_logits[task] = clamp_logits_to_labels(
+                                    beam_v2_logits[task],
+                                    labels_dict[task],
+                                    context_indices,
+                                    num_classes=self.task_dict.get(task),
+                                )
+                        structured_beam_prefix = (
+                            "test_component_beam"
+                            if self._structured_decoder_version() == "component_v3"
+                            else "test_beam_v2"
+                        )
+                        beam_v2_summary = _log_test_variant(
+                            metric_prefix=structured_beam_prefix,
+                            variant_logits=beam_v2_logits,
+                        )
+                        if (
+                            mean_summary.get("total_loss") is not None
+                            and beam_v2_summary.get("total_loss") is not None
+                        ):
+                            self.log(
+                                f"{structured_beam_prefix}_delta/total_loss_beam_minus_base_{gtask_key}",
+                                beam_v2_summary["total_loss"] - mean_summary["total_loss"],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+                        if (
+                            mean_summary.get("rn_onset_acc") is not None
+                            and beam_v2_summary.get("rn_onset_acc") is not None
+                        ):
+                            self.log(
+                                f"{structured_beam_prefix}_delta/RN(Onset)_beam_minus_base_{gtask_key}",
+                                beam_v2_summary["rn_onset_acc"] - mean_summary["rn_onset_acc"],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+                if self.structured_refine_eval:
+                    structured_refine_version = self._structured_decoder_version()
+                    refine_cfg = {
+                        "enabled": True,
+                        "version": structured_refine_version,
+                        "masked_tasks": (
+                            self._component_refine_tasks_for_available_labels(list(labels_dict.keys()))
+                            if structured_refine_version == "component_v3"
+                            else self._structured_refine_tasks_for_available_labels(list(labels_dict.keys()))
+                        ),
+                        "target_only_update": False,
+                        "zero_known_start": True,
+                        "segment_keep_ratio": self.structured_refine_keep_ratio,
+                        "segment_confidence_min": self.structured_refine_conf_min,
+                        "boundary_threshold": self.structured_refine_boundary_max,
+                    }
+                    if structured_refine_version == "component_v3":
+                        refine_probs, _, _ = self._component_refine_v3(
+                            data=batch,
+                            batch_size=batch_size,
+                            base_conditioning=None,
+                            overrides=None,
+                            iterative_cfg=refine_cfg,
+                            x_dict_override=x_dict,
+                        )
+                    else:
+                        refine_probs, _, _ = self._structured_refine_v2(
+                            data=batch,
+                            batch_size=batch_size,
+                            base_conditioning=None,
+                            overrides=None,
+                            iterative_cfg=refine_cfg,
+                            x_dict_override=x_dict,
+                        )
+                    refine_logits = self._note_probs_to_metric_logits(
+                        note_prob_dict=refine_probs,
+                        labels_dict=labels_dict,
+                        mask_dict=mask_dict,
+                        valid_label_mask=valid_label_mask,
+                        raw_task_node_masks=raw_task_node_masks,
+                    )
+                    structured_refine_prefix = (
+                        "test_component_refine"
+                        if structured_refine_version == "component_v3"
+                        else "test_refine_v2"
+                    )
+                    refine_summary = _log_test_variant(
+                        metric_prefix=structured_refine_prefix,
+                        variant_logits=refine_logits,
+                    )
+                    if (
+                        mean_summary.get("total_loss") is not None
+                        and refine_summary.get("total_loss") is not None
+                    ):
+                        self.log(
+                            f"{structured_refine_prefix}_delta/total_loss_refine_minus_base_{gtask_key}",
+                            refine_summary["total_loss"] - mean_summary["total_loss"],
+                            add_dataloader_idx=True,
+                            batch_size=batch_size,
+                        )
+                    if (
+                        mean_summary.get("rn_onset_acc") is not None
+                        and refine_summary.get("rn_onset_acc") is not None
+                    ):
+                        self.log(
+                            f"{structured_refine_prefix}_delta/RN(Onset)_refine_minus_base_{gtask_key}",
+                            refine_summary["rn_onset_acc"] - mean_summary["rn_onset_acc"],
+                            add_dataloader_idx=True,
+                            batch_size=batch_size,
+                        )
                 continue
 
             if self.iterative_eval:
@@ -5389,6 +7038,154 @@ class ContinualAnalysisGNN(LightningModule):
                         add_dataloader_idx=True,
                         batch_size=batch_size,
                     )
+                if self.structured_beam_eval or self.structured_refine_eval:
+                    structured_eval_agg_mode, structured_eval_agg_bundle = self._resolve_aggregation_runtime(
+                        aggregation_spec=None
+                    )
+                    structured_raw_probs = self._predict_note_probs_once(
+                        data=batch,
+                        batch_size=batch_size,
+                        conditioning=batch_conditioning,
+                        overrides=None,
+                        x_dict_override=x_dict,
+                        neighbor_mask_node=num_sampled_nodes_dict,
+                        neighbor_mask_edge=num_sampled_edges_dict,
+                    )
+                else:
+                    structured_raw_probs = None
+                if self.structured_beam_eval and structured_raw_probs is not None:
+                    structured_onset_probs = self._aggregate_onset_only_note_probs(
+                        note_prob_dict=structured_raw_probs,
+                        data=batch,
+                        batch_size=batch_size,
+                        aggregation_mode=structured_eval_agg_mode,
+                        aggregation_bundle=structured_eval_agg_bundle,
+                    )
+                    beam_v2_payload = self._decode_beam_from_note_probs(
+                        note_prob_dict=structured_onset_probs,
+                        data=batch,
+                        batch_size=batch_size,
+                        enabled_override=True,
+                        version_override=self.structured_beam_decoder_version,
+                        rescorer_path_override=self.structured_beam_rescorer_path,
+                    )
+                    if beam_v2_payload is not None:
+                        beam_v2_logits = self._build_beam_variant_logits(
+                            base_logits=full_logits_dict,
+                            beam_payload=beam_v2_payload,
+                            batch_size=batch_size,
+                            valid_label_mask=valid_label_mask,
+                            mask_dict=mask_dict,
+                        )
+                        if self.constraint_mode == "hard" and node_mask_valid is not None:
+                            for task in labels_dict.keys():
+                                if task not in beam_v2_logits:
+                                    continue
+                                raw_mask = raw_task_node_masks.get(task)
+                                if raw_mask is None:
+                                    continue
+                                _, context_indices, _ = split_nodes_by_mask(raw_mask)
+                                if context_indices.numel() == 0:
+                                    continue
+                                valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                                context_indices = context_indices[valid_context]
+                                if context_indices.numel() == 0:
+                                    continue
+                                beam_v2_logits[task] = clamp_logits_to_labels(
+                                    beam_v2_logits[task],
+                                    labels_dict[task],
+                                    context_indices,
+                                    num_classes=self.task_dict.get(task),
+                                )
+                        structured_beam_prefix = (
+                            "test_component_beam"
+                            if self._structured_decoder_version() == "component_v3"
+                            else "test_beam_v2"
+                        )
+                        beam_v2_summary = _log_test_variant(
+                            metric_prefix=structured_beam_prefix,
+                            variant_logits=beam_v2_logits,
+                        )
+                        if (
+                            full_summary.get("total_loss") is not None
+                            and beam_v2_summary.get("total_loss") is not None
+                        ):
+                            self.log(
+                                f"{structured_beam_prefix}_delta/total_loss_beam_minus_base_{gtask_key}",
+                                beam_v2_summary["total_loss"] - full_summary["total_loss"],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+                if self.structured_refine_eval and structured_raw_probs is not None:
+                    structured_refine_version = self._structured_decoder_version()
+                    refine_cfg = {
+                        "enabled": True,
+                        "version": structured_refine_version,
+                        "masked_tasks": (
+                            self._component_refine_tasks_for_available_labels(list(labels_dict.keys()))
+                            if structured_refine_version == "component_v3"
+                            else self._structured_refine_tasks_for_available_labels(list(labels_dict.keys()))
+                        ),
+                        "target_only_update": False,
+                        "zero_known_start": True,
+                        "segment_keep_ratio": self.structured_refine_keep_ratio,
+                        "segment_confidence_min": self.structured_refine_conf_min,
+                        "boundary_threshold": self.structured_refine_boundary_max,
+                    }
+                    if structured_refine_version == "component_v3":
+                        refine_probs, _, _ = self._component_refine_v3(
+                            data=batch,
+                            batch_size=batch_size,
+                            base_conditioning=None,
+                            overrides=None,
+                            iterative_cfg=refine_cfg,
+                            x_dict_override=x_dict,
+                        )
+                    else:
+                        refine_probs, _, _ = self._structured_refine_v2(
+                            data=batch,
+                            batch_size=batch_size,
+                            base_conditioning=None,
+                            overrides=None,
+                            iterative_cfg=refine_cfg,
+                            x_dict_override=x_dict,
+                        )
+                    refine_logits = self._note_probs_to_metric_logits(
+                        note_prob_dict=refine_probs,
+                        labels_dict=labels_dict,
+                        mask_dict=mask_dict,
+                        valid_label_mask=valid_label_mask,
+                        raw_task_node_masks=raw_task_node_masks,
+                    )
+                    structured_refine_prefix = (
+                        "test_component_refine"
+                        if structured_refine_version == "component_v3"
+                        else "test_refine_v2"
+                    )
+                    refine_summary = _log_test_variant(
+                        metric_prefix=structured_refine_prefix,
+                        variant_logits=refine_logits,
+                    )
+                    if (
+                        full_summary.get("total_loss") is not None
+                        and refine_summary.get("total_loss") is not None
+                    ):
+                        self.log(
+                            f"{structured_refine_prefix}_delta/total_loss_refine_minus_base_{gtask_key}",
+                            refine_summary["total_loss"] - full_summary["total_loss"],
+                            add_dataloader_idx=True,
+                            batch_size=batch_size,
+                        )
+                    if (
+                        full_summary.get("rn_onset_acc") is not None
+                        and refine_summary.get("rn_onset_acc") is not None
+                    ):
+                        self.log(
+                            f"{structured_refine_prefix}_delta/RN(Onset)_refine_minus_base_{gtask_key}",
+                            refine_summary["rn_onset_acc"] - full_summary["rn_onset_acc"],
+                            add_dataloader_idx=True,
+                            batch_size=batch_size,
+                        )
             else:
                 base_summary = _log_test_variant(
                     metric_prefix="test",
@@ -5490,9 +7287,159 @@ class ContinualAnalysisGNN(LightningModule):
                                 add_dataloader_idx=True,
                                 batch_size=batch_size,
                             )
+                if self.structured_beam_eval or self.structured_refine_eval:
+                    structured_eval_agg_mode, structured_eval_agg_bundle = self._resolve_aggregation_runtime(
+                        aggregation_spec=None
+                    )
+                    structured_raw_probs = self._predict_note_probs_once(
+                        data=batch,
+                        batch_size=batch_size,
+                        conditioning=batch_conditioning,
+                        overrides=None,
+                        x_dict_override=x_dict,
+                        neighbor_mask_node=num_sampled_nodes_dict,
+                        neighbor_mask_edge=num_sampled_edges_dict,
+                    )
+                else:
+                    structured_raw_probs = None
+                if self.structured_beam_eval and structured_raw_probs is not None:
+                    structured_onset_probs = self._aggregate_onset_only_note_probs(
+                        note_prob_dict=structured_raw_probs,
+                        data=batch,
+                        batch_size=batch_size,
+                        aggregation_mode=structured_eval_agg_mode,
+                        aggregation_bundle=structured_eval_agg_bundle,
+                    )
+                    beam_v2_payload = self._decode_beam_from_note_probs(
+                        note_prob_dict=structured_onset_probs,
+                        data=batch,
+                        batch_size=batch_size,
+                        enabled_override=True,
+                        version_override=self.structured_beam_decoder_version,
+                        rescorer_path_override=self.structured_beam_rescorer_path,
+                    )
+                    if beam_v2_payload is not None:
+                        beam_v2_logits = self._build_beam_variant_logits(
+                            base_logits=logits_dict,
+                            beam_payload=beam_v2_payload,
+                            batch_size=batch_size,
+                            valid_label_mask=valid_label_mask,
+                            mask_dict=mask_dict,
+                        )
+                        if self.constraint_mode == "hard" and node_mask_valid is not None:
+                            for task in labels_dict.keys():
+                                if task not in beam_v2_logits:
+                                    continue
+                                raw_mask = raw_task_node_masks.get(task)
+                                if raw_mask is None:
+                                    continue
+                                _, context_indices, _ = split_nodes_by_mask(raw_mask)
+                                if context_indices.numel() == 0:
+                                    continue
+                                valid_context = self._metric_safe_mask(labels_dict[task], task)[context_indices]
+                                context_indices = context_indices[valid_context]
+                                if context_indices.numel() == 0:
+                                    continue
+                                beam_v2_logits[task] = clamp_logits_to_labels(
+                                    beam_v2_logits[task],
+                                    labels_dict[task],
+                                    context_indices,
+                                    num_classes=self.task_dict.get(task),
+                                )
+                        structured_beam_prefix = (
+                            "test_component_beam"
+                            if self._structured_decoder_version() == "component_v3"
+                            else "test_beam_v2"
+                        )
+                        beam_v2_summary = _log_test_variant(
+                            metric_prefix=structured_beam_prefix,
+                            variant_logits=beam_v2_logits,
+                            preserve_metrics=None,
+                        )
+                        if (
+                            base_summary.get("total_loss") is not None
+                            and beam_v2_summary.get("total_loss") is not None
+                        ):
+                            self.log(
+                                f"{structured_beam_prefix}_delta/total_loss_beam_minus_base_{gtask_key}",
+                                beam_v2_summary["total_loss"] - base_summary["total_loss"],
+                                add_dataloader_idx=True,
+                                batch_size=batch_size,
+                            )
+                if self.structured_refine_eval and structured_raw_probs is not None:
+                    structured_refine_version = self._structured_decoder_version()
+                    refine_cfg = {
+                        "enabled": True,
+                        "version": structured_refine_version,
+                        "masked_tasks": (
+                            self._component_refine_tasks_for_available_labels(list(labels_dict.keys()))
+                            if structured_refine_version == "component_v3"
+                            else self._structured_refine_tasks_for_available_labels(list(labels_dict.keys()))
+                        ),
+                        "target_only_update": False,
+                        "zero_known_start": True,
+                        "segment_keep_ratio": self.structured_refine_keep_ratio,
+                        "segment_confidence_min": self.structured_refine_conf_min,
+                        "boundary_threshold": self.structured_refine_boundary_max,
+                    }
+                    if structured_refine_version == "component_v3":
+                        refine_probs, _, _ = self._component_refine_v3(
+                            data=batch,
+                            batch_size=batch_size,
+                            base_conditioning=None,
+                            overrides=None,
+                            iterative_cfg=refine_cfg,
+                            x_dict_override=x_dict,
+                        )
+                    else:
+                        refine_probs, _, _ = self._structured_refine_v2(
+                            data=batch,
+                            batch_size=batch_size,
+                            base_conditioning=None,
+                            overrides=None,
+                            iterative_cfg=refine_cfg,
+                            x_dict_override=x_dict,
+                        )
+                    refine_logits = self._note_probs_to_metric_logits(
+                        note_prob_dict=refine_probs,
+                        labels_dict=labels_dict,
+                        mask_dict=mask_dict,
+                        valid_label_mask=valid_label_mask,
+                        raw_task_node_masks=raw_task_node_masks,
+                    )
+                    structured_refine_prefix = (
+                        "test_component_refine"
+                        if structured_refine_version == "component_v3"
+                        else "test_refine_v2"
+                    )
+                    refine_summary = _log_test_variant(
+                        metric_prefix=structured_refine_prefix,
+                        variant_logits=refine_logits,
+                        preserve_metrics=None,
+                    )
+                    if (
+                        base_summary.get("total_loss") is not None
+                        and refine_summary.get("total_loss") is not None
+                    ):
+                        self.log(
+                            f"{structured_refine_prefix}_delta/total_loss_refine_minus_base_{gtask_key}",
+                            refine_summary["total_loss"] - base_summary["total_loss"],
+                            add_dataloader_idx=True,
+                            batch_size=batch_size,
+                        )
+                    if (
+                        base_summary.get("rn_onset_acc") is not None
+                        and refine_summary.get("rn_onset_acc") is not None
+                    ):
+                        self.log(
+                            f"{structured_refine_prefix}_delta/RN(Onset)_refine_minus_base_{gtask_key}",
+                            refine_summary["rn_onset_acc"] - base_summary["rn_onset_acc"],
+                            add_dataloader_idx=True,
+                            batch_size=batch_size,
+                        )
 
     def on_test_epoch_end(self) -> None:
-        if not self.beam_eval:
+        if not (self.beam_eval or self.structured_beam_eval or self.structured_refine_eval):
             return
         metrics = getattr(self.trainer, "callback_metrics", {})
         if not isinstance(metrics, dict) or not metrics:
@@ -5518,6 +7465,14 @@ class ContinualAnalysisGNN(LightningModule):
             "summary/test_beam_delta_total_loss": "test_beam_delta/total_loss_beam_minus_base_",
             "summary/test_beam_delta_rn_onset_acc": "test_beam_delta/RN(Onset)_beam_minus_base_",
             "summary/test_beam_delta_romanNumeral_acc": "test_beam_delta/romanNumeral_acc_beam_minus_base_",
+            "summary/test_beam_v2_delta_total_loss": "test_beam_v2_delta/total_loss_beam_minus_base_",
+            "summary/test_beam_v2_delta_rn_onset_acc": "test_beam_v2_delta/RN(Onset)_beam_minus_base_",
+            "summary/test_refine_v2_delta_total_loss": "test_refine_v2_delta/total_loss_refine_minus_base_",
+            "summary/test_refine_v2_delta_rn_onset_acc": "test_refine_v2_delta/RN(Onset)_refine_minus_base_",
+            "summary/test_component_beam_delta_total_loss": "test_component_beam_delta/total_loss_beam_minus_base_",
+            "summary/test_component_beam_delta_rn_onset_acc": "test_component_beam_delta/RN(Onset)_beam_minus_base_",
+            "summary/test_component_refine_delta_total_loss": "test_component_refine_delta/total_loss_refine_minus_base_",
+            "summary/test_component_refine_delta_rn_onset_acc": "test_component_refine_delta/RN(Onset)_refine_minus_base_",
         }
         for out_key, prefix in summary_map.items():
             value = _mean_prefix(prefix)
@@ -5907,14 +7862,33 @@ class ContinualAnalysisGNN(LightningModule):
             )
             iterative_trace: Dict[str, Any] = {"enabled": False, "steps": []}
             if iterative_cfg.get("enabled", False):
-                note_predictions, iterative_trace, _ = self._iterative_masked_refinement(
-                    data=data,
-                    batch_size=batch_size,
-                    base_conditioning=conditioning,
-                    overrides=overrides,
-                    iterative_cfg=iterative_cfg,
-                    x_dict_override=x_dict,
-                )
+                if iterative_cfg.get("version") == "component_v3":
+                    note_predictions, iterative_trace, _ = self._component_refine_v3(
+                        data=data,
+                        batch_size=batch_size,
+                        base_conditioning=conditioning,
+                        overrides=overrides,
+                        iterative_cfg=iterative_cfg,
+                        x_dict_override=x_dict,
+                    )
+                elif iterative_cfg.get("version") == "structured_v2":
+                    note_predictions, iterative_trace, _ = self._structured_refine_v2(
+                        data=data,
+                        batch_size=batch_size,
+                        base_conditioning=conditioning,
+                        overrides=overrides,
+                        iterative_cfg=iterative_cfg,
+                        x_dict_override=x_dict,
+                    )
+                else:
+                    note_predictions, iterative_trace, _ = self._iterative_masked_refinement(
+                        data=data,
+                        batch_size=batch_size,
+                        base_conditioning=conditioning,
+                        overrides=overrides,
+                        iterative_cfg=iterative_cfg,
+                        x_dict_override=x_dict,
+                    )
             else:
                 note_predictions = self._predict_note_probs_once(
                     data=data,
@@ -5931,8 +7905,18 @@ class ContinualAnalysisGNN(LightningModule):
                 aggregation_mode=aggregation_mode,
                 aggregation_bundle=aggregation_bundle,
             )
+            beam_cfg = self._resolve_beam_spec(beam_spec=beam_spec)
+            beam_input_probs = predictions
+            if beam_cfg.get("version") in {"structured_v2", "component_v3"}:
+                beam_input_probs = self._aggregate_onset_only_note_probs(
+                    note_prob_dict=note_predictions,
+                    data=data,
+                    batch_size=batch_size,
+                    aggregation_mode=aggregation_mode,
+                    aggregation_bundle=aggregation_bundle,
+                )
             beam_output = self._decode_beam_from_note_probs(
-                note_prob_dict=predictions,
+                note_prob_dict=beam_input_probs,
                 data=data,
                 batch_size=batch_size,
                 beam_spec=beam_spec,

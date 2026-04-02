@@ -89,13 +89,11 @@ WANDB_TASK_ABBR = {
 
 
 def _clip_wandb_label(value: str, *, max_len: int = 128, field_name: str = "label") -> str:
-    """Clip long W&B identifiers while preserving uniqueness."""
+    """Clip long W&B identifiers while keeping them human-readable."""
     text = str(value or "").strip()
     if len(text) <= max_len:
         return text
-    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
-    keep = max(1, max_len - len(digest) - 1)
-    clipped = f"{text[:keep]}-{digest}"
+    clipped = text[:max_len].rstrip("-_.")
     print(
         f"Warning: W&B {field_name} exceeded {max_len} chars; "
         f"using clipped value '{clipped}'."
@@ -424,6 +422,11 @@ def get_parser():
         help="Enable onset-level constrained beam decoding evaluation in parallel with baseline metrics.",
     )
     parser.add_argument(
+        "--structured_beam_eval",
+        action="store_true",
+        help="Enable structured_v2 onset-state beam decoding evaluation with separate test_beam_v2/* logging.",
+    )
+    parser.add_argument(
         "--beam_eval_during_fit",
         action="store_true",
         default=False,
@@ -440,6 +443,62 @@ def get_parser():
         type=str,
         default=None,
         help="Optional JSON file with beam decoder overrides (topk_by_task, weights, penalties).",
+    )
+    parser.add_argument(
+        "--structured_beam_decoder_version",
+        type=str,
+        default="structured_v2",
+        choices=["legacy", "structured_v2", "component_v3"],
+        help="Beam decoder version used by --structured_beam_eval.",
+    )
+    parser.add_argument(
+        "--structured_beam_rescorer_path",
+        type=str,
+        default=None,
+        help="Optional structured beam rescorer artifact path.",
+    )
+    parser.add_argument(
+        "--structured_refine_train",
+        action="store_true",
+        help="Train a separate onset-segment structured refinement checkpoint on top of the full model.",
+    )
+    parser.add_argument(
+        "--structured_refine_eval",
+        action="store_true",
+        help="Evaluate the structured refinement v2 path with test_refine_v2/* logging.",
+    )
+    parser.add_argument(
+        "--structured_refine_teacher_checkpoint",
+        type=str,
+        default=None,
+        help="Optional teacher checkpoint used during structured refinement training.",
+    )
+    parser.add_argument(
+        "--component_refine_train",
+        action="store_true",
+        help="Alias for --structured_refine_train with --structured_beam_decoder_version=component_v3.",
+    )
+    parser.add_argument(
+        "--component_refine_eval",
+        action="store_true",
+        help="Alias for --structured_refine_eval with --structured_beam_decoder_version=component_v3.",
+    )
+    parser.add_argument(
+        "--component_refine_teacher_checkpoint",
+        type=str,
+        default=None,
+        help="Alias for --structured_refine_teacher_checkpoint in component_v3 mode.",
+    )
+    parser.add_argument(
+        "--component_beam_eval",
+        action="store_true",
+        help="Alias for --structured_beam_eval with --structured_beam_decoder_version=component_v3.",
+    )
+    parser.add_argument(
+        "--component_beam_rescorer_path",
+        type=str,
+        default=None,
+        help="Alias for --structured_beam_rescorer_path in component_v3 mode.",
     )
     parser.add_argument(
         "--aggregation_mode",
@@ -781,6 +840,22 @@ def main():
     if not config.get("preserve_tasks"):
         config["preserve_tasks"] = ["all_nonmasked"]
 
+    if config.get("component_beam_eval", False):
+        config["structured_beam_eval"] = True
+        config["structured_beam_decoder_version"] = "component_v3"
+    if config.get("component_refine_train", False):
+        config["structured_refine_train"] = True
+        config["structured_beam_decoder_version"] = "component_v3"
+    if config.get("component_refine_eval", False):
+        config["structured_refine_eval"] = True
+        config["structured_beam_decoder_version"] = "component_v3"
+    if config.get("component_refine_teacher_checkpoint"):
+        config["structured_refine_teacher_checkpoint"] = config["component_refine_teacher_checkpoint"]
+        config["structured_beam_decoder_version"] = "component_v3"
+    if config.get("component_beam_rescorer_path"):
+        config["structured_beam_rescorer_path"] = config["component_beam_rescorer_path"]
+        config["structured_beam_decoder_version"] = "component_v3"
+
     if config.get("robust_profile", False):
         print("Applying robust profile defaults.")
         config["scheduler_type"] = "cosine_warmup"
@@ -864,6 +939,17 @@ def main():
         if not config.get("masked_prediction_train", False):
             print("Warning: --iterative_refine_train requires masked prediction; disabling iterative refine train.")
             config["iterative_refine_train"] = False
+    if config.get("structured_refine_train", False) and config.get("iterative_refine_train", False):
+        print(
+            "Warning: --structured_refine_train is a separate v2 path and cannot be combined with "
+            "--iterative_refine_train. Disabling legacy iterative_refine_train."
+        )
+        config["iterative_refine_train"] = False
+    if config.get("structured_refine_teacher_checkpoint"):
+        teacher_ckpt = Path(str(config["structured_refine_teacher_checkpoint"])).expanduser()
+        if not teacher_ckpt.exists():
+            raise ValueError(f"--structured_refine_teacher_checkpoint path not found: {teacher_ckpt}")
+        config["structured_refine_teacher_checkpoint"] = str(teacher_ckpt)
     if config.get("iterative_eval", False):
         eval_steps = int(config.get("iterative_eval_steps", 10))
         if eval_steps < 1:
@@ -903,6 +989,11 @@ def main():
         )
         config["beam_eval"] = False
         config["beam_eval_during_fit"] = False
+    if config.get("structured_beam_rescorer_path"):
+        rescorer_path = Path(str(config["structured_beam_rescorer_path"])).expanduser()
+        if not rescorer_path.exists():
+            raise ValueError(f"--structured_beam_rescorer_path path not found: {rescorer_path}")
+        config["structured_beam_rescorer_path"] = str(rescorer_path)
 
     aggregation_mode = str(config.get("aggregation_mode", "mean")).lower().strip()
     if aggregation_mode not in {"mean", "voter", "voter_consistent_beat"}:
@@ -1254,6 +1345,10 @@ def main():
         )
         beam_tag = "beam_eval" if config.get("beam_eval", False) else "no_beam_eval"
         beam_width_tag = f"beam_w{int(config.get('beam_width', 8))}"
+        structured_beam_tag = "sbeam_eval" if config.get("structured_beam_eval", False) else "no_sbeam_eval"
+        structured_beam_version_tag = f"sbeam={_sanitize_wandb_token(config.get('structured_beam_decoder_version', 'structured_v2'))}"
+        structured_refine_tag = "srefine" if config.get("structured_refine_train", False) else "no_srefine"
+        structured_refine_eval_tag = "srefine_eval" if config.get("structured_refine_eval", False) else "no_srefine_eval"
         beam_cfg_tag = ""
         if config.get("beam_eval", False) and isinstance(config.get("beam_spec_config"), dict):
             try:
@@ -1280,8 +1375,12 @@ def main():
                 f"-{iterative_tag}"
                 f"-{iterative_eval_tag}"
                 f"-{iterative_eval_zero_known_tag}"
+                f"-{structured_refine_tag}"
+                f"-{structured_refine_eval_tag}"
                 f"-sched={_sanitize_wandb_token(config['scheduler_type'])}"
                 f"-conf={_sanitize_wandb_token(config['mt_conflict_method'])}"
+                f"-{structured_beam_tag}"
+                f"-{structured_beam_version_tag}"
                 f"-ep={config['num_epochs']}"
                 f"-bs={config['batch_size']}"
                 f"-lr={config['lr']}{ckpt_tag}"
@@ -1291,6 +1390,8 @@ def main():
             f"{task_group_tag}-{feature_tag}-{musicbert_tag}-{arch_tag}-{aug}-"
             f"{masked_tag}-{masked_tasks_tag}-{preserve_tag}-{iterative_tag}-"
             f"{iterative_eval_tag}-{iterative_eval_zero_known_tag}-"
+            f"{structured_refine_tag}-{structured_refine_eval_tag}-"
+            f"{structured_beam_tag}-{structured_beam_version_tag}-"
             f"{_sanitize_wandb_token(config['scheduler_type'])}-"
             f"{_sanitize_wandb_token(config['mt_conflict_method'])}"
         )
@@ -1315,6 +1416,10 @@ def main():
                 beam_tag,
                 beam_width_tag,
                 beam_cfg_tag,
+                structured_beam_tag,
+                structured_beam_version_tag,
+                structured_refine_tag,
+                structured_refine_eval_tag,
                 config["scheduler_type"],
                 config["mt_conflict_method"],
             ] + user_tags

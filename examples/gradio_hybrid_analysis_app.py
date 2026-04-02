@@ -35,7 +35,11 @@ from analysisgnn.inference.hybrid_predictor import (
     parse_task_csv,
     predictions_to_dataframe,
 )
-from analysisgnn.inference.hf_bundle import HybridBundleResolutionError, resolve_hybrid_bundle
+from analysisgnn.inference.hf_bundle import (
+    HybridBundleResolutionError,
+    resolve_hybrid_bundle,
+)
+from analysisgnn.utils.chord_symbols import build_beat_chord_symbol_row
 from analysisgnn.utils.roman_decode import decode_roman_numeral
 
 
@@ -65,7 +69,11 @@ DEFAULT_VOTER_CKPT = _resolve_optional_default_path(
 )
 DEFAULT_BEAT_VOTER_CKPT = _resolve_optional_default_path(
     "ANALYSISGNN_BEAT_VOTER_CKPT",
-    Path(DEFAULT_VOTER_CKPT) if DEFAULT_VOTER_CKPT else REPO_ROOT / "artifacts" / "posthoc_voter" / "uocj8f6y_voter.pt",
+    (
+        Path(DEFAULT_VOTER_CKPT)
+        if DEFAULT_VOTER_CKPT
+        else REPO_ROOT / "artifacts" / "posthoc_voter" / "uocj8f6y_voter.pt"
+    ),
 )
 DEFAULT_TASKS = ",".join(DEFAULT_EDITABLE_TASKS)
 AVAILABLE_TASKS: Dict[str, str] = {
@@ -96,16 +104,24 @@ EDGE_LABELS = {
     "rest": "Rest",
 }
 DEFAULT_BEAT_TASKS = [
-    "cadence",
-    "phrase",
-    "romanNumeral",
-    "root",
-    "bass",
+    "localkey",
     "degree1",
     "degree2",
+    "quality",
     "inversion",
-    "localkey",
+    "root",
+    "bass",
 ]
+BEAT_TASK_CHOICES = list(
+    dict.fromkeys(
+        DEFAULT_BEAT_TASKS
+        + [
+            "romanNumeral",
+            "cadence",
+            "phrase",
+        ]
+    )
+)
 
 
 @lru_cache(maxsize=8)
@@ -162,7 +178,9 @@ def _resolve_runtime_artifact_paths(
     notes: List[str] = []
     if filled:
         rev_txt = f"@{revision}" if revision else ""
-        notes.append(f"Loaded missing artifacts from HF bundle {repo_id}{rev_txt}: {','.join(filled)}")
+        notes.append(
+            f"Loaded missing artifacts from HF bundle {repo_id}{rev_txt}: {','.join(filled)}"
+        )
     if unresolved:
         notes.append(f"Still missing artifacts: {','.join(unresolved)}")
     return resolved, " | ".join(notes)
@@ -190,7 +208,9 @@ def _load_score(score_path: str):
     return pt.load_score(score_path)
 
 
-def _get_predictor(full_ckpt: str, masked_ckpt: str, device: str) -> HybridAnalysisPredictor:
+def _get_predictor(
+    full_ckpt: str, masked_ckpt: str, device: str
+) -> HybridAnalysisPredictor:
     full_ckpt = (full_ckpt or "").strip()
     masked_ckpt = (masked_ckpt or "").strip()
     if not full_ckpt:
@@ -214,7 +234,9 @@ def _resolve_selected_tasks(task_labels: List[str], tasks_csv: str) -> List[str]
     label_to_task = {v: k for k, v in AVAILABLE_TASKS.items()}
     supported_tasks = set(AVAILABLE_TASKS.keys())
     if task_labels:
-        tasks = [label_to_task[label] for label in task_labels if label in label_to_task]
+        tasks = [
+            label_to_task[label] for label in task_labels if label in label_to_task
+        ]
     else:
         tasks = parse_task_csv(tasks_csv)
     normalized: List[str] = []
@@ -254,7 +276,16 @@ def _format_table_output(df: pd.DataFrame, tasks: List[str]) -> pd.DataFrame:
     _convert_tpc_column_inplace(out)
 
     timing_cols = [
-        col for col in ["row", "note_id", "onset_beat", "measure", "duration_beat", "pitch_spelling", "pitch_midi"]
+        col
+        for col in [
+            "row",
+            "note_id",
+            "onset_beat",
+            "measure",
+            "duration_beat",
+            "pitch_spelling",
+            "pitch_midi",
+        ]
         if col in out.columns
     ]
     prediction_cols = [task for task in tasks if task in out.columns]
@@ -266,12 +297,18 @@ def _format_table_output(df: pd.DataFrame, tasks: List[str]) -> pd.DataFrame:
         conf_col = f"{pred_col}_confidence"
         if conf_col in confidence_cols:
             ordered_cols.append(conf_col)
-    remaining_cols = [col for col in out.columns if col not in ordered_cols and not col.endswith("_id")]
+    remaining_cols = [
+        col
+        for col in out.columns
+        if col not in ordered_cols and not col.endswith("_id")
+    ]
     out = out[ordered_cols + remaining_cols]
     return out
 
 
-def _apply_timing_from_predictions(df: pd.DataFrame, predictions: Dict[str, torch.Tensor]) -> pd.DataFrame:
+def _apply_timing_from_predictions(
+    df: pd.DataFrame, predictions: Dict[str, torch.Tensor]
+) -> pd.DataFrame:
     out = df.copy()
     # Keep score-derived timing as the source of truth for display. Some model
     # tensors (e.g., onset/s_measure logits or class ids) are not absolute
@@ -396,15 +433,18 @@ def _build_complete_rn_spans(df: pd.DataFrame) -> List[Tuple[int, int, str]]:
         return []
 
     work["onset_div"] = pd.to_numeric(work["onset_div"], errors="coerce")
-    work["duration_div"] = pd.to_numeric(work["duration_div"], errors="coerce").fillna(0)
-    work["romanNumeral_full"] = work["romanNumeral_full"].fillna("").astype(str).str.strip()
+    work["duration_div"] = pd.to_numeric(work["duration_div"], errors="coerce").fillna(
+        0
+    )
+    work["romanNumeral_full"] = (
+        work["romanNumeral_full"].fillna("").astype(str).str.strip()
+    )
     work = work.dropna(subset=["onset_div"])
     if len(work) == 0:
         return []
 
-    by_onset = (
-        work.sort_values(["onset_div", "duration_div"])
-        .groupby("onset_div", sort=True)
+    by_onset = work.sort_values(["onset_div", "duration_div"]).groupby(
+        "onset_div", sort=True
     )
     onset_points: List[int] = []
     onset_rn: List[str] = []
@@ -417,7 +457,12 @@ def _build_complete_rn_spans(df: pd.DataFrame) -> List[Tuple[int, int, str]]:
     if not onset_points:
         return []
 
-    score_end = int(np.max(work["onset_div"].to_numpy() + np.maximum(1, work["duration_div"].to_numpy())))
+    score_end = int(
+        np.max(
+            work["onset_div"].to_numpy()
+            + np.maximum(1, work["duration_div"].to_numpy())
+        )
+    )
     spans: List[Tuple[int, int, str]] = []
     current_rn = ""
     current_start: int | None = None
@@ -467,7 +512,9 @@ def _read_score_xml_with_complete_rn(
         return _read_score_xml_text(score_path, score)
 
     harmony_classes = tuple(
-        cls for cls in (pt.score.Harmony, pt.score.RomanNumeral, pt.score.ChordSymbol) if cls is not None
+        cls
+        for cls in (pt.score.Harmony, pt.score.RomanNumeral, pt.score.ChordSymbol)
+        if cls is not None
     )
     for part in parts:
         for cls in harmony_classes:
@@ -514,18 +561,24 @@ def _sorted_note_array(score: pt.score.Score) -> np.ndarray:
     return note_array_raw[sort_idx]
 
 
-def _extract_graph_edges_from_score(score: pt.score.Score, note_array: np.ndarray) -> Tuple[Dict[str, List[List[int]]], str]:
+def _extract_graph_edges_from_score(
+    score: pt.score.Score, note_array: np.ndarray
+) -> Tuple[Dict[str, List[List[int]]], str]:
     try:
         from analysisgnn.descriptors import select_features
         from graphmuse import create_score_graph
     except Exception as exc:
-        return {k: [[], []] for k in DEFAULT_EDGE_TYPES}, f"Could not import graph builders ({exc})."
+        return {
+            k: [[], []] for k in DEFAULT_EDGE_TYPES
+        }, f"Could not import graph builders ({exc})."
 
     warning = ""
     try:
         note_features = select_features(note_array, "voice")
     except Exception as exc:
-        warning = f"Feature selection for graph overlay failed ({exc}); using zero features."
+        warning = (
+            f"Feature selection for graph overlay failed ({exc}); using zero features."
+        )
         note_features = np.zeros((len(note_array), 1), dtype=np.float32)
     try:
         measures = score[-1].measures
@@ -542,7 +595,9 @@ def _extract_graph_edges_from_score(score: pt.score.Score, note_array: np.ndarra
         )
         edge_index_dict = graph.edge_index_dict
     except Exception as exc:
-        return {k: [[], []] for k in DEFAULT_EDGE_TYPES}, f"Graph construction failed ({exc})."
+        return {
+            k: [[], []] for k in DEFAULT_EDGE_TYPES
+        }, f"Graph construction failed ({exc})."
 
     key_map = {
         "onset": ("note", "onset", "note"),
@@ -607,22 +662,46 @@ def _build_graph_overlay_payload(
                         pass
 
         note_id = _value_or_none(row.get("note_id"))
-        score_note_id = _value_or_none(note_array["id"][idx]) if "id" in note_array.dtype.names else None
+        score_note_id = (
+            _value_or_none(note_array["id"][idx])
+            if "id" in note_array.dtype.names
+            else None
+        )
         notes_payload.append(
             {
                 "index": idx,
-                "row": int(_value_or_none(row.get("row")) if "row" in row.index else idx),
-                "note_id": str(score_note_id) if score_note_id is not None else (str(note_id) if note_id is not None else None),
+                "row": int(
+                    _value_or_none(row.get("row")) if "row" in row.index else idx
+                ),
+                "note_id": (
+                    str(score_note_id)
+                    if score_note_id is not None
+                    else (str(note_id) if note_id is not None else None)
+                ),
                 "table_note_id": str(note_id) if note_id is not None else None,
-                "onset_div": int(note_array["onset_div"][idx]) if "onset_div" in note_array.dtype.names else None,
+                "onset_div": (
+                    int(note_array["onset_div"][idx])
+                    if "onset_div" in note_array.dtype.names
+                    else None
+                ),
                 "onset_beat": float(_value_or_none(row.get("onset_beat")) or 0.0),
-                "measure": int(_value_or_none(row.get("measure"))) if _value_or_none(row.get("measure")) is not None else None,
+                "measure": (
+                    int(_value_or_none(row.get("measure")))
+                    if _value_or_none(row.get("measure")) is not None
+                    else None
+                ),
                 "duration_beat": float(_value_or_none(row.get("duration_beat")) or 0.0),
-                "pitch_midi": int(_value_or_none(row.get("pitch_midi"))) if _value_or_none(row.get("pitch_midi")) is not None else None,
+                "pitch_midi": (
+                    int(_value_or_none(row.get("pitch_midi")))
+                    if _value_or_none(row.get("pitch_midi")) is not None
+                    else None
+                ),
                 "pitch_spelling": str(_value_or_none(row.get("pitch_spelling")) or ""),
                 "tasks": task_vals,
                 "confidence": conf,
-                "romanNumeral_full": str(rn_full.iloc[idx]) if idx < len(rn_full) else "",
+                "romanNumeral_full": (
+                    str(rn_full.iloc[idx]) if idx < len(rn_full) else ""
+                ),
             }
         )
 
@@ -666,7 +745,7 @@ def _build_verovio_html(payload: Dict[str, Any]) -> str:
     return (
         "<iframe "
         "style='width:100%;height:980px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
-        f"srcdoc=\"{srcdoc}\"></iframe>"
+        f'srcdoc="{srcdoc}"></iframe>'
     )
 
 
@@ -677,7 +756,9 @@ def _build_visual_payload(
     tasks: List[str],
     edge_types: List[str],
 ) -> Dict[str, Any]:
-    payload = _build_graph_overlay_payload(score=score, df=df, tasks=tasks, edge_types=edge_types)
+    payload = _build_graph_overlay_payload(
+        score=score, df=df, tasks=tasks, edge_types=edge_types
+    )
     payload["score_xml"] = _read_score_xml_with_complete_rn(
         score_path=score_path,
         score=score,
@@ -698,7 +779,9 @@ def _build_iterative_spec(
     return {
         "enabled": bool(enable_iterative),
         "steps": int(max(1, iterative_steps)),
-        "keep_percentile_per_step": float(max(0.0, min(100.0, keep_percentile_per_step))),
+        "keep_percentile_per_step": float(
+            max(0.0, min(100.0, keep_percentile_per_step))
+        ),
         "masked_tasks": list(tasks),
         "mode": "cumulative",
         "freeze_confidence": "joint_mean",
@@ -784,7 +867,11 @@ def _beat_payload_to_dataframe(
     if not rows:
         return pd.DataFrame()
     payload_tasks = beat_payload.get("tasks", [])
-    tasks = [t for t in beat_tasks if t in payload_tasks] if beat_tasks else list(payload_tasks)
+    tasks = (
+        [t for t in beat_tasks if t in payload_tasks]
+        if beat_tasks
+        else list(payload_tasks)
+    )
     if not tasks:
         tasks = list(payload_tasks)
 
@@ -805,17 +892,52 @@ def _beat_payload_to_dataframe(
             out[f"{task}_confidence"] = entry.get("confidence")
             out[f"{task}_conflict_flag"] = entry.get("conflict_flag")
             out[f"{task}_conflict_prob"] = entry.get("conflict_prob")
+        out.update(build_beat_chord_symbol_row(row if isinstance(row, dict) else {}))
         flat_rows.append(out)
 
     beat_df = pd.DataFrame(flat_rows)
-    core_cols = ["beat_id", "beat_index", "measure", "onset_beat", "note_count", "romanNumeral_full"]
+    core_cols = [
+        "beat_id",
+        "beat_index",
+        "measure",
+        "onset_beat",
+        "note_count",
+        "romanNumeral_full",
+        "chordSymbol_abs",
+        "chordSymbol_context",
+        "chordSymbol_supported",
+        "chordSymbol_ambiguous",
+        "chordSymbol_source",
+    ]
     ordered_cols: List[str] = [c for c in core_cols if c in beat_df.columns]
     for task in tasks:
-        for col in [task, f"{task}_confidence", f"{task}_conflict_flag", f"{task}_conflict_prob"]:
+        for col in [
+            task,
+            f"{task}_confidence",
+            f"{task}_conflict_flag",
+            f"{task}_conflict_prob",
+        ]:
             if col in beat_df.columns:
                 ordered_cols.append(col)
     remaining = [c for c in beat_df.columns if c not in ordered_cols]
     return beat_df[ordered_cols + remaining]
+
+
+def _dataframe_to_csv_file(df: Optional[pd.DataFrame], prefix: str) -> Optional[str]:
+    if df is None or len(df) == 0:
+        return None
+    safe_prefix = "".join(
+        ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in prefix
+    ).strip("_")
+    safe_prefix = safe_prefix or "analysisgnn"
+    with tempfile.NamedTemporaryFile(
+        suffix=".csv",
+        prefix=f"{safe_prefix}_",
+        delete=False,
+    ) as tmp:
+        csv_path = tmp.name
+    df.to_csv(csv_path, index=False)
+    return csv_path
 
 
 def _format_trace(trace: Dict[str, Any], show_trace: bool) -> str:
@@ -938,9 +1060,7 @@ def run_full_inference(
                 beat_payload=beat_payload,
                 beat_tasks=selected_beat_tasks,
             )
-            beat_status = (
-                f"Beat-level table ready: rows={len(beat_df)} mode={beat_agg_spec.get('mode', 'mean')}"
-            )
+            beat_status = f"Beat-level table ready: rows={len(beat_df)} mode={beat_agg_spec.get('mode', 'mean')}"
             if hf_resolution_note:
                 beat_status = f"{beat_status} | {hf_resolution_note}"
             if beat_agg_warning:
@@ -953,9 +1073,20 @@ def run_full_inference(
             tasks=tasks,
             edge_types=[],
         )
-        return display_df, status, _format_trace(trace, show_trace), visual_payload, beat_df, beat_status
+        note_csv = _dataframe_to_csv_file(display_df, "note_predictions")
+        beat_csv = _dataframe_to_csv_file(beat_df, "beat_predictions")
+        return (
+            display_df,
+            status,
+            _format_trace(trace, show_trace),
+            visual_payload,
+            note_csv,
+            beat_df,
+            beat_status,
+            beat_csv,
+        )
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}", "", {}, pd.DataFrame(), ""
+        return pd.DataFrame(), f"Error: {exc}", "", {}, None, pd.DataFrame(), "", None
 
 
 def run_partial_rerender(
@@ -996,7 +1127,9 @@ def run_partial_rerender(
             device,
         )
 
-        edited_df = pd.DataFrame(edited_table) if edited_table is not None else pd.DataFrame()
+        edited_df = (
+            pd.DataFrame(edited_table) if edited_table is not None else pd.DataFrame()
+        )
         user_edits, masked_spec, info = build_mask_inputs_from_table_edits(
             edited_df=edited_df,
             masked_tasks=tasks,
@@ -1082,9 +1215,7 @@ def run_partial_rerender(
                 beat_payload=beat_payload,
                 beat_tasks=selected_beat_tasks,
             )
-            beat_status = (
-                f"Beat-level table ready: rows={len(beat_df)} mode={beat_agg_spec.get('mode', 'mean')}"
-            )
+            beat_status = f"Beat-level table ready: rows={len(beat_df)} mode={beat_agg_spec.get('mode', 'mean')}"
             if hf_resolution_note:
                 beat_status = f"{beat_status} | {hf_resolution_note}"
             if beat_agg_warning:
@@ -1097,9 +1228,20 @@ def run_partial_rerender(
             tasks=tasks,
             edge_types=[],
         )
-        return display_df, status, _format_trace(trace, show_trace), visual_payload, beat_df, beat_status
+        note_csv = _dataframe_to_csv_file(display_df, "note_predictions")
+        beat_csv = _dataframe_to_csv_file(beat_df, "beat_predictions")
+        return (
+            display_df,
+            status,
+            _format_trace(trace, show_trace),
+            visual_payload,
+            note_csv,
+            beat_df,
+            beat_status,
+            beat_csv,
+        )
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}", "", {}, pd.DataFrame(), ""
+        return pd.DataFrame(), f"Error: {exc}", "", {}, None, pd.DataFrame(), "", None
 
 
 def refresh_visual_tab(
@@ -1111,7 +1253,9 @@ def refresh_visual_tab(
     visual_state: Dict[str, Any],
 ):
     try:
-        selected_edge_types = [k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])]
+        selected_edge_types = [
+            k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])
+        ]
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
         score_path = None
         score = None
@@ -1135,7 +1279,9 @@ def refresh_visual_tab(
             payload.setdefault("meta", {})
             payload["meta"]["visible_edge_types"] = selected_edge_types
         else:
-            raise ValueError("No predictions available yet. Run inference first to populate the visual tab.")
+            raise ValueError(
+                "No predictions available yet. Run inference first to populate the visual tab."
+            )
 
         html_frame = _build_verovio_html(payload)
         note_count = len(payload.get("notes", []))
@@ -1153,12 +1299,17 @@ def refresh_visual_tab(
             f"Visual rendering error: {html_lib.escape(str(exc))}"
             "</div>"
         )
-        return fallback, f"Visual error: {exc}", visual_state if isinstance(visual_state, dict) else {}
+        return (
+            fallback,
+            f"Visual error: {exc}",
+            visual_state if isinstance(visual_state, dict) else {},
+        )
 
 
 def build_demo() -> gr.Blocks:
     with gr.Blocks(title="AnalysisGNN Hybrid Inference") as demo:
-        gr.Markdown("""
+        gr.Markdown(
+            """
 # AnalysisGNN Hybrid Inference
 
 Three explicit inference paths:
@@ -1169,19 +1320,34 @@ Three explicit inference paths:
 This app also includes a separate **Verovio Visual Score** tab for score + graph overlays.
 
 Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
-""")
+"""
+        )
 
         with gr.Row():
-            full_ckpt = gr.Textbox(label="Base (Full Inference) Checkpoint", value=DEFAULT_FULL_CKPT)
-            masked_ckpt = gr.Textbox(label="Masked (Partial Inference) Checkpoint", value=DEFAULT_MASKED_CKPT)
-            device = gr.Dropdown(label="Device", choices=["auto", "cuda", "cpu"], value="auto")
+            full_ckpt = gr.Textbox(
+                label="Base (Full Inference) Checkpoint", value=DEFAULT_FULL_CKPT
+            )
+            masked_ckpt = gr.Textbox(
+                label="Masked (Partial Inference) Checkpoint", value=DEFAULT_MASKED_CKPT
+            )
+            device = gr.Dropdown(
+                label="Device", choices=["auto", "cuda", "cpu"], value="auto"
+            )
 
         with gr.Row():
-            score_file = gr.File(label="MusicXML Score", file_types=[".xml", ".musicxml", ".mxl"], type="filepath")
+            score_file = gr.File(
+                label="MusicXML Score",
+                file_types=[".xml", ".musicxml", ".mxl"],
+                type="filepath",
+            )
 
         task_selector = gr.CheckboxGroup(
             choices=list(AVAILABLE_TASKS.values()),
-            value=[AVAILABLE_TASKS[t] for t in DEFAULT_EDITABLE_TASKS if t in AVAILABLE_TASKS],
+            value=[
+                AVAILABLE_TASKS[t]
+                for t in DEFAULT_EDITABLE_TASKS
+                if t in AVAILABLE_TASKS
+            ],
             label="Select Analysis Tasks",
             info="Choose which tasks to run and show in the editable table and visual tab.",
         )
@@ -1247,7 +1413,11 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                         )
                     beat_tasks = gr.CheckboxGroup(
                         label="Beat Tasks",
-                        choices=[(AVAILABLE_TASKS.get(t, t), t) for t in DEFAULT_BEAT_TASKS if t in AVAILABLE_TASKS],
+                        choices=[
+                            (AVAILABLE_TASKS.get(t, t), t)
+                            for t in BEAT_TASK_CHOICES
+                            if t in AVAILABLE_TASKS
+                        ],
                         value=[t for t in DEFAULT_BEAT_TASKS if t in AVAILABLE_TASKS],
                         info="Tasks to include in the beat-level table.",
                     )
@@ -1278,13 +1448,23 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     interactive=True,
                     wrap=True,
                 )
+                note_csv_download = gr.File(
+                    label="Download Predictions CSV",
+                    interactive=False,
+                )
                 status = gr.Textbox(label="Status", interactive=False)
-                trace_output = gr.Textbox(label="Iteration Trace", interactive=False, lines=12)
+                trace_output = gr.Textbox(
+                    label="Iteration Trace", interactive=False, lines=12
+                )
                 beat_status = gr.Textbox(label="Beat Status", interactive=False)
                 beat_table = gr.Dataframe(
                     label="Beat-Level Table",
                     interactive=False,
                     wrap=True,
+                )
+                beat_csv_download = gr.File(
+                    label="Download Beat-Level CSV",
+                    interactive=False,
                 )
 
             with gr.Tab("Verovio Visual Score"):
@@ -1298,7 +1478,9 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     value=[],
                     info="Edges are hidden by default; select one or more types and refresh.",
                 )
-                refresh_visual_btn = gr.Button("Refresh Visual from Latest Predictions", variant="secondary")
+                refresh_visual_btn = gr.Button(
+                    "Refresh Visual from Latest Predictions", variant="secondary"
+                )
                 visual_html = gr.HTML(
                     value=(
                         "<div style='padding:12px;border:1px solid #d1d5db;border-radius:10px;background:#fff;'>"
@@ -1419,7 +1601,16 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 target_only_update,
                 show_trace,
             ],
-            outputs=[table, status, trace_output, visual_payload_state, beat_table, beat_status],
+            outputs=[
+                table,
+                status,
+                trace_output,
+                visual_payload_state,
+                note_csv_download,
+                beat_table,
+                beat_status,
+                beat_csv_download,
+            ],
         )
 
         refresh_visual_btn.click(

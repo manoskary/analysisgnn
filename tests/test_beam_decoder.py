@@ -5,6 +5,8 @@ from analysisgnn.inference.beam_decoder import (
     build_smoothed_note_probs_from_class_ids,
     decode_onset_beam,
 )
+from analysisgnn.inference.harmonic_state import get_default_harmonic_state_library
+from analysisgnn.inference.harmonic_state import get_default_component_harmonic_state_library
 
 
 def _make_note_probs(num_notes: int, num_classes: int, preferred_idx: int) -> torch.Tensor:
@@ -125,3 +127,113 @@ def test_build_smoothed_note_probs_from_class_ids_normalizes():
     assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-6)
     winners = probs.argmax(dim=-1)
     assert torch.equal(winners, class_ids)
+
+
+def test_decode_onset_beam_structured_v2_returns_state_aligned_outputs():
+    library = get_default_harmonic_state_library()
+    state = next(s for s in library.states if s.localkey == "C" and s.roman_numeral == "I")
+    num_notes = 6
+    onset_ids = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
+    task_num_classes = {
+        "romanNumeral": 184,
+        "localkey": 50,
+        "quality": 16,
+        "inversion": 4,
+        "degree1": 22,
+        "degree2": 22,
+        "root": 38,
+        "bass": 38,
+        "tpc_in_label": 2,
+    }
+    note_prob_dict = {}
+    for task, num_classes in task_num_classes.items():
+        preferred = state.class_ids.get(task, 0)
+        note_prob_dict[task] = _make_note_probs(num_notes, num_classes, preferred)
+    payload = decode_onset_beam(
+        note_prob_dict=note_prob_dict,
+        onset_ids=onset_ids,
+        task_num_classes=task_num_classes,
+        legal_rn_set=None,
+        spec={"enabled": True, "version": "structured_v2", "beam_width": 4, "nbest": 2},
+    )
+    assert payload is not None
+    assert payload["beam_trace"]["version"] == "structured_v2"
+    assert payload["onset_values"].shape[0] == 3
+    assert payload["note_class_ids"]["romanNumeral"].shape[0] == num_notes
+    assert payload["note_class_ids"]["romanNumeral"][0].item() == state.class_ids["romanNumeral"]
+    assert payload["note_class_ids"]["localkey"][0].item() == state.class_ids["localkey"]
+    assert len(payload["beam_trace"]["nbest"]) >= 1
+
+
+def test_component_harmonic_state_library_contains_basic_tonic_state():
+    library = get_default_component_harmonic_state_library()
+    state = next(
+        s
+        for s in library.states
+        if s.localkey == "C"
+        and s.degree1 == "1"
+        and s.degree2 == "None"
+        and s.quality == "major triad"
+        and int(s.inversion) == 0
+    )
+    fetched = library.get(
+        state.class_ids["localkey"],
+        state.class_ids["degree1"],
+        state.class_ids["degree2"],
+        state.class_ids["quality"],
+        state.class_ids["inversion"],
+    )
+    assert fetched is not None
+    assert fetched.complete_rn
+
+
+def test_decode_onset_beam_component_v3_ignores_rn_head_and_returns_component_states():
+    library = get_default_component_harmonic_state_library()
+    state = next(
+        s
+        for s in library.states
+        if s.localkey == "C"
+        and s.degree1 == "1"
+        and s.degree2 == "None"
+        and s.quality == "major triad"
+        and int(s.inversion) == 0
+    )
+    num_notes = 6
+    onset_ids = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
+    task_num_classes = {
+        "romanNumeral": 184,
+        "localkey": 50,
+        "quality": 16,
+        "inversion": 4,
+        "degree1": 22,
+        "degree2": 22,
+        "root": 38,
+        "bass": 38,
+        "tpc_in_label": 2,
+    }
+    note_prob_dict = {
+        "romanNumeral": _make_note_probs(num_notes, 184, 0),
+        "localkey": _make_note_probs(num_notes, 50, state.class_ids["localkey"]),
+        "quality": _make_note_probs(num_notes, 16, state.class_ids["quality"]),
+        "inversion": _make_note_probs(num_notes, 4, state.class_ids["inversion"]),
+        "degree1": _make_note_probs(num_notes, 22, state.class_ids["degree1"]),
+        "degree2": _make_note_probs(num_notes, 22, state.class_ids["degree2"]),
+        "root": _make_note_probs(num_notes, 38, state.class_ids.get("root", 0)),
+        "bass": _make_note_probs(num_notes, 38, state.class_ids.get("bass", 0)),
+        "tpc_in_label": _make_note_probs(num_notes, 2, 1),
+    }
+    payload = decode_onset_beam(
+        note_prob_dict=note_prob_dict,
+        onset_ids=onset_ids,
+        task_num_classes=task_num_classes,
+        legal_rn_set=None,
+        spec={"enabled": True, "version": "component_v3", "beam_width": 4, "nbest": 2},
+    )
+    assert payload is not None
+    assert payload["beam_trace"]["version"] == "component_v3"
+    assert payload["onset_values"].shape[0] == 3
+    assert payload["note_class_ids"]["localkey"][0].item() == state.class_ids["localkey"]
+    assert payload["note_class_ids"]["degree1"][0].item() == state.class_ids["degree1"]
+    assert payload["note_class_ids"]["quality"][0].item() == state.class_ids["quality"]
+    assert payload["onset_margin"].shape[0] == 3
+    assert len(payload["onset_complete_rn"]) == 3
