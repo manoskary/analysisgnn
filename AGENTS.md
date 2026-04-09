@@ -572,6 +572,30 @@ confidence heatmaps) can populate `note_colors` the same way.
 interpolation from lightgrey `rgb(211,211,211)` at score=0 to black `rgb(0,0,0)` at
 score=1.
 
+### Step 4b: FlexOHR-Based Complete RN Column — DONE
+
+Replaced the hand-rolled `decode_roman_numeral()` (from `analysisgnn/utils/roman_decode.py`)
+with FlexOHR's `OHR.from_()` + `.to_format('dcml')` for the "Complete RN" column in the
+Gradio app. The old `_parse_inversion_value`, `_build_complete_rn_column` (old version),
+and the `decode_roman_numeral` import were removed entirely.
+
+Key changes in `examples/gradio_hybrid_analysis_app.py`:
+- Imports: `flexohr.codecs.analysisgnn` (codec activation), `OHR`, `ChordQuality`,
+  `Inversion`, `CollectionType`, `SD`, `build_key_context`, `infer_collection_type`,
+  `build_key_context_from_row`
+- `_derive_global_key(df)`: finds the most frequent `(romanNumeral, localkey)` pair
+  where `romanNumeral` is `"I"` or `"i"`; returns uppercase SPC for major, lowercase
+  for minor; raises `ValueError` if derivation fails
+- `_build_complete_rn_column(df, global_key)`: per-row FlexOHR OHR construction from
+  five principal tasks (degree1, degree2, inversion, quality, localkey), rendered via
+  `.to_format('dcml')` — output format is `chord/localkey/globalkey` (e.g. `V7/V/I/G`)
+- `global_key` parameter threaded through `_build_complete_rn_spans`,
+  `_build_graph_overlay_payload`, `_build_visual_payload`
+- New Gradio `global_key_field` text field in Module 2, auto-populated on inference /
+  Delta Lake load, editable by the user; passed as input to `run_aggregation` and
+  `refresh_visual_tab`; returned as output from `run_full_inference`,
+  `load_from_delta_lake`, and `run_edit_conditioned`
+
 ### Step 5: Aggregation Experimentation Framework
 
 The `analysisgnn/aggregation/` package is already created (see Step 3) with:

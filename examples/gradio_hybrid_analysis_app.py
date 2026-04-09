@@ -39,7 +39,12 @@ from analysisgnn.inference.hybrid_predictor import (
     predictions_to_dataframe,
 )
 from analysisgnn.utils.chord_representations import format_table_output
-from analysisgnn.utils.roman_decode import decode_roman_numeral
+
+import flexohr as flx
+import flexohr.codecs.analysisgnn  # noqa: F401 — activate codec
+import flexohr.harmony.harmony_enums  # noqa: F401
+import flexohr.paradigms.pitchspace.scale  # noqa: F401
+import flexohr.paradigms.pitchspace.scale_degrees  # noqa: F401
 
 from analysisgnn.aggregation import get_strategy, list_strategies
 from analysisgnn.storage.delta_writer import write_analysis_results
@@ -130,7 +135,9 @@ def _load_score(score_path: str):
     return pt.load_score(score_path)
 
 
-def _get_predictor(full_ckpt: str, masked_ckpt: str, device: str) -> HybridAnalysisPredictor:
+def _get_predictor(
+    full_ckpt: str, masked_ckpt: str, device: str
+) -> HybridAnalysisPredictor:
     full_ckpt = (full_ckpt or "").strip()
     masked_ckpt = (masked_ckpt or "").strip()
     if not full_ckpt:
@@ -154,7 +161,9 @@ def _resolve_selected_tasks(task_labels: List[str], tasks_csv: str) -> List[str]
     label_to_task = {v: k for k, v in AVAILABLE_TASKS.items()}
     supported_tasks = set(AVAILABLE_TASKS.keys())
     if task_labels:
-        tasks = [label_to_task[label] for label in task_labels if label in label_to_task]
+        tasks = [
+            label_to_task[label] for label in task_labels if label in label_to_task
+        ]
     else:
         tasks = parse_task_csv(tasks_csv)
     normalized: List[str] = []
@@ -169,7 +178,9 @@ def _resolve_selected_tasks(task_labels: List[str], tasks_csv: str) -> List[str]
     return normalized
 
 
-def _apply_timing_from_predictions(df: pd.DataFrame, predictions: Dict[str, torch.Tensor]) -> pd.DataFrame:
+def _apply_timing_from_predictions(
+    df: pd.DataFrame, predictions: Dict[str, torch.Tensor]
+) -> pd.DataFrame:
     out = df.copy()
     onset = predictions.get("onset_beat")
     if isinstance(onset, torch.Tensor) and onset.numel() == len(out):
@@ -195,66 +206,116 @@ def _value_or_none(value: Any) -> Any:
     return value
 
 
-def _parse_inversion_value(value: Any) -> Any:
-    val = _value_or_none(value)
-    if val is None:
-        return None
-    if isinstance(val, (int, np.integer)):
-        return int(val)
-    if isinstance(val, float):
-        return int(val)
-    text = str(val).strip()
-    if text == "":
-        return None
-    try:
-        return int(float(text))
-    except Exception:
-        mapping = {
-            "root": 0,
-            "root position": 0,
-            "6": 1,
-            "63": 1,
-            "first inversion": 1,
-            "64": 2,
-            "second inversion": 2,
-            "65": 1,
-            "43": 2,
-            "2": 3,
-            "42": 3,
-            "third inversion": 3,
-        }
-        return mapping.get(text.lower(), None)
+def _derive_global_key(df: pd.DataFrame) -> str:
+    """Derive the global key from the most frequent (romanNumeral, localkey)
+    pair where romanNumeral is ``"I"`` or ``"i"``.
+
+    Returns an uppercase SPC string for major (e.g. ``"G"``) or lowercase
+    for minor (e.g. ``"c"``).
+
+    Raises
+    ------
+    ValueError
+        If the global key cannot be derived (empty DataFrame, missing
+        columns, or no tonic chords found).
+    """
+    if df is None or len(df) == 0:
+        raise ValueError("Cannot derive global key: DataFrame is empty.")
+    if "romanNumeral" not in df.columns or "localkey" not in df.columns:
+        raise ValueError(
+            "Cannot derive global key: DataFrame is missing 'romanNumeral' "
+            "and/or 'localkey' columns."
+        )
+    mask = df["romanNumeral"].isin(["I", "i"])
+    candidates = df.loc[mask, ["romanNumeral", "localkey"]]
+    if len(candidates) == 0:
+        raise ValueError(
+            "Cannot derive global key: no rows with romanNumeral 'I' or 'i'."
+        )
+    counts = (
+        candidates.groupby(["romanNumeral", "localkey"])
+        .size()
+        .reset_index(name="count")
+    )
+    best = counts.loc[counts["count"].idxmax()]
+    rn, lk = str(best["romanNumeral"]), _agnn_to_flx_pitch(str(best["localkey"]))
+    return lk.lower() if rn == "i" else lk
 
 
-def _build_complete_rn_column(df: pd.DataFrame) -> pd.Series:
+def _agnn_to_flx_pitch(name: str) -> str:
+    """Normalise an AnalysisGNN pitch-class string for FlexOHR.
+
+    AnalysisGNN uses ``-`` for flat (e.g. ``A-``, ``B--``); FlexOHR's
+    ``SPC`` expects ``b`` (e.g. ``Ab``, ``Bbb``).
+    """
+    return name.replace("-", "b")
+
+
+def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
+    """Build the Complete RN column using FlexOHR OHR objects.
+
+    Each row's five principal task predictions (degree1, degree2, inversion,
+    quality, localkey) are used to construct a FlexOHR OHR, which is then
+    rendered via ``.to_format('dcml')``.
+    """
     if df is None or len(df) == 0:
         return pd.Series(dtype=object)
-    out: List[str] = []
     required = ["degree1", "degree2", "inversion", "quality", "localkey"]
     missing = [k for k in required if k not in df.columns]
     if missing:
         return pd.Series([""] * len(df), index=df.index, dtype=object)
+
+    gk = _agnn_to_flx_pitch(global_key)
+    out: List[str] = []
     for _, row in df.iterrows():
-        d1 = _value_or_none(row.get("degree1"))
-        d2 = _value_or_none(row.get("degree2"))
-        inv = _parse_inversion_value(row.get("inversion"))
-        quality = _value_or_none(row.get("quality"))
-        localkey = _value_or_none(row.get("localkey"))
-        if d1 is None or inv is None or quality is None or localkey is None:
-            out.append("")
-            continue
         try:
-            rn = decode_roman_numeral(
-                degree1=str(d1),
-                degree2=str(d2) if d2 is not None else "None",
-                inversion=inv,
-                quality=str(quality),
-                localkey=str(localkey),
-                include_key=False,
+            quality = flx.harmony.harmony_enums.ChordQuality.from_format(
+                str(row["quality"]),
+                "analysisgnn",
             )
+            inv = flx.harmony.harmony_enums.Inversion.from_format(
+                str(int(row["inversion"])),
+                "analysisgnn",
+            )
+            lk_str = _agnn_to_flx_pitch(str(row["localkey"]))
+            lk_coll = flx.paradigms.pitchspace.scale.infer_collection_type(lk_str)
+
+            degree2_val = row.get("degree2")
+            if pd.notna(degree2_val) and str(degree2_val).strip() not in ("", "None"):
+                sd2 = flx.paradigms.pitchspace.scale_degrees.SD.from_string(
+                    str(degree2_val),
+                    collection_type=lk_coll,
+                )
+                ref_ohr = flx.paradigms.pitchspace.scale.build_key_context(
+                    gk,
+                    lk_str,
+                    tonicized_key=sd2,
+                    tonicized_coll=flx.harmony.harmony_enums.CollectionType.major,
+                )
+                tonic_coll = flx.harmony.harmony_enums.CollectionType.major
+            else:
+                # Normalise the row's localkey for FlexOHR before delegating
+                norm_row = dict(row)
+                norm_row["localkey"] = lk_str
+                ref_ohr = flx.codecs.analysisgnn.build_key_context_from_row(
+                    norm_row,
+                    gk,
+                )
+                tonic_coll = lk_coll
+
+            degree1_sd = flx.paradigms.pitchspace.scale_degrees.SD.from_string(
+                str(row["degree1"]),
+                collection_type=tonic_coll,
+            )
+            ohr = flx.OHR.from_(
+                quality,
+                degree1_sd,
+                inversion=inv,
+                reference_ohr=ref_ohr,
+            )
+            out.append(ohr.to_format("dcml"))
         except Exception:
-            rn = ""
-        out.append(rn)
+            out.append("")
     return pd.Series(out, index=df.index, dtype=object)
 
 
@@ -331,7 +392,9 @@ def _read_score_xml_text(score_path: str, score: pt.score.Score) -> str:
             pass
 
 
-def _build_complete_rn_spans(df: pd.DataFrame) -> List[Tuple[int, int, str]]:
+def _build_complete_rn_spans(
+    df: pd.DataFrame, global_key: str
+) -> List[Tuple[int, int, str]]:
     """Build non-redundant Roman Numeral spans over onset_div."""
     if df is None or len(df) == 0:
         return []
@@ -340,20 +403,23 @@ def _build_complete_rn_spans(df: pd.DataFrame) -> List[Tuple[int, int, str]]:
 
     work = df.copy()
     if "romanNumeral_full" not in work.columns:
-        work["romanNumeral_full"] = _build_complete_rn_column(work)
+        work["romanNumeral_full"] = _build_complete_rn_column(work, global_key)
     if "duration_div" not in work.columns:
         return []
 
     work["onset_div"] = pd.to_numeric(work["onset_div"], errors="coerce")
-    work["duration_div"] = pd.to_numeric(work["duration_div"], errors="coerce").fillna(0)
-    work["romanNumeral_full"] = work["romanNumeral_full"].fillna("").astype(str).str.strip()
+    work["duration_div"] = pd.to_numeric(work["duration_div"], errors="coerce").fillna(
+        0
+    )
+    work["romanNumeral_full"] = (
+        work["romanNumeral_full"].fillna("").astype(str).str.strip()
+    )
     work = work.dropna(subset=["onset_div"])
     if len(work) == 0:
         return []
 
-    by_onset = (
-        work.sort_values(["onset_div", "duration_div"])
-        .groupby("onset_div", sort=True)
+    by_onset = work.sort_values(["onset_div", "duration_div"]).groupby(
+        "onset_div", sort=True
     )
     onset_points: List[int] = []
     onset_rn: List[str] = []
@@ -366,7 +432,12 @@ def _build_complete_rn_spans(df: pd.DataFrame) -> List[Tuple[int, int, str]]:
     if not onset_points:
         return []
 
-    score_end = int(np.max(work["onset_div"].to_numpy() + np.maximum(1, work["duration_div"].to_numpy())))
+    score_end = int(
+        np.max(
+            work["onset_div"].to_numpy()
+            + np.maximum(1, work["duration_div"].to_numpy())
+        )
+    )
     spans: List[Tuple[int, int, str]] = []
     current_rn = ""
     current_start: int | None = None
@@ -429,11 +500,15 @@ def _edges_from_pyg_data(data: Any, num_notes: int) -> Dict[str, List[List[int]]
     return edges
 
 
-def _edges_from_delta_lake_df(edges_df: pd.DataFrame, note_id_to_idx: Dict[str, int]) -> Dict[str, List[List[int]]]:
+def _edges_from_delta_lake_df(
+    edges_df: pd.DataFrame, note_id_to_idx: Dict[str, int]
+) -> Dict[str, List[List[int]]]:
     """Convert a Delta Lake edges DataFrame to the edge-list format used by Verovio."""
     edges: Dict[str, List[List[int]]] = {}
     for etype in DEFAULT_EDGE_TYPES:
-        sub = edges_df[edges_df["edge_type"] == etype] if len(edges_df) > 0 else edges_df
+        sub = (
+            edges_df[edges_df["edge_type"] == etype] if len(edges_df) > 0 else edges_df
+        )
         src_ids = sub["src"].tolist() if len(sub) > 0 else []
         dst_ids = sub["dst"].tolist() if len(sub) > 0 else []
         src_idx = [note_id_to_idx[s] for s in src_ids if s in note_id_to_idx]
@@ -454,18 +529,24 @@ def _build_graph_overlay_payload(
     tasks: List[str],
     edge_types: List[str],
     edges_all: Dict[str, List[List[int]]],
+    global_key: str = "",
 ) -> Dict[str, Any]:
     """Build the Verovio overlay payload."""
     n = min(len(df), len(note_array))
     data = df.iloc[:n].reset_index(drop=True).copy()
-    rn_full = _build_complete_rn_column(data)
+    if "romanNumeral_full" in data.columns:
+        rn_full = data["romanNumeral_full"].fillna("").astype(str)
+    elif global_key:
+        rn_full = _build_complete_rn_column(data, global_key)
+    else:
+        rn_full = pd.Series([""] * n, dtype=object)
     spans_df = data.copy()
     if "onset_div" in note_array.dtype.names:
         spans_df["onset_div"] = note_array["onset_div"][:n]
     if "duration_div" in note_array.dtype.names:
         spans_df["duration_div"] = note_array["duration_div"][:n]
     spans_df["romanNumeral_full"] = rn_full
-    rn_spans = _build_complete_rn_spans(spans_df)
+    rn_spans = _build_complete_rn_spans(spans_df, global_key)
 
     notes_payload: List[Dict[str, Any]] = []
     for idx in range(n):
@@ -485,22 +566,38 @@ def _build_graph_overlay_payload(
                         pass
 
         note_id = _value_or_none(row.get("note_id"))
-        score_note_id = _value_or_none(note_array["id"][idx]) if "id" in note_array.dtype.names else None
+        score_note_id = (
+            _value_or_none(note_array["id"][idx])
+            if "id" in note_array.dtype.names
+            else None
+        )
         notes_payload.append(
             {
                 "index": idx,
-                "row": int(_value_or_none(row.get("row")) if "row" in row.index else idx),
-                "note_id": str(score_note_id) if score_note_id is not None else (str(note_id) if note_id is not None else None),
+                "row": int(
+                    _value_or_none(row.get("row")) if "row" in row.index else idx
+                ),
+                "note_id": str(score_note_id)
+                if score_note_id is not None
+                else (str(note_id) if note_id is not None else None),
                 "table_note_id": str(note_id) if note_id is not None else None,
-                "onset_div": int(note_array["onset_div"][idx]) if "onset_div" in note_array.dtype.names else None,
+                "onset_div": int(note_array["onset_div"][idx])
+                if "onset_div" in note_array.dtype.names
+                else None,
                 "onset_beat": float(_value_or_none(row.get("onset_beat")) or 0.0),
-                "measure": int(_value_or_none(row.get("measure"))) if _value_or_none(row.get("measure")) is not None else None,
+                "measure": int(_value_or_none(row.get("measure")))
+                if _value_or_none(row.get("measure")) is not None
+                else None,
                 "duration_beat": float(_value_or_none(row.get("duration_beat")) or 0.0),
-                "pitch_midi": int(_value_or_none(row.get("pitch_midi"))) if _value_or_none(row.get("pitch_midi")) is not None else None,
+                "pitch_midi": int(_value_or_none(row.get("pitch_midi")))
+                if _value_or_none(row.get("pitch_midi")) is not None
+                else None,
                 "pitch_spelling": str(_value_or_none(row.get("pitch_spelling")) or ""),
                 "tasks": task_vals,
                 "confidence": conf,
-                "romanNumeral_full": str(rn_full.iloc[idx]) if idx < len(rn_full) else "",
+                "romanNumeral_full": str(rn_full.iloc[idx])
+                if idx < len(rn_full)
+                else "",
             }
         )
 
@@ -544,7 +641,7 @@ def _build_verovio_html(payload: Dict[str, Any]) -> str:
     return (
         "<iframe "
         "style='width:100%;height:980px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
-        f"srcdoc=\"{srcdoc}\"></iframe>"
+        f'srcdoc="{srcdoc}"></iframe>'
     )
 
 
@@ -555,10 +652,16 @@ def _build_visual_payload(
     tasks: List[str],
     edge_types: List[str],
     edges_all: Dict[str, List[List[int]]],
+    global_key: str = "",
 ) -> Dict[str, Any]:
     note_array = _sorted_note_array(score)
     payload = _build_graph_overlay_payload(
-        df=df, note_array=note_array, tasks=tasks, edge_types=edge_types, edges_all=edges_all,
+        df=df,
+        note_array=note_array,
+        tasks=tasks,
+        edge_types=edge_types,
+        edges_all=edges_all,
+        global_key=global_key,
     )
     payload["score_xml"] = _read_score_xml_text(score_path, score)
     payload["score_format"] = "musicxml"
@@ -576,7 +679,9 @@ def _build_iterative_spec(
     return {
         "enabled": bool(enable_iterative),
         "steps": int(max(1, iterative_steps)),
-        "keep_percentile_per_step": float(max(0.0, min(100.0, keep_percentile_per_step))),
+        "keep_percentile_per_step": float(
+            max(0.0, min(100.0, keep_percentile_per_step))
+        ),
         "masked_tasks": list(tasks),
         "mode": "cumulative",
         "freeze_confidence": "joint_mean",
@@ -673,7 +778,9 @@ def _precompute_delta_dfs(
         hyperedges_table, _ = _build_hyperedges_table(pyg_data, note_ids)
         hyperedges_df = hyperedges_table.to_pandas()
     else:
-        hyperedges_df = pd.DataFrame(columns=["group_id", "note_id", "edge_type", "parent_group_id"])
+        hyperedges_df = pd.DataFrame(
+            columns=["group_id", "note_id", "edge_type", "parent_group_id"]
+        )
 
     return {
         "probs_df": probs_df,
@@ -706,7 +813,8 @@ def run_full_inference(
     Returns:
         (display_df, log_text, visual_payload, csv_path,
          raw_predictions_state, intermediates_state, delta_dfs_state,
-         tasks_state, score_path_state, edges_state, model_available_flag)
+         tasks_state, score_path_state, edges_state, model_available_flag,
+         global_key)
     """
     try:
         log_text = _log(log_text, "Starting inference...")
@@ -790,6 +898,19 @@ def run_full_inference(
         # Precompute DataFrames for aggregation (cached)
         delta_dfs = _precompute_delta_dfs(predictions, intermediates_state)
 
+        # Derive global key from predictions
+        try:
+            global_key = _derive_global_key(display_df)
+        except ValueError as gk_exc:
+            global_key = ""
+            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+
+        # Add Complete RN column
+        if global_key:
+            display_df["romanNumeral_full"] = _build_complete_rn_column(
+                display_df, global_key
+            )
+
         # Build visual payload
         visual_payload = _build_visual_payload(
             score_path=score_path,
@@ -798,6 +919,7 @@ def run_full_inference(
             tasks=tasks,
             edge_types=[],
             edges_all=edges_all,
+            global_key=global_key,
         )
 
         # Write Delta Lake
@@ -846,6 +968,7 @@ def run_full_inference(
             score_path,
             edges_all,
             True,  # model_available
+            global_key,
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error: {exc}")
@@ -861,6 +984,7 @@ def run_full_inference(
             "",
             {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
+            "",
         )
 
 
@@ -906,7 +1030,9 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
 
         # Build "none" aggregation: argmax summary
         strategy = get_strategy("none")
-        display_df = strategy.aggregate(probs_df, notes_df, hyperedges_df, metadata, tasks=tasks)
+        display_df = strategy.aggregate(
+            probs_df, notes_df, hyperedges_df, metadata, tasks=tasks
+        )
         display_df = format_table_output(display_df, tasks)
 
         log_text = _log(
@@ -930,6 +1056,19 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             "metadata": metadata,
         }
 
+        # Derive global key from predictions
+        try:
+            global_key = _derive_global_key(display_df)
+        except ValueError as gk_exc:
+            global_key = ""
+            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+
+        # Add Complete RN column
+        if global_key:
+            display_df["romanNumeral_full"] = _build_complete_rn_column(
+                display_df, global_key
+            )
+
         csv_path = _write_csv_to_temp(display_df, score_path)
 
         return (
@@ -944,6 +1083,7 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             score_path,
             edges_all,
             False,  # model NOT available
+            global_key,
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error loading Delta Lake: {exc}")
@@ -959,6 +1099,7 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             "",
             {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
+            "",
         )
 
 
@@ -981,6 +1122,7 @@ def run_aggregation(
     score_path_state: str,
     edges_state: Any,
     intermediates_state: Any,
+    global_key_text: str,
     log_text: str,
 ):
     """Apply an aggregation strategy.  Uses a cache so that toggling back and
@@ -993,14 +1135,20 @@ def run_aggregation(
         tasks = tasks_state or []
         delta_dfs = delta_dfs_state or {}
         intermediates = intermediates_state or {}
+        global_key = (global_key_text or "").strip()
 
         if not delta_dfs or "probs_df" not in delta_dfs:
-            raise ValueError("No data available. Run inference or load Delta Lake first.")
+            raise ValueError(
+                "No data available. Run inference or load Delta Lake first."
+            )
 
         # Check cache
         if strategy_name in _aggregation_cache:
             display_df = _aggregation_cache[strategy_name]
-            log_text = _log(log_text, f"Aggregation '{strategy_name}' (cached). Rows={len(display_df)}.")
+            log_text = _log(
+                log_text,
+                f"Aggregation '{strategy_name}' (cached). Rows={len(display_df)}.",
+            )
         else:
             probs_df = delta_dfs["probs_df"]
             notes_df = delta_dfs["notes_df"]
@@ -1008,10 +1156,20 @@ def run_aggregation(
             metadata = delta_dfs.get("metadata", {})
 
             strategy = get_strategy(strategy_name)
-            result_df = strategy.aggregate(probs_df, notes_df, hyperedges_df, metadata, tasks=tasks)
+            result_df = strategy.aggregate(
+                probs_df, notes_df, hyperedges_df, metadata, tasks=tasks
+            )
             display_df = format_table_output(result_df, tasks)
+            # Add Complete RN column
+            if global_key:
+                display_df["romanNumeral_full"] = _build_complete_rn_column(
+                    display_df, global_key
+                )
             _aggregation_cache[strategy_name] = display_df
-            log_text = _log(log_text, f"Aggregation '{strategy_name}' applied. Rows={len(display_df)}.")
+            log_text = _log(
+                log_text,
+                f"Aggregation '{strategy_name}' applied. Rows={len(display_df)}.",
+            )
 
         # Build visual payload if score is available
         score_obj = intermediates.get("score")
@@ -1027,6 +1185,7 @@ def run_aggregation(
                 tasks=tasks,
                 edge_types=[],
                 edges_all=edges_all,
+                global_key=global_key,
             )
 
         csv_path = _write_csv_to_temp(display_df, score_path)
@@ -1052,7 +1211,10 @@ def save_delta_lake(
         if score_obj is None or note_array is None or pyg_data is None:
             dl_dir = intermediates.get("delta_lake_dir", "")
             if dl_dir:
-                return _log(log_text, f"Data was loaded from Delta Lake at {dl_dir}. No new data to write.")
+                return _log(
+                    log_text,
+                    f"Data was loaded from Delta Lake at {dl_dir}. No new data to write.",
+                )
             raise ValueError("No inference data available to save.")
 
         if not score_path:
@@ -1118,7 +1280,9 @@ def run_edit_conditioned(
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
         predictor = _get_predictor(full_ckpt, masked_ckpt, device)
 
-        edited_df = pd.DataFrame(edited_table) if edited_table is not None else pd.DataFrame()
+        edited_df = (
+            pd.DataFrame(edited_table) if edited_table is not None else pd.DataFrame()
+        )
         user_edits, masked_spec, info = build_mask_inputs_from_table_edits(
             edited_df=edited_df,
             masked_tasks=tasks,
@@ -1199,6 +1363,19 @@ def run_edit_conditioned(
         delta_dfs = _precompute_delta_dfs(predictions, new_intermediates)
         _clear_aggregation_cache()
 
+        # Derive global key from predictions
+        try:
+            global_key = _derive_global_key(display_df)
+        except ValueError as gk_exc:
+            global_key = ""
+            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+
+        # Add Complete RN column
+        if global_key:
+            display_df["romanNumeral_full"] = _build_complete_rn_column(
+                display_df, global_key
+            )
+
         visual_payload = _build_visual_payload(
             score_path=score_path,
             score=score_obj,
@@ -1206,6 +1383,7 @@ def run_edit_conditioned(
             tasks=tasks,
             edge_types=[],
             edges_all=edges_all,
+            global_key=global_key,
         )
 
         log_text = _log(
@@ -1231,6 +1409,7 @@ def run_edit_conditioned(
             score_path,
             edges_all,
             True,
+            global_key,
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error: {exc}")
@@ -1246,6 +1425,7 @@ def run_edit_conditioned(
             "",
             edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
+            "",
         )
 
 
@@ -1299,17 +1479,23 @@ def refresh_visual_tab(
     table_data: Any,
     edge_type_labels: List[str],
     nct_color_labels: List[str],
+    global_key_text: str,
     visual_state: Dict[str, Any],
     intermediates_state: Any,
     edges_state: Any,
     log_text: str,
 ):
     try:
-        selected_edge_types = [k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])]
-        nct_color = bool(nct_color_labels and "Colour non-chord tones grey" in nct_color_labels)
+        selected_edge_types = [
+            k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])
+        ]
+        nct_color = bool(
+            nct_color_labels and "Colour non-chord tones grey" in nct_color_labels
+        )
         tasks = _resolve_selected_tasks(task_labels, tasks_csv)
         intermediates = intermediates_state or {}
         edges_all = edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES}
+        global_key = (global_key_text or "").strip()
 
         # Resolve score: prefer the Verovio-tab file upload, fall back to intermediates
         score_obj = None
@@ -1343,6 +1529,7 @@ def refresh_visual_tab(
                 tasks=tasks,
                 edge_types=selected_edge_types,
                 edges_all=edges_all,
+                global_key=global_key,
             )
             # Apply NCT coloring
             if nct_color:
@@ -1375,7 +1562,11 @@ def refresh_visual_tab(
             "</div>"
         )
         log_text = _log(log_text, f"Visual error: {exc}")
-        return fallback, log_text, visual_state if isinstance(visual_state, dict) else {}
+        return (
+            fallback,
+            log_text,
+            visual_state if isinstance(visual_state, dict) else {},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1397,7 +1588,7 @@ def build_demo() -> gr.Blocks:
         visual_payload_state = gr.State({})
         raw_predictions_state = gr.State({})
         intermediates_state = gr.State({})
-        delta_dfs_state = gr.State({})         # precomputed probs/notes/hyperedges DFs
+        delta_dfs_state = gr.State({})  # precomputed probs/notes/hyperedges DFs
         tasks_state = gr.State([])
         score_path_state = gr.State("")
         edges_state = gr.State({k: [[], []] for k in DEFAULT_EDGE_TYPES})
@@ -1413,16 +1604,30 @@ def build_demo() -> gr.Blocks:
             # ------ Tab 1a: Analyse Score ------
             with gr.Tab("Analyse Score"):
                 with gr.Row():
-                    full_ckpt = gr.Textbox(label="Base (Full Inference) Checkpoint", value=DEFAULT_FULL_CKPT)
-                    masked_ckpt = gr.Textbox(label="Masked (Partial Inference) Checkpoint", value=DEFAULT_MASKED_CKPT)
-                    device = gr.Dropdown(label="Device", choices=["auto", "cuda", "cpu"], value="auto")
+                    full_ckpt = gr.Textbox(
+                        label="Base (Full Inference) Checkpoint",
+                        value=DEFAULT_FULL_CKPT,
+                    )
+                    masked_ckpt = gr.Textbox(
+                        label="Masked (Partial Inference) Checkpoint",
+                        value=DEFAULT_MASKED_CKPT,
+                    )
+                    device = gr.Dropdown(
+                        label="Device", choices=["auto", "cuda", "cpu"], value="auto"
+                    )
 
                 with gr.Row():
-                    score_file = gr.File(label="MusicXML Score", file_types=[".xml", ".musicxml", ".mxl"], type="filepath")
+                    score_file = gr.File(
+                        label="MusicXML Score",
+                        file_types=[".xml", ".musicxml", ".mxl"],
+                        type="filepath",
+                    )
 
                 task_selector = gr.CheckboxGroup(
                     choices=list(AVAILABLE_TASKS.values()),
-                    value=list(AVAILABLE_TASKS.values()),  # All tasks selected by default
+                    value=list(
+                        AVAILABLE_TASKS.values()
+                    ),  # All tasks selected by default
                     label="Select Analysis Tasks",
                     info="Choose which tasks to run and show in the editable table and visual tab.",
                 )
@@ -1446,7 +1651,9 @@ def build_demo() -> gr.Blocks:
 
             # ------ Tab 1b: Load Delta Lake ------
             with gr.Tab("Load Delta Lake"):
-                gr.Markdown("Select a `metadata.json` file from an existing Delta Lake output directory.")
+                gr.Markdown(
+                    "Select a `metadata.json` file from an existing Delta Lake output directory."
+                )
                 delta_lake_explorer = gr.FileExplorer(
                     glob="**/metadata.json",
                     root_dir=str(REPO_ROOT),
@@ -1462,6 +1669,13 @@ def build_demo() -> gr.Blocks:
         gr.Markdown("## Module 2: Analysis Results")
 
         with gr.Row():
+            global_key_field = gr.Textbox(
+                label="Global Key",
+                value="",
+                info="Auto-derived from predictions (most frequent tonic). Editable.",
+                max_lines=1,
+                scale=0,
+            )
             aggregation_dropdown = gr.Dropdown(
                 label="Aggregation Strategy",
                 choices=[s.capitalize() for s in list_strategies()],
@@ -1520,8 +1734,10 @@ def build_demo() -> gr.Blocks:
         # ==================================================================
         gr.Markdown("---")
         gr.Markdown("## Module 3: Edit-Conditioned Re-Inference")
-        gr.Markdown("*Requires a live model (run inference in Module 1a first). "
-                     "Grayed out when loading from Delta Lake.*")
+        gr.Markdown(
+            "*Requires a live model (run inference in Module 1a first). "
+            "Grayed out when loading from Delta Lake.*"
+        )
 
         tasks_csv = gr.Textbox(
             label="Tasks Override (internal keys CSV, optional)",
@@ -1551,7 +1767,9 @@ def build_demo() -> gr.Blocks:
                 interactive=False,
             )
 
-        update_analysis_btn = gr.Button("Update Analysis", variant="stop", interactive=False)
+        update_analysis_btn = gr.Button(
+            "Update Analysis", variant="stop", interactive=False
+        )
 
         # ==================================================================
         # DIAGNOSTICS (single log for everything)
@@ -1612,11 +1830,18 @@ def build_demo() -> gr.Blocks:
                 score_path_state,
                 edges_state,
                 model_available_state,
+                global_key_field,
             ],
         ).then(
             fn=_update_module3_interactivity,
             inputs=[model_available_state],
-            outputs=[target_only_update, known_rows_expr, target_rows_expr, update_analysis_btn, tasks_csv],
+            outputs=[
+                target_only_update,
+                known_rows_expr,
+                target_rows_expr,
+                update_analysis_btn,
+                tasks_csv,
+            ],
         )
         # Auto-fill Verovio score file from Module 1a
         score_file.change(
@@ -1645,11 +1870,18 @@ def build_demo() -> gr.Blocks:
                 score_path_state,
                 edges_state,
                 model_available_state,
+                global_key_field,
             ],
         ).then(
             fn=_update_module3_interactivity,
             inputs=[model_available_state],
-            outputs=[target_only_update, known_rows_expr, target_rows_expr, update_analysis_btn, tasks_csv],
+            outputs=[
+                target_only_update,
+                known_rows_expr,
+                target_rows_expr,
+                update_analysis_btn,
+                tasks_csv,
+            ],
         )
 
         # ---- Module 2: Aggregate! ----
@@ -1662,6 +1894,7 @@ def build_demo() -> gr.Blocks:
                 score_path_state,
                 edges_state,
                 intermediates_state,
+                global_key_field,
                 log_output,
             ],
             outputs=[table, log_output, visual_payload_state, csv_download],
@@ -1688,6 +1921,7 @@ def build_demo() -> gr.Blocks:
                 table,
                 visual_edge_types,
                 nct_color_group,
+                global_key_field,
                 visual_payload_state,
                 intermediates_state,
                 edges_state,
@@ -1734,6 +1968,7 @@ def build_demo() -> gr.Blocks:
                 score_path_state,
                 edges_state,
                 model_available_state,
+                global_key_field,
             ],
         )
 
