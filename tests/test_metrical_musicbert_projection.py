@@ -1,6 +1,6 @@
 import torch
 
-from analysisgnn.models.analysis import TorchAnalysisGNN
+from analysisgnn.models.analysis import ContinualAnalysisGNN, TorchAnalysisGNN
 
 
 def test_metrical_projection_uses_base_width_for_non_note_nodes():
@@ -43,3 +43,37 @@ def test_metrical_projection_uses_base_width_for_non_note_nodes():
     )
 
     assert x.shape == (5, 16)
+
+
+def test_runtime_feature_alignment_truncates_metrical_nodes_to_checkpoint_width():
+    predictor = object.__new__(ContinualAnalysisGNN)
+    object.__setattr__(
+        predictor,
+        "model",
+        TorchAnalysisGNN(
+            metadata=(
+                ["note", "beat", "measure"],
+                [("note", "onset", "note")],
+            ),
+            in_channels=1047,
+            base_in_channels=23,
+            hidden_channels=32,
+            out_channels=16,
+            task_dict={"romanNumeral": 185},
+            num_layers=1,
+            use_graph_encoder=False,
+            logit_fusion=False,
+        ),
+    )
+
+    aligned = predictor._align_runtime_x_dict_feature_dims(
+        {
+            "note": torch.zeros(5, 1047),
+            "beat": torch.zeros(3, 25),
+            "measure": torch.zeros(2, 25),
+        }
+    )
+
+    assert aligned["note"].shape == (5, 1047)
+    assert aligned["beat"].shape == (3, 23)
+    assert aligned["measure"].shape == (2, 23)

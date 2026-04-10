@@ -2617,6 +2617,56 @@ class ContinualAnalysisGNN(LightningModule):
         )
         return torch.cat([x_note, pad], dim=-1)
 
+    def _expected_node_input_dim(self, node_type: str) -> Optional[int]:
+        try:
+            node_proj = self.model.project_dict[node_type][0]
+            if not isinstance(node_proj, nn.Linear):
+                return None
+            if node_type == "note":
+                return int(node_proj.in_features - 128)
+            return int(node_proj.in_features)
+        except Exception:
+            return None
+
+    def _align_node_feature_dim(
+        self,
+        node_type: str,
+        x_node: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_dim = self._expected_node_input_dim(node_type)
+        if expected_dim is None:
+            return x_node
+        current_dim = int(x_node.size(-1))
+        if current_dim == expected_dim:
+            return x_node
+        if current_dim > expected_dim:
+            warnings.warn(
+                f"Inference {node_type} features ({current_dim}) exceed expected ({expected_dim}); truncating.",
+                RuntimeWarning,
+            )
+            return x_node[..., :expected_dim]
+        warnings.warn(
+            f"Inference {node_type} features ({current_dim}) below expected ({expected_dim}); padding zeros.",
+            RuntimeWarning,
+        )
+        pad = torch.zeros(
+            (x_node.size(0), expected_dim - current_dim),
+            dtype=x_node.dtype,
+            device=x_node.device,
+        )
+        return torch.cat([x_node, pad], dim=-1)
+
+    def _align_runtime_x_dict_feature_dims(
+        self,
+        x_dict: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        aligned = dict(x_dict)
+        for node_type in getattr(self.model, "project_dict", {}).keys():
+            if node_type not in aligned:
+                continue
+            aligned[node_type] = self._align_node_feature_dim(node_type, aligned[node_type])
+        return aligned
+
     def _normalize_iterative_spec(
         self,
         iterative_spec: Optional[Dict[str, Any]],
@@ -7960,8 +8010,7 @@ class ContinualAnalysisGNN(LightningModule):
                     RuntimeWarning,
                 )
                 x_dict = data.x_dict
-            x_dict = dict(x_dict)
-            x_dict["note"] = self._align_note_feature_dim(x_dict["note"])
+            x_dict = self._align_runtime_x_dict_feature_dims(dict(x_dict))
             iterative_cfg = self._normalize_iterative_spec(
                 iterative_spec=iterative_spec,
                 conditioning=conditioning,

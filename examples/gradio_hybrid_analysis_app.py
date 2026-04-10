@@ -38,6 +38,7 @@ from analysisgnn.inference.hybrid_predictor import (
     parse_task_csv,
     predictions_to_dataframe,
 )
+from analysisgnn.utils.chord_symbols import build_beat_chord_symbol_row
 from analysisgnn.utils.chord_representations import format_table_output
 
 import flexohr as flx
@@ -779,6 +780,173 @@ def _build_iterative_spec(
         "confidence_temperature": 1.0,
         "zero_known_start": bool(zero_known_start),
     }
+
+
+def _is_trace_payload(obj: Any) -> bool:
+    return isinstance(obj, dict) and "enabled" in obj and "steps" in obj
+
+
+def _is_beat_payload(obj: Any) -> bool:
+    return (
+        isinstance(obj, dict)
+        and obj.get("level", "beat") == "beat"
+        and "rows" in obj
+        and "tasks" in obj
+        and "mode" in obj
+    )
+
+
+def _is_measure_payload(obj: Any) -> bool:
+    return (
+        isinstance(obj, dict)
+        and obj.get("level") == "measure"
+        and "rows" in obj
+        and "mode" in obj
+    )
+
+
+def _parse_predict_output(
+    output: Any,
+    *,
+    enable_iterative: bool,
+    enable_beat: bool,
+    enable_measure: bool,
+) -> Tuple[
+    Dict[str, torch.Tensor],
+    Dict[str, Any],
+    Optional[Dict[str, Any]],
+    Optional[Dict[str, Any]],
+]:
+    default_trace: Dict[str, Any] = {"enabled": False, "steps": []}
+    if isinstance(output, tuple):
+        if len(output) == 0:
+            return {}, default_trace, None, None
+        predictions = output[0]
+        trace = default_trace
+        beat_payload = None
+        measure_payload = None
+        for item in output[1:]:
+            if _is_trace_payload(item):
+                trace = item
+            elif _is_beat_payload(item):
+                beat_payload = item
+            elif _is_measure_payload(item):
+                measure_payload = item
+        if enable_iterative and trace is default_trace:
+            trace = {"enabled": True, "steps": []}
+        if enable_beat and beat_payload is None:
+            beat_payload = {"level": "beat", "rows": [], "tasks": [], "mode": "mean"}
+        if enable_measure and measure_payload is None:
+            measure_payload = {"level": "measure", "rows": [], "mode": "summary_v1"}
+        return predictions, trace, beat_payload, measure_payload
+    return output, default_trace, None, None
+
+
+def _beat_payload_to_dataframe(
+    beat_payload: Optional[Dict[str, Any]],
+    beat_tasks: List[str],
+) -> pd.DataFrame:
+    if not isinstance(beat_payload, dict):
+        return pd.DataFrame()
+    rows = beat_payload.get("rows", [])
+    if not rows:
+        return pd.DataFrame()
+
+    payload_tasks = beat_payload.get("tasks", [])
+    tasks = (
+        [task for task in beat_tasks if task in payload_tasks]
+        if beat_tasks
+        else list(payload_tasks)
+    )
+    if not tasks:
+        tasks = list(payload_tasks)
+
+    flat_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        out: Dict[str, Any] = {
+            "beat_id": row.get("beat_id"),
+            "beat_index": row.get("beat_index"),
+            "measure": row.get("measure"),
+            "onset_beat": row.get("onset_beat"),
+            "note_count": row.get("note_count"),
+            "romanNumeral_full": row.get("romanNumeral_full", ""),
+        }
+        task_map = row.get("tasks", {}) if isinstance(row, dict) else {}
+        for task in tasks:
+            entry = task_map.get(task, {}) if isinstance(task_map, dict) else {}
+            out[task] = entry.get("label")
+            out[f"{task}_confidence"] = entry.get("confidence")
+            out[f"{task}_conflict_flag"] = entry.get("conflict_flag")
+            out[f"{task}_conflict_prob"] = entry.get("conflict_prob")
+        out.update(build_beat_chord_symbol_row(row if isinstance(row, dict) else {}))
+        flat_rows.append(out)
+
+    beat_df = pd.DataFrame(flat_rows)
+    core_cols = [
+        "beat_id",
+        "beat_index",
+        "measure",
+        "onset_beat",
+        "note_count",
+        "romanNumeral_full",
+        "chordSymbol_abs",
+        "chordSymbol_context",
+        "chordSymbol_supported",
+        "chordSymbol_ambiguous",
+        "chordSymbol_source",
+    ]
+    ordered_cols: List[str] = [col for col in core_cols if col in beat_df.columns]
+    for task in tasks:
+        for col in [
+            task,
+            f"{task}_confidence",
+            f"{task}_conflict_flag",
+            f"{task}_conflict_prob",
+        ]:
+            if col in beat_df.columns:
+                ordered_cols.append(col)
+    remaining = [col for col in beat_df.columns if col not in ordered_cols]
+    return beat_df[ordered_cols + remaining]
+
+
+def _measure_payload_to_dataframe(
+    measure_payload: Optional[Dict[str, Any]],
+) -> pd.DataFrame:
+    if not isinstance(measure_payload, dict):
+        return pd.DataFrame()
+    rows = measure_payload.get("rows", [])
+    if not rows:
+        return pd.DataFrame()
+
+    measure_df = pd.DataFrame(rows)
+    ordered_cols = [
+        "measure",
+        "measure_index",
+        "note_count",
+        "onset_count",
+        "measure_start_beat",
+        "measure_end_beat",
+        "tonal_space_label",
+        "tonal_space_confidence",
+        "mixedness",
+        "transition_flag",
+        "bar_localkey",
+        "bar_localkey_confidence",
+        "tonicization_target",
+        "tonicization_confidence",
+        "modulation_confidence",
+        "cadential_intent",
+        "cadential_confidence",
+        "harmonic_stability",
+        "harmonic_change_density",
+        "top2_label",
+        "top2_share",
+        "romanNumeral_full_mode",
+        "no_evidence",
+    ]
+    ordered_present = [col for col in ordered_cols if col in measure_df.columns]
+    remaining = [col for col in measure_df.columns if col not in ordered_present]
+    return measure_df[ordered_present + remaining]
 
 
 # Voter-related aggregation spec builder — commented out (voter not yet
@@ -1682,6 +1850,9 @@ def build_demo() -> gr.Blocks:
         score_path_state = gr.State("")
         edges_state = gr.State({k: [[], []] for k in DEFAULT_EDGE_TYPES})
         model_available_state = gr.State(False)
+        enable_iterative = gr.State(False)
+        iterative_steps = gr.State(10)
+        keep_percentile_per_step = gr.State(10.0)
 
         # ==================================================================
         # MODULE 1: DATA SOURCE
@@ -1720,21 +1891,6 @@ def build_demo() -> gr.Blocks:
                     label="Select Analysis Tasks",
                     info="Choose which tasks to run and show in the editable table and visual tab.",
                 )
-
-                with gr.Row():
-                    enable_iterative = gr.Checkbox(
-                        label="Enable Iterative Refinement",
-                        value=False,
-                    )
-                    iterative_steps = gr.Number(
-                        label="Refinement Steps",
-                        value=10,
-                        precision=0,
-                    )
-                    keep_percentile_per_step = gr.Number(
-                        label="Keep Percentile/Step",
-                        value=10.0,
-                    )
 
                 run_inference_btn = gr.Button("Run Inference", variant="primary")
 
