@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 from itertools import combinations
 import re
 import partitura
 import numpy as np
 import pandas as pd
 from analysisgnn.utils.globals import *
-from analysisgnn.utils.general import exit_after
 from fractions import Fraction
 import numpy.lib.recfunctions as rfn
 from music21.key import Key
@@ -556,7 +557,123 @@ inversions = {
 }
 
 
-import numpy as np
+# ---------------------------------------------------------------------------
+# Unified vocabulary resolution
+# ---------------------------------------------------------------------------
+
+# Mapping from task_dict keys to available_representations keys when they differ
+_TASK_KEY_ALIASES = {
+    "hrythm": "hrhythm",
+}
+
+# Extra representation classes not in available_representations but with a classList
+_EXTRA_REPRESENTATION_CLASSES = {
+    "note_degree": "NoteDegree49",
+}
+
+# Binary tasks with known semantics (class_id -> label).
+# All binary tasks use "False"/"True" string labels, where class 0 = "False"
+# (negative) and class 1 = "True" (positive).
+_BINARY_TASK_VOCABULARIES = {
+    "phrase": ["False", "True"],
+    "section": ["False", "True"],
+    "tpc_in_label": ["False", "True"],
+    "tpc_is_root": ["False", "True"],
+    "tpc_is_bass": ["False", "True"],
+    "organ_point": ["False", "True"],
+}
+
+
+def _class_list_to_strings(class_list):
+    """Convert a classList (which may contain ints, bools, tuples, etc.) to strings."""
+    result = []
+    for item in class_list:
+        if isinstance(item, (list, tuple, np.ndarray)):
+            # pcset-style tuples
+            seq = [str(int(x)) for x in np.asarray(item).reshape(-1).tolist()]
+            result.append("{" + ",".join(seq) + "}")
+        else:
+            result.append(str(item))
+    return result
+
+
+def _fit_vocab(vocab, num_classes, task_name):
+    """Ensure vocabulary length matches num_classes, truncating or padding."""
+    if len(vocab) == num_classes:
+        return vocab
+    if len(vocab) > num_classes:
+        return vocab[:num_classes]
+    # Pad with fallback names
+    return vocab + [f"class_{i}" for i in range(len(vocab), num_classes)]
+
+
+def resolve_task_vocabulary(task_name, num_classes):
+    """Resolve the ordered class vocabulary for a task.
+
+    The returned list has length == *num_classes*.  Position ``i`` in the list
+    is the human-readable label for softmax output index ``i``.
+
+    Resolution order:
+
+    1. ``available_representations`` (canonical vocabularies)
+    2. Key aliases (e.g. ``hrythm`` -> ``hrhythm``)
+    3. ``CadenceEncoder.accepted_cadences``
+    4. Extra representation classes (``NoteDegree49``)
+    5. Known binary task semantics
+    6. Known integer-labelled tasks (``downbeat``, ``staff``)
+    7. Fallback: ``"class_0"``, ``"class_1"``, ...
+
+    Parameters
+    ----------
+    task_name : str
+        Task key (e.g. ``"romanNumeral"``, ``"cadence"``).
+    num_classes : int
+        Number of output classes for the task.
+
+    Returns
+    -------
+    list[str]
+        Ordered vocabulary of length *num_classes*.
+    """
+    # 1. Direct lookup in available_representations
+    if task_name in available_representations:
+        vocab = _class_list_to_strings(available_representations[task_name].classList)
+        return _fit_vocab(vocab, num_classes, task_name)
+
+    # 2. Alias lookup
+    alias = _TASK_KEY_ALIASES.get(task_name)
+    if alias and alias in available_representations:
+        vocab = _class_list_to_strings(available_representations[alias].classList)
+        return _fit_vocab(vocab, num_classes, task_name)
+
+    # 3. Cadence
+    if task_name == "cadence":
+        from analysisgnn.utils.music import CadenceEncoder
+        enc = CadenceEncoder()
+        vocab = [str(v) for v in enc.accepted_cadences]
+        return _fit_vocab(vocab, num_classes, task_name)
+
+    # 4. Extra representation classes
+    if task_name in _EXTRA_REPRESENTATION_CLASSES:
+        cls_name = _EXTRA_REPRESENTATION_CLASSES[task_name]
+        cls = globals().get(cls_name)
+        if cls is not None and hasattr(cls, "classList"):
+            vocab = _class_list_to_strings(cls.classList)
+            return _fit_vocab(vocab, num_classes, task_name)
+
+    # 5. Known binary tasks
+    if task_name in _BINARY_TASK_VOCABULARIES:
+        vocab = list(_BINARY_TASK_VOCABULARIES[task_name])
+        return _fit_vocab(vocab, num_classes, task_name)
+
+    # 6. Known integer-label tasks (downbeat, staff) — labels are just the index
+    if task_name in ("downbeat", "staff"):
+        return [str(i) for i in range(num_classes)]
+
+    # 7. Fallback
+    return [f"class_{i}" for i in range(num_classes)]
+
+
 
 # The diagonal of keys in the Weber tonal chart
 # constrained to the range of keys between [Fb, G#]
@@ -826,3 +943,53 @@ def closestPcSet(pcset):
             closestPcSet = pcs
             mostSimilarScore = similarity
     return closestPcSet
+
+
+def format_table_output(df: pd.DataFrame, tasks) -> pd.DataFrame:
+    """Reorder columns for display: timing cols, then interleaved (task, task_confidence).
+
+    This is the canonical column-ordering function used by both the Gradio
+    app and reference CSV generation, ensuring that both produce identical
+    output.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of :func:`predictions_to_dataframe`.
+    tasks : list[str]
+        Ordered list of task names.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of *df* with columns reordered.
+    """
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+    if "note_id" not in out.columns:
+        out.insert(0, "note_id", np.arange(len(out)))
+
+    timing_cols = [
+        col
+        for col in [
+            "row", "note_id", "onset_beat", "measure",
+            "duration_beat", "pitch_spelling", "pitch_midi",
+        ]
+        if col in out.columns
+    ]
+    prediction_cols = [task for task in tasks if task in out.columns]
+    confidence_cols = [col for col in out.columns if col.endswith("_confidence")]
+
+    ordered_cols: list = timing_cols.copy()
+    for pred_col in prediction_cols:
+        ordered_cols.append(pred_col)
+        conf_col = f"{pred_col}_confidence"
+        if conf_col in confidence_cols:
+            ordered_cols.append(conf_col)
+    remaining_cols = [
+        col for col in out.columns
+        if col not in ordered_cols and not col.endswith("_id")
+    ]
+    out = out[ordered_cols + remaining_cols]
+    return out

@@ -100,6 +100,18 @@
   font-weight: 600;
 }
 
+g.note.agn-colored use,
+g.note.agn-colored > use,
+g.note.agn-colored path,
+g.note.agn-colored > path,
+g.note.agn-colored ellipse,
+g.note.agn-colored > ellipse,
+g.note.agn-colored circle,
+g.note.agn-colored > circle {
+  fill: var(--agn-note-color, currentColor);
+  stroke: var(--agn-note-color, currentColor);
+}
+
 g.note.agn-active use,
 g.note.agn-active > use,
 g.note.agn-active path,

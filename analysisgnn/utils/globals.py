@@ -2348,7 +2348,7 @@ SIMPLE_NUMERAL_VOCABULARY = [
     'biio',
     'bI',
     'bviio',
-    '#VII'
+    '#VII',
     # These are the 52 types that the DLC, resulting in 185 different simpleNumeral labels overall (incl. "none")
     # DLC: n_types=165, n_tokens=240129 (101 of which 'none')
     'bvio7',

@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Flexohr
+flexohr_project/
+
 # Distribution / packaging
 .Python
 build/
@@ -208,9 +211,8 @@ __marimo__/
 
 # AnalysisGNN artifacts (models, scores, outputs)
 artifacts/
-outputs/
 wandb/
-
+outputs/
 .vscode/
 
 /lightning_logs/
@@ -223,3 +225,7 @@ paper/
 None/
 scripts/*.sh
 .codex
+AGENTS.md
+PROMPT.md
+notebooks/*.musicxml
+examples/assets

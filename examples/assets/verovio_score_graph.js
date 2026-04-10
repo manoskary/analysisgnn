@@ -233,6 +233,17 @@
         });
       }
 
+      // Apply note colors from payload (e.g., NCT coloring).
+      // Uses CSS custom property --agn-note-color + class .agn-colored so that
+      // the active-note highlight (.agn-active with !important) still overrides.
+      const noteColors = payload.note_colors || {};
+      for (const [noteIndexStr, color] of Object.entries(noteColors)) {
+        const item = noteMap.get(Number(noteIndexStr));
+        if (!item || !item.noteGroup || !color) continue;
+        item.noteGroup.classList.add("agn-colored");
+        item.noteGroup.style.setProperty("--agn-note-color", color);
+      }
+
       const edgeEls = [];
       const edges = payload.edges || {};
       const edgeTypes = Object.keys(edgeColor);

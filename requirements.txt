@@ -25,6 +25,10 @@ miditok>=3.0.0
 wandb>=0.13.0
 huggingface_hub>=0.20.0
 
+# Storage (Delta Lake)
+deltalake>=0.22.0
+pyarrow>=14.0.0
+
 # Utilities
 tqdm>=4.64.0
 matplotlib>=3.5.0

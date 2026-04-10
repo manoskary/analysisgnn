@@ -2092,6 +2092,8 @@ class ContinualAnalysisGNN(LightningModule):
         aggregation_bundle: Optional[PosthocAggregationBundle] = None,
     ) -> Dict[str, torch.Tensor]:
         mode = str(aggregation_mode or self.aggregation_mode or "mean").lower().strip()
+        if mode == "none":
+            return {k: v.clone() for k, v in note_prob_dict.items()}
         out = {k: v.clone() for k, v in note_prob_dict.items()}
         out = onsetwise_logit_aggregation(
             out,
@@ -2150,6 +2152,8 @@ class ContinualAnalysisGNN(LightningModule):
     ) -> Tuple[str, Optional[PosthocAggregationBundle]]:
         spec = aggregation_spec or {}
         mode = str(spec.get("mode", self.aggregation_mode or "mean")).lower().strip()
+        if mode == "none":
+            return "none", None
         if mode not in {"mean", "voter", "voter_consistent_beat"}:
             mode = "mean"
         path = spec.get("voter_path", None)
@@ -7835,6 +7839,7 @@ class ContinualAnalysisGNN(LightningModule):
         measure_spec: Optional[Dict[str, Any]] = None,
         beam_spec: Optional[Dict[str, Any]] = None,
         return_iterative_trace: bool = False,
+        return_intermediates: bool = False,
         return_beat_predictions: bool = False,
         return_measure_predictions: bool = False,
         return_beam_payload: bool = False,
@@ -7853,6 +7858,8 @@ class ContinualAnalysisGNN(LightningModule):
             beam_spec: Optional beam-decoding override
                 {"enabled": bool, "beam_width": int, ...}. Beam is additive and does not overwrite baseline outputs.
             return_iterative_trace: If True, append iterative trace to output.
+            return_intermediates: If True, append intermediates dict with keys
+                ``"score"``, ``"note_array"``, ``"data"`` (the PyG graph).
             return_beat_predictions: If True, append optional beat-level parallel payload.
             return_measure_predictions: If True, append optional measure-level parallel payload.
             return_beam_payload: If True, append beam payload when beam decoding is enabled.
@@ -8116,6 +8123,14 @@ class ContinualAnalysisGNN(LightningModule):
                 )
             if return_iterative_trace:
                 outputs.append(iterative_trace)
+            if return_intermediates:
+                outputs.append(
+                    {
+                        "score": score_obj,
+                        "note_array": note_array,
+                        "data": data,
+                    }
+                )
             if return_beam_payload:
                 outputs.append(beam_output if beam_output is not None else {"beam_enabled": False})
             if return_beat_predictions:
