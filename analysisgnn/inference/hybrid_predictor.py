@@ -400,11 +400,13 @@ class HybridAnalysisPredictor:
         masked_spec: Optional[Dict[str, Any]] = None,
         iterative_spec: Optional[Dict[str, Any]] = None,
         aggregation_spec: Optional[Dict[str, Any]] = None,
+        measure_spec: Optional[Dict[str, Any]] = None,
         beam_spec: Optional[Dict[str, Any]] = None,
         force_route: Optional[str] = None,
         return_edit_info: bool = False,
         return_iterative_trace: bool = False,
         return_beat_predictions: bool = False,
+        return_measure_predictions: bool = False,
         return_beam_payload: bool = False,
         return_route: bool = False,
     ) -> Any:
@@ -429,10 +431,12 @@ class HybridAnalysisPredictor:
             masked_spec=masked_spec,
             iterative_spec=iterative_spec,
             aggregation_spec=aggregation_spec,
+            measure_spec=measure_spec,
             beam_spec=beam_spec,
             return_edit_info=return_edit_info,
             return_iterative_trace=return_iterative_trace,
             return_beat_predictions=return_beat_predictions,
+            return_measure_predictions=return_measure_predictions,
             return_beam_payload=return_beam_payload,
         )
 

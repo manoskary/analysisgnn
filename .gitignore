@@ -221,3 +221,5 @@ wandb/
 logs/
 paper/
 None/
+scripts/*.sh
+.codex

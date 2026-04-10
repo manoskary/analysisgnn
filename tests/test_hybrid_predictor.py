@@ -82,13 +82,17 @@ def test_hybrid_predictor_passes_iterative_args(monkeypatch):
     out = predictor.predict(
         score="ok",
         iterative_spec={"enabled": True, "steps": 2},
+        measure_spec={"mode": "summary_v1"},
         beam_spec={"enabled": True, "beam_width": 6},
         return_iterative_trace=True,
+        return_measure_predictions=True,
         return_beam_payload=True,
     )
     assert out == {"romanNumeral": "ok"}
     assert dummy.kwargs is not None
     assert dummy.kwargs["iterative_spec"]["enabled"] is True
     assert dummy.kwargs["return_iterative_trace"] is True
+    assert dummy.kwargs["measure_spec"]["mode"] == "summary_v1"
+    assert dummy.kwargs["return_measure_predictions"] is True
     assert dummy.kwargs["beam_spec"]["enabled"] is True
     assert dummy.kwargs["return_beam_payload"] is True

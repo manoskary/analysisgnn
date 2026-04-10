@@ -21,8 +21,6 @@ from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.tuner import Tuner
 
 
-# for repeatability
-seed_everything(0, workers=True)
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
@@ -220,6 +218,7 @@ def get_parser():
     parser.add_argument("--verbose", action="store_true", help="Verbose")
     parser.add_argument("--random_split", action="store_true", help="random_split")
     parser.add_argument("--logit_fusion", action="store_true", help="In case of multiple tasks, use logit fusion")
+    parser.add_argument("--seed", type=int, default=0, help="Global random seed")
     parser.add_argument("--has_memories", help="Use memories", type=bool, default=False,)
     parser.add_argument("--feature_type", type=str, default="simple", choices=["cadence", "simple"], help="Input feature type")
     parser.add_argument("--config_path", type=str, default=None, help="Path to the config file")
@@ -822,6 +821,10 @@ def main():
         for k, v in args_config.items():
             if k not in config.keys():
                 config[k] = v
+
+    seed = int(config.get("seed", 0))
+    seed_everything(seed, workers=True)
+    print(f"Using global seed: {seed}")
 
     if isinstance(config.get("masked_tasks", []), str):
         config["masked_tasks"] = [t.strip() for t in config["masked_tasks"].split(",") if t.strip()]

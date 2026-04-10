@@ -828,7 +828,22 @@ def _is_trace_payload(obj: Any) -> bool:
 
 
 def _is_beat_payload(obj: Any) -> bool:
-    return isinstance(obj, dict) and "rows" in obj and "tasks" in obj and "mode" in obj
+    return (
+        isinstance(obj, dict)
+        and obj.get("level", "beat") == "beat"
+        and "rows" in obj
+        and "tasks" in obj
+        and "mode" in obj
+    )
+
+
+def _is_measure_payload(obj: Any) -> bool:
+    return (
+        isinstance(obj, dict)
+        and obj.get("level") == "measure"
+        and "rows" in obj
+        and "mode" in obj
+    )
 
 
 def _parse_predict_output(
@@ -836,25 +851,31 @@ def _parse_predict_output(
     *,
     enable_iterative: bool,
     enable_beat: bool,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any], Optional[Dict[str, Any]]]:
+    enable_measure: bool,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     default_trace: Dict[str, Any] = {"enabled": False, "steps": []}
     if isinstance(output, tuple):
         if len(output) == 0:
-            return {}, default_trace, None
+            return {}, default_trace, None, None
         predictions = output[0]
         trace = default_trace
         beat_payload = None
+        measure_payload = None
         for item in output[1:]:
             if _is_trace_payload(item):
                 trace = item
             elif _is_beat_payload(item):
                 beat_payload = item
+            elif _is_measure_payload(item):
+                measure_payload = item
         if enable_iterative and trace is default_trace:
             trace = {"enabled": True, "steps": []}
         if enable_beat and beat_payload is None:
-            beat_payload = {"rows": [], "tasks": [], "mode": "mean"}
-        return predictions, trace, beat_payload
-    return output, default_trace, None
+            beat_payload = {"level": "beat", "rows": [], "tasks": [], "mode": "mean"}
+        if enable_measure and measure_payload is None:
+            measure_payload = {"level": "measure", "rows": [], "mode": "summary_v1"}
+        return predictions, trace, beat_payload, measure_payload
+    return output, default_trace, None, None
 
 
 def _beat_payload_to_dataframe(
@@ -923,6 +944,46 @@ def _beat_payload_to_dataframe(
     return beat_df[ordered_cols + remaining]
 
 
+def _measure_payload_to_dataframe(
+    measure_payload: Optional[Dict[str, Any]],
+) -> pd.DataFrame:
+    if not isinstance(measure_payload, dict):
+        return pd.DataFrame()
+    rows = measure_payload.get("rows", [])
+    if not rows:
+        return pd.DataFrame()
+
+    measure_df = pd.DataFrame(rows)
+    ordered_cols = [
+        "measure",
+        "measure_index",
+        "note_count",
+        "onset_count",
+        "measure_start_beat",
+        "measure_end_beat",
+        "tonal_space_label",
+        "tonal_space_confidence",
+        "mixedness",
+        "transition_flag",
+        "bar_localkey",
+        "bar_localkey_confidence",
+        "tonicization_target",
+        "tonicization_confidence",
+        "modulation_confidence",
+        "cadential_intent",
+        "cadential_confidence",
+        "harmonic_stability",
+        "harmonic_change_density",
+        "top2_label",
+        "top2_share",
+        "romanNumeral_full_mode",
+        "no_evidence",
+    ]
+    ordered_present = [col for col in ordered_cols if col in measure_df.columns]
+    remaining = [col for col in measure_df.columns if col not in ordered_present]
+    return measure_df[ordered_present + remaining]
+
+
 def _dataframe_to_csv_file(df: Optional[pd.DataFrame], prefix: str) -> Optional[str]:
     if df is None or len(df) == 0:
         return None
@@ -967,6 +1028,7 @@ def run_full_inference(
     beat_aggregation_mode: str,
     beat_voter_checkpoint_path: str,
     beat_tasks: List[str],
+    enable_measure: bool,
     show_trace: bool,
 ):
     try:
@@ -1006,10 +1068,11 @@ def run_full_inference(
                 return_iterative_trace=bool(enable_iterative),
                 return_route=True,
             )
-        predictions, trace, _ = _parse_predict_output(
+        predictions, trace, _, _ = _parse_predict_output(
             output,
             enable_iterative=bool(enable_iterative),
             enable_beat=False,
+            enable_measure=False,
         )
 
         full_df = predictions_to_dataframe(
@@ -1033,6 +1096,8 @@ def run_full_inference(
 
         beat_df = pd.DataFrame()
         beat_status = "Beat-level aggregation disabled."
+        measure_df = pd.DataFrame()
+        measure_status = "Measure-level summary disabled."
         if bool(enable_beat):
             selected_beat_tasks = [t for t in (beat_tasks or []) if t]
             if not selected_beat_tasks:
@@ -1051,10 +1116,11 @@ def run_full_inference(
                     return_beat_predictions=True,
                     return_route=False,
                 )
-            _, _, beat_payload = _parse_predict_output(
+            _, _, beat_payload, _ = _parse_predict_output(
                 beat_output_raw,
                 enable_iterative=False,
                 enable_beat=True,
+                enable_measure=False,
             )
             beat_df = _beat_payload_to_dataframe(
                 beat_payload=beat_payload,
@@ -1065,6 +1131,27 @@ def run_full_inference(
                 beat_status = f"{beat_status} | {hf_resolution_note}"
             if beat_agg_warning:
                 beat_status = f"{beat_status} | {beat_agg_warning}"
+        if bool(enable_measure):
+            with torch.no_grad():
+                measure_output_raw = predictor.predict(
+                    score,
+                    force_route="full",
+                    iterative_spec=iterative_spec,
+                    aggregation_spec=aggregation_spec,
+                    measure_spec={"mode": "summary_v1"},
+                    return_measure_predictions=True,
+                    return_route=False,
+                )
+            _, _, _, measure_payload = _parse_predict_output(
+                measure_output_raw,
+                enable_iterative=False,
+                enable_beat=False,
+                enable_measure=True,
+            )
+            measure_df = _measure_payload_to_dataframe(measure_payload)
+            measure_status = f"Measure-level table ready: rows={len(measure_df)} mode=summary_v1"
+            if hf_resolution_note:
+                measure_status = f"{measure_status} | {hf_resolution_note}"
 
         visual_payload = _build_visual_payload(
             score_path=score_path,
@@ -1075,6 +1162,7 @@ def run_full_inference(
         )
         note_csv = _dataframe_to_csv_file(display_df, "note_predictions")
         beat_csv = _dataframe_to_csv_file(beat_df, "beat_predictions")
+        measure_csv = _dataframe_to_csv_file(measure_df, "measure_predictions")
         return (
             display_df,
             status,
@@ -1084,9 +1172,12 @@ def run_full_inference(
             beat_df,
             beat_status,
             beat_csv,
+            measure_df,
+            measure_status,
+            measure_csv,
         )
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}", "", {}, None, pd.DataFrame(), "", None
+        return pd.DataFrame(), f"Error: {exc}", "", {}, None, pd.DataFrame(), "", None, pd.DataFrame(), "", None
 
 
 def run_partial_rerender(
@@ -1109,6 +1200,7 @@ def run_partial_rerender(
     beat_aggregation_mode: str,
     beat_voter_checkpoint_path: str,
     beat_tasks: List[str],
+    enable_measure: bool,
     show_trace: bool,
 ):
     try:
@@ -1159,10 +1251,11 @@ def run_partial_rerender(
                 return_iterative_trace=bool(enable_iterative),
                 return_route=True,
             )
-        predictions, trace, _ = _parse_predict_output(
+        predictions, trace, _, _ = _parse_predict_output(
             output,
             enable_iterative=bool(enable_iterative),
             enable_beat=False,
+            enable_measure=False,
         )
 
         out_df = predictions_to_dataframe(
@@ -1187,6 +1280,8 @@ def run_partial_rerender(
 
         beat_df = pd.DataFrame()
         beat_status = "Beat-level aggregation disabled."
+        measure_df = pd.DataFrame()
+        measure_status = "Measure-level summary disabled."
         if bool(enable_beat):
             selected_beat_tasks = [t for t in (beat_tasks or []) if t]
             if not selected_beat_tasks:
@@ -1206,10 +1301,11 @@ def run_partial_rerender(
                     return_beat_predictions=True,
                     return_route=False,
                 )
-            _, _, beat_payload = _parse_predict_output(
+            _, _, beat_payload, _ = _parse_predict_output(
                 beat_output_raw,
                 enable_iterative=False,
                 enable_beat=True,
+                enable_measure=False,
             )
             beat_df = _beat_payload_to_dataframe(
                 beat_payload=beat_payload,
@@ -1220,6 +1316,28 @@ def run_partial_rerender(
                 beat_status = f"{beat_status} | {hf_resolution_note}"
             if beat_agg_warning:
                 beat_status = f"{beat_status} | {beat_agg_warning}"
+        if bool(enable_measure):
+            with torch.no_grad():
+                measure_output_raw = predictor.predict(
+                    score,
+                    user_edits=user_edits,
+                    masked_spec=masked_spec,
+                    iterative_spec=iterative_spec,
+                    aggregation_spec=aggregation_spec,
+                    measure_spec={"mode": "summary_v1"},
+                    return_measure_predictions=True,
+                    return_route=False,
+                )
+            _, _, _, measure_payload = _parse_predict_output(
+                measure_output_raw,
+                enable_iterative=False,
+                enable_beat=False,
+                enable_measure=True,
+            )
+            measure_df = _measure_payload_to_dataframe(measure_payload)
+            measure_status = f"Measure-level table ready: rows={len(measure_df)} mode=summary_v1"
+            if hf_resolution_note:
+                measure_status = f"{measure_status} | {hf_resolution_note}"
 
         visual_payload = _build_visual_payload(
             score_path=score_path,
@@ -1230,6 +1348,7 @@ def run_partial_rerender(
         )
         note_csv = _dataframe_to_csv_file(display_df, "note_predictions")
         beat_csv = _dataframe_to_csv_file(beat_df, "beat_predictions")
+        measure_csv = _dataframe_to_csv_file(measure_df, "measure_predictions")
         return (
             display_df,
             status,
@@ -1239,9 +1358,12 @@ def run_partial_rerender(
             beat_df,
             beat_status,
             beat_csv,
+            measure_df,
+            measure_status,
+            measure_csv,
         )
     except Exception as exc:
-        return pd.DataFrame(), f"Error: {exc}", "", {}, None, pd.DataFrame(), "", None
+        return pd.DataFrame(), f"Error: {exc}", "", {}, None, pd.DataFrame(), "", None, pd.DataFrame(), "", None
 
 
 def refresh_visual_tab(
@@ -1421,6 +1543,11 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                         value=[t for t in DEFAULT_BEAT_TASKS if t in AVAILABLE_TASKS],
                         info="Tasks to include in the beat-level table.",
                     )
+                with gr.Accordion("Measure-Level Summary (Optional)", open=False):
+                    enable_measure = gr.Checkbox(
+                        label="Enable Measure-Level Summary",
+                        value=False,
+                    )
                 with gr.Row():
                     target_only_update = gr.Checkbox(
                         label="Target-only overwrite (partial mode)",
@@ -1464,6 +1591,16 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 )
                 beat_csv_download = gr.File(
                     label="Download Beat-Level CSV",
+                    interactive=False,
+                )
+                measure_status = gr.Textbox(label="Measure Status", interactive=False)
+                measure_table = gr.Dataframe(
+                    label="Measure-Level Table",
+                    interactive=False,
+                    wrap=True,
+                )
+                measure_csv_download = gr.File(
+                    label="Download Measure-Level CSV",
                     interactive=False,
                 )
 
@@ -1511,6 +1648,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
             beat_aggregation_mode: str,
             beat_voter_checkpoint_path: str,
             beat_tasks: List[str],
+            enable_measure: bool,
             target_only_update: bool,
             show_trace: bool,
         ):
@@ -1532,6 +1670,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     beat_aggregation_mode=beat_aggregation_mode,
                     beat_voter_checkpoint_path=beat_voter_checkpoint_path,
                     beat_tasks=beat_tasks,
+                    enable_measure=enable_measure,
                     show_trace=show_trace,
                 )
             if mode_value == "Iterative (no known labels)":
@@ -1551,6 +1690,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                     beat_aggregation_mode=beat_aggregation_mode,
                     beat_voter_checkpoint_path=beat_voter_checkpoint_path,
                     beat_tasks=beat_tasks,
+                    enable_measure=enable_measure,
                     show_trace=show_trace,
                 )
             return run_partial_rerender(
@@ -1572,6 +1712,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 beat_aggregation_mode=beat_aggregation_mode,
                 beat_voter_checkpoint_path=beat_voter_checkpoint_path,
                 beat_tasks=beat_tasks,
+                enable_measure=enable_measure,
                 target_only_update=target_only_update,
                 show_trace=show_trace,
             )
@@ -1598,6 +1739,7 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 beat_aggregation_mode,
                 beat_voter_checkpoint_path,
                 beat_tasks,
+                enable_measure,
                 target_only_update,
                 show_trace,
             ],
@@ -1610,6 +1752,9 @@ Index expressions for row selection are 1-based. Example: `1-8, 12, 20-24`.
                 beat_table,
                 beat_status,
                 beat_csv_download,
+                measure_table,
+                measure_status,
+                measure_csv_download,
             ],
         )
 

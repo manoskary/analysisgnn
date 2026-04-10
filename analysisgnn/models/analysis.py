@@ -20,6 +20,7 @@ import math
 import warnings
 from analysisgnn.utils.chord_representations import available_representations
 from analysisgnn.utils.roman_decode import decode_roman_numeral
+from analysisgnn.utils.measure_summary import summarize_measure_rows
 from analysisgnn.utils.music import CadenceEncoder
 from analysisgnn.utils.masked_conditioning import MaskedConditioningSpec
 from analysisgnn.utils.node_masking import (
@@ -2383,7 +2384,7 @@ class ContinualAnalysisGNN(LightningModule):
         group_ids = _group_ids_from_cluster_or_edges("beat", data, data.edge_index_dict, batch_size)
         valid_group_mask = group_ids >= 0
         if not torch.any(valid_group_mask):
-            return {"rows": [], "tasks": beat_tasks, "mode": aggregation_mode}
+            return {"level": "beat", "rows": [], "tasks": beat_tasks, "mode": aggregation_mode}
 
         unique_beats = torch.unique(group_ids[valid_group_mask], sorted=True)
         # Optional conflict probability per note/task from consistent-beat voter.
@@ -2480,10 +2481,104 @@ class ContinualAnalysisGNN(LightningModule):
             rows.append(row)
 
         return {
+            "level": "beat",
             "rows": rows,
             "tasks": beat_tasks,
             "mode": aggregation_mode,
         }
+
+    def _build_measure_level_predictions(
+        self,
+        *,
+        onset_note_probs: Dict[str, torch.Tensor],
+        data,
+        batch_size: int,
+        measure_meta: List[Dict[str, Any]],
+        note_onset_div: Optional[np.ndarray] = None,
+        note_onset_beat: Optional[np.ndarray] = None,
+        note_measure: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        if note_onset_div is None or note_measure is None or not measure_meta:
+            return {"level": "measure", "mode": "summary_v1", "rows": []}
+
+        onset_values = np.asarray(note_onset_div[:batch_size])
+        measure_values = np.asarray(note_measure[:batch_size])
+        onset_beat_values = (
+            np.asarray(note_onset_beat[:batch_size])
+            if note_onset_beat is not None
+            else None
+        )
+
+        if onset_values.size == 0 or measure_values.size == 0:
+            return {"level": "measure", "mode": "summary_v1", "rows": []}
+
+        onset_rows: List[Dict[str, Any]] = []
+        unique_onsets = np.unique(onset_values)
+        measure_end_lookup = {
+            meta.get("measure"): float(meta.get("measure_end_div", 0.0) or 0.0)
+            for meta in measure_meta
+        }
+        for onset_rank, onset_div in enumerate(unique_onsets.tolist()):
+            idx = np.where(onset_values == onset_div)[0]
+            if idx.size == 0:
+                continue
+            anchor = int(idx[0])
+            measure_id = measure_values[anchor] if anchor < len(measure_values) else None
+            next_onset_div = (
+                float(unique_onsets[onset_rank + 1])
+                if onset_rank + 1 < len(unique_onsets)
+                else None
+            )
+            measure_end_div = measure_end_lookup.get(measure_id)
+            if next_onset_div is None and measure_end_div is not None:
+                span_div = max(float(measure_end_div) - float(onset_div), 1.0)
+            elif measure_end_div is None:
+                span_div = max(float(next_onset_div or onset_div) - float(onset_div), 1.0)
+            else:
+                span_div = max(min(float(next_onset_div or measure_end_div), float(measure_end_div)) - float(onset_div), 1.0)
+
+            onset_row: Dict[str, Any] = {
+                "measure": measure_id,
+                "onset_div": float(onset_div),
+                "onset_index": int(onset_rank),
+                "note_count": int(idx.size),
+                "span_div": float(span_div),
+            }
+            if onset_beat_values is not None and anchor < len(onset_beat_values):
+                onset_row["onset_beat"] = float(onset_beat_values[anchor])
+                if onset_rank + 1 < len(unique_onsets):
+                    next_anchor = np.where(onset_values == unique_onsets[onset_rank + 1])[0]
+                    if next_anchor.size > 0 and onset_beat_values is not None:
+                        onset_row["span_beat"] = max(
+                            float(onset_beat_values[int(next_anchor[0])]) - float(onset_beat_values[anchor]),
+                            0.0,
+                        )
+
+            for task, probs in onset_note_probs.items():
+                task_probs = probs[:batch_size]
+                onset_probs = task_probs[idx].mean(dim=0)
+                class_id = int(torch.argmax(onset_probs).item())
+                onset_row[task] = self._decode_task_class_id(task, class_id)
+                onset_row[f"{task}_class_id"] = class_id
+                onset_row[f"{task}_confidence"] = float(torch.max(onset_probs).item())
+
+            comp_rn = ""
+            try:
+                if all(k in onset_row for k in ["degree1", "degree2", "inversion_class_id", "quality", "localkey"]):
+                    comp_rn = decode_roman_numeral(
+                        degree1=str(onset_row["degree1"]),
+                        degree2=str(onset_row["degree2"]),
+                        inversion=int(onset_row["inversion_class_id"]),
+                        quality=str(onset_row["quality"]),
+                        localkey=str(onset_row["localkey"]),
+                    )
+            except Exception:
+                comp_rn = ""
+            rn_label = str(onset_row.get("romanNumeral", ""))
+            onset_row["romanNumeral_full"] = self._project_complete_roman_numeral(comp_rn, rn_label)
+            onset_rows.append(onset_row)
+
+        return summarize_measure_rows(onset_rows=onset_rows, measure_rows=measure_meta)
 
     def _expected_note_input_dim(self) -> Optional[int]:
         try:
@@ -7737,9 +7832,11 @@ class ContinualAnalysisGNN(LightningModule):
         return_edit_info: bool = False,
         iterative_spec: Optional[Dict[str, Any]] = None,
         aggregation_spec: Optional[Dict[str, Any]] = None,
+        measure_spec: Optional[Dict[str, Any]] = None,
         beam_spec: Optional[Dict[str, Any]] = None,
         return_iterative_trace: bool = False,
         return_beat_predictions: bool = False,
+        return_measure_predictions: bool = False,
         return_beam_payload: bool = False,
     ):
         """Predict analysis for a musical score.
@@ -7752,10 +7849,12 @@ class ContinualAnalysisGNN(LightningModule):
             iterative_spec: Optional iterative masked-refinement configuration.
             aggregation_spec: Optional aggregation override
                 {"mode": "mean|voter|voter_consistent_beat", "voter_path": "...", "beat_tasks": [...]}.
+            measure_spec: Optional measure-summary override. v1 supports {"mode": "summary_v1"}.
             beam_spec: Optional beam-decoding override
                 {"enabled": bool, "beam_width": int, ...}. Beam is additive and does not overwrite baseline outputs.
             return_iterative_trace: If True, append iterative trace to output.
             return_beat_predictions: If True, append optional beat-level parallel payload.
+            return_measure_predictions: If True, append optional measure-level parallel payload.
             return_beam_payload: If True, append beam payload when beam decoding is enabled.
             
         Returns:
@@ -7927,6 +8026,17 @@ class ContinualAnalysisGNN(LightningModule):
                     **beam_output,
                 }
             beat_output = None
+            measure_output = None
+            note_onset_beat = None
+            note_measure = None
+            try:
+                note_onset_beat = np.asarray(note_array["onset_beat"])
+            except Exception:
+                note_onset_beat = None
+            try:
+                note_measure = np.asarray(score_obj[0].measure_number_map(note_array["onset_div"]))
+            except Exception:
+                note_measure = None
             if return_beat_predictions:
                 beat_tasks_cfg = []
                 if isinstance(aggregation_spec, dict):
@@ -7936,16 +8046,6 @@ class ContinualAnalysisGNN(LightningModule):
                 beat_tasks = [t for t in beat_tasks_cfg if t in self.task_dict]
                 if not beat_tasks:
                     beat_tasks = [t for t in DEFAULT_BEAT_OUTPUT_TASKS if t in self.task_dict]
-                note_onset_beat = None
-                note_measure = None
-                try:
-                    note_onset_beat = np.asarray(note_array["onset_beat"])
-                except Exception:
-                    note_onset_beat = None
-                try:
-                    note_measure = np.asarray(score_obj[0].measure_number_map(note_array["onset_div"]))
-                except Exception:
-                    note_measure = None
                 beat_output = self._build_beat_level_predictions(
                     raw_note_probs=note_predictions,
                     aggregated_note_probs=predictions,
@@ -7954,6 +8054,53 @@ class ContinualAnalysisGNN(LightningModule):
                     aggregation_mode=aggregation_mode,
                     aggregation_bundle=aggregation_bundle,
                     beat_tasks=beat_tasks,
+                    note_onset_beat=note_onset_beat,
+                    note_measure=note_measure,
+                )
+            if return_measure_predictions:
+                measure_mode = "summary_v1"
+                if isinstance(measure_spec, dict):
+                    measure_mode = str(measure_spec.get("mode", "summary_v1")).strip().lower() or "summary_v1"
+                if measure_mode != "summary_v1":
+                    measure_mode = "summary_v1"
+                measure_meta: List[Dict[str, Any]] = []
+                note_count_by_measure: Dict[Any, int] = {}
+                if note_measure is not None and len(note_measure) > 0:
+                    unique_measure_ids, unique_counts = np.unique(note_measure, return_counts=True)
+                    note_count_by_measure = {
+                        measure_id: int(count)
+                        for measure_id, count in zip(unique_measure_ids.tolist(), unique_counts.tolist())
+                    }
+                for measure_index, measure in enumerate(list(measures)):
+                    measure_id = getattr(measure, "number", measure_index + 1)
+                    try:
+                        measure_start_div = float(measure.start.t)
+                        measure_end_div = float(measure.end.t)
+                    except Exception:
+                        measure_start_div = 0.0
+                        measure_end_div = 0.0
+                    measure_meta.append(
+                        {
+                            "measure": measure_id,
+                            "measure_index": int(measure_index),
+                            "measure_start_div": measure_start_div,
+                            "measure_end_div": measure_end_div,
+                            "note_count": int(note_count_by_measure.get(measure_id, 0)),
+                        }
+                    )
+                onset_only_predictions = self._aggregate_onset_only_note_probs(
+                    note_prob_dict=note_predictions,
+                    data=data,
+                    batch_size=batch_size,
+                    aggregation_mode=aggregation_mode,
+                    aggregation_bundle=aggregation_bundle,
+                )
+                measure_output = self._build_measure_level_predictions(
+                    onset_note_probs=onset_only_predictions,
+                    data=data,
+                    batch_size=batch_size,
+                    measure_meta=measure_meta,
+                    note_onset_div=np.asarray(note_array["onset_div"]),
                     note_onset_beat=note_onset_beat,
                     note_measure=note_measure,
                 )
@@ -7973,6 +8120,8 @@ class ContinualAnalysisGNN(LightningModule):
                 outputs.append(beam_output if beam_output is not None else {"beam_enabled": False})
             if return_beat_predictions:
                 outputs.append(beat_output)
+            if return_measure_predictions:
+                outputs.append(measure_output if measure_output is not None else {"level": "measure", "mode": "summary_v1", "rows": []})
             if len(outputs) == 1:
                 return outputs[0]
             return tuple(outputs)
