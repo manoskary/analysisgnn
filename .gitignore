@@ -221,3 +221,9 @@ wandb/
 /AnalysisGNN/
 /AnalysisGNN-MusicBERT/
 logs/
+
+.codex
+None/
+outputs/
+scripts/*.sh
+*.tex
