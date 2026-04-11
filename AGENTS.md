@@ -583,6 +583,11 @@ Key changes in `examples/gradio_hybrid_analysis_app.py`:
 - Imports: `flexohr.codecs.analysisgnn` (codec activation), `OHR`, `ChordQuality`,
   `Inversion`, `CollectionType`, `SD`, `build_key_context`, `infer_collection_type`,
   `build_key_context_from_row`
+- `_fix_key_mode(df)`: corrects localkey/tonkey case in-place — the model's 50-class
+  key softmax does not reliably distinguish major/minor via case, so mode is inferred
+  from romanNumeral tonic counts (`"i"` = minor, `"I"` = major) per pitch-class group;
+  applied to `display_df` at all 4 `format_table_output` call sites so all downstream
+  consumers (global key, Complete RN, table display) see corrected case
 - `_derive_global_key(df, k=5)`: takes the first *k* tonic chords (romanNumeral
   `"I"` / `"i"`) in score order and lets their `localkey` values vote (case-insensitive
   pitch-class grouping, most frequent cased variant wins); avoids bias from extended
@@ -591,8 +596,6 @@ Key changes in `examples/gradio_hybrid_analysis_app.py`:
   five principal tasks (degree1, degree2, inversion, quality, localkey), rendered via
   `.to_format('dcml')` — localkey and tonkey mode read directly from prediction case
   (uppercase = major, lowercase = minor); tonicized key mode from `tonkey` when available
-- Removed `_infer_key_mode`, `_apply_key_mode`, `_build_localkey_mode_map` — these
-  inferred mode from romanNumeral counts instead of trusting the localkey/tonkey case
 - `global_key` parameter threaded through `_build_complete_rn_spans`,
   `_build_graph_overlay_payload`, `_build_visual_payload`
 - New Gradio `global_key_field` text field in Module 2, auto-populated on inference /

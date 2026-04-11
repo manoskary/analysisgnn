@@ -234,9 +234,66 @@ def _prepare_prediction_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
 _GLOBAL_KEY_K = 5
 
-def _derive_global_key(df: pd.DataFrame) -> str:
-    """Derive the global key from tonic chords (``romanNumeral`` is ``"I"``
-    or ``"i"``).
+_KEY_TASKS = ("localkey", "tonkey")
+
+
+def _fix_key_mode(df: pd.DataFrame) -> pd.DataFrame:
+    """Correct the case of ``localkey`` and ``tonkey`` predictions in-place.
+
+    The model's 50-class key vocabulary encodes mode via case (uppercase =
+    major, lowercase = minor), but the softmax argmax does not reliably
+    land on the correct case variant.  This function infers the true mode
+    from the ``romanNumeral`` column: within each key pitch-class group,
+    if the count of minor-tonic chords (``"i"``) is not lower than the
+    count of major-tonic chords (``"I"``), all occurrences of that key are
+    lowercased (= minor).
+
+    The correction is applied to every key-task column present in *df*
+    (``localkey``, ``tonkey``).
+
+    Returns *df* (modified in-place) for chaining convenience.
+
+    .. note::
+        This is a workaround for a model deficiency — the localkey/tonkey
+        softmax does not reliably separate major from minor classes for the
+        same pitch class.  Remove this function once the model outputs have
+        been fixed (e.g. by retraining with a loss that penalises mode
+        confusion, or by collapsing major/minor into a single pitch-class
+        prediction and inferring mode from a separate head).
+    """
+    if df is None or len(df) == 0:
+        return df
+    if "romanNumeral" not in df.columns:
+        return df
+
+    key_cols = [c for c in _KEY_TASKS if c in df.columns]
+    if not key_cols:
+        return df
+
+    tonic_mask = df["romanNumeral"].isin(["I", "i"])
+    if not tonic_mask.any():
+        return df
+
+    for col in key_cols:
+        tonic_rows = df.loc[tonic_mask, [col, "romanNumeral"]].copy()
+        tonic_rows["_pc"] = tonic_rows[col].astype(str).str.upper()
+        minor_mode: dict[str, bool] = {}
+        for pc, grp in tonic_rows.groupby("_pc"):
+            n_minor = int((grp["romanNumeral"] == "i").sum())
+            n_major = int((grp["romanNumeral"] == "I").sum())
+            minor_mode[str(pc)] = not (n_minor < n_major)
+
+        vals = df[col].astype(str).values.copy()
+        for i, v in enumerate(vals):
+            if not v or v == "None":
+                continue
+            pc = v.upper()
+            if pc in minor_mode and minor_mode[pc]:
+                vals[i] = v[0].lower() + v[1:]
+        df[col] = vals
+
+    return df
+
 
 def _derive_global_key(df: pd.DataFrame, k: int = _GLOBAL_KEY_K) -> str:
     """Derive the global key from the first *k* tonic chords.
@@ -1101,6 +1158,7 @@ def run_full_inference(
         )
         full_df = _apply_timing_from_predictions(full_df, predictions)
         display_df = format_table_output(full_df, tasks)
+        _fix_key_mode(display_df)
 
         # Extract edges from intermediates
         num_notes = len(note_array)
@@ -1257,6 +1315,7 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             probs_df, notes_df, hyperedges_df, metadata, tasks=tasks
         )
         display_df = format_table_output(display_df, tasks)
+        _fix_key_mode(display_df)
 
         log_text = _log(
             log_text,
@@ -1384,6 +1443,7 @@ def run_aggregation(
                 probs_df, notes_df, hyperedges_df, metadata, tasks=tasks
             )
             display_df = format_table_output(result_df, tasks)
+            _fix_key_mode(display_df)
             # Add Complete RN column
             if global_key:
                 display_df["romanNumeral_full"] = _build_complete_rn_column(
@@ -1570,6 +1630,7 @@ def run_edit_conditioned(
         )
         out_df = _apply_timing_from_predictions(out_df, predictions)
         display_df = format_table_output(out_df, tasks)
+        _fix_key_mode(display_df)
 
         num_notes = len(note_array)
         if pyg_data is not None:
