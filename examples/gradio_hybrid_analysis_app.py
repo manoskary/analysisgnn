@@ -232,15 +232,23 @@ def _prepare_prediction_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+_GLOBAL_KEY_K = 5
 
 def _derive_global_key(df: pd.DataFrame) -> str:
     """Derive the global key from tonic chords (``romanNumeral`` is ``"I"``
     or ``"i"``).
 
-    Groups tonic chords by pitch class (case-insensitive) to find the most
-    frequent tonic, then takes the most frequent cased ``localkey`` variant
-    — its case encodes the mode (uppercase = major, lowercase = minor) per
-    the DCML convention and the 50-class vocabulary.
+def _derive_global_key(df: pd.DataFrame, k: int = _GLOBAL_KEY_K) -> str:
+    """Derive the global key from the first *k* tonic chords.
+
+    Takes the first *k* rows (in score order) where ``romanNumeral`` is
+    ``"I"`` or ``"i"`` and lets their ``localkey`` values vote.  Grouping
+    is case-insensitive (so ``"C"`` and ``"c"`` count toward the same
+    pitch class); among the winning pitch class the most frequent cased
+    variant determines the mode.
+
+    Using only the first *k* tonics avoids bias from extended middle
+    sections whose key may outnumber the main key's tonic chords.
 
     Returns the raw ``localkey`` string (e.g. ``"G"``, ``"c"``, ``"A-"``).
 
@@ -258,16 +266,15 @@ def _derive_global_key(df: pd.DataFrame) -> str:
             "and/or 'localkey' columns."
         )
     mask = df["romanNumeral"].isin(["I", "i"])
-    candidates = df.loc[mask, "localkey"].astype(str)
+    candidates = df.loc[mask, "localkey"].astype(str).head(k)
     if len(candidates) == 0:
         raise ValueError(
             "Cannot derive global key: no rows with romanNumeral 'I' or 'i'."
         )
-    # Group by pitch class (case-insensitive) to find the most frequent tonic
+    # Group by pitch class (case-insensitive) to find the winning tonic
     lk_upper = candidates.str.upper()
     best_pc = str(lk_upper.value_counts().index[0])
-    # Among tonic chords with that pitch class, take the most frequent
-    # cased variant — its case encodes the mode.
+    # Among those, take the most frequent cased variant for mode.
     pc_mask = lk_upper == best_pc
     return str(candidates[pc_mask].value_counts().index[0])
 

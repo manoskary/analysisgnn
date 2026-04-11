@@ -583,9 +583,10 @@ Key changes in `examples/gradio_hybrid_analysis_app.py`:
 - Imports: `flexohr.codecs.analysisgnn` (codec activation), `OHR`, `ChordQuality`,
   `Inversion`, `CollectionType`, `SD`, `build_key_context`, `infer_collection_type`,
   `build_key_context_from_row`
-- `_derive_global_key(df)`: groups tonic chords (romanNumeral `"I"` / `"i"`) by pitch
-  class (case-insensitive), takes the most frequent cased `localkey` variant — case
-  encodes mode directly from the 50-class vocabulary; returns raw localkey string
+- `_derive_global_key(df, k=5)`: takes the first *k* tonic chords (romanNumeral
+  `"I"` / `"i"`) in score order and lets their `localkey` values vote (case-insensitive
+  pitch-class grouping, most frequent cased variant wins); avoids bias from extended
+  middle sections whose key may outnumber the main key's tonic chords
 - `_build_complete_rn_column(df, global_key)`: per-row FlexOHR OHR construction from
   five principal tasks (degree1, degree2, inversion, quality, localkey), rendered via
   `.to_format('dcml')` — localkey and tonkey mode read directly from prediction case
