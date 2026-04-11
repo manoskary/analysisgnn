@@ -237,12 +237,12 @@ def _derive_global_key(df: pd.DataFrame) -> str:
     """Derive the global key from tonic chords (``romanNumeral`` is ``"I"``
     or ``"i"``).
 
-    Finds the most frequent localkey pitch class (case-insensitive) among
-    tonic chords, then infers major/minor mode from the ``"I"`` vs ``"i"``
-    counts via :func:`_infer_key_mode`.
+    Groups tonic chords by pitch class (case-insensitive) to find the most
+    frequent tonic, then takes the most frequent cased ``localkey`` variant
+    — its case encodes the mode (uppercase = major, lowercase = minor) per
+    the DCML convention and the 50-class vocabulary.
 
-    Returns an SPC-compatible string — uppercase for major (e.g. ``"G"``),
-    lowercase for minor (e.g. ``"c"``).
+    Returns the raw ``localkey`` string (e.g. ``"G"``, ``"c"``, ``"A-"``).
 
     Raises
     ------
@@ -258,25 +258,18 @@ def _derive_global_key(df: pd.DataFrame) -> str:
             "and/or 'localkey' columns."
         )
     mask = df["romanNumeral"].isin(["I", "i"])
-    candidates = df.loc[mask, ["romanNumeral", "localkey"]].copy()
+    candidates = df.loc[mask, "localkey"].astype(str)
     if len(candidates) == 0:
         raise ValueError(
             "Cannot derive global key: no rows with romanNumeral 'I' or 'i'."
         )
-    # Find the most frequent localkey pitch class (case-insensitive)
-    candidates["_lk_upper"] = candidates["localkey"].astype(str).str.upper()
-    lk_counts = candidates["_lk_upper"].value_counts()
-    best_lk_upper = str(lk_counts.index[0])
-
-    # Infer mode from all tonic chords in this key
-    best_mask = candidates["_lk_upper"] == best_lk_upper
-    mode = _infer_key_mode(candidates.loc[best_mask, "romanNumeral"])
-    if mode is None:
-        mode = "major"
-
-    best_lk_raw = str(candidates.loc[best_mask, "localkey"].iloc[0])
-    lk = _agnn_to_flx_pitch(best_lk_raw)
-    return _apply_key_mode(lk, mode)
+    # Group by pitch class (case-insensitive) to find the most frequent tonic
+    lk_upper = candidates.str.upper()
+    best_pc = str(lk_upper.value_counts().index[0])
+    # Among tonic chords with that pitch class, take the most frequent
+    # cased variant — its case encodes the mode.
+    pc_mask = lk_upper == best_pc
+    return str(candidates[pc_mask].value_counts().index[0])
 
 
 def _agnn_to_flx_pitch(name: str) -> str:
@@ -288,78 +281,17 @@ def _agnn_to_flx_pitch(name: str) -> str:
     return name.replace("-", "b")
 
 
-def _infer_key_mode(roman_numerals: pd.Series) -> Optional[str]:
-    """Infer major/minor key mode from tonic Roman numeral counts.
-
-    Counts ``"I"`` (major tonic) vs ``"i"`` (minor tonic) in the given
-    series.  Returns ``"major"`` or ``"minor"`` based on which is more
-    frequent, or ``None`` if neither is found.
-    """
-    if roman_numerals is None or len(roman_numerals) == 0:
-        return None
-    n_major = int((roman_numerals == "I").sum())
-    n_minor = int((roman_numerals == "i").sum())
-    if n_major == 0 and n_minor == 0:
-        return None
-    return "minor" if n_minor > n_major else "major"
-
-
-def _apply_key_mode(key_str: str, mode: str) -> str:
-    """Adjust the case of a key string to encode the given mode.
-
-    ``"major"`` -> uppercase first character, ``"minor"`` -> lowercase
-    first character.  Accidentals (``#``, ``b``) are left unchanged.
-    """
-    if not key_str:
-        return key_str
-    if mode == "minor":
-        return key_str[0].lower() + key_str[1:]
-    return key_str[0].upper() + key_str[1:]
-
-
-def _build_localkey_mode_map(df: pd.DataFrame) -> Dict[str, str]:
-    """Build a mapping from localkey pitch class to inferred mode.
-
-    Groups rows by localkey pitch class (case-insensitive) and counts
-    ``"I"`` vs ``"i"`` in the ``romanNumeral`` column to determine
-    whether each local key is major or minor.
-
-    Returns
-    -------
-    Dict[str, str]
-        Keys are uppercased localkey strings (e.g. ``"G"``, ``"C#"``,
-        ``"A-"``); values are ``"major"`` or ``"minor"``.
-    """
-    if df is None or len(df) == 0:
-        return {}
-    if "localkey" not in df.columns or "romanNumeral" not in df.columns:
-        return {}
-    result: Dict[str, str] = {}
-    work = df[["localkey", "romanNumeral"]].copy()
-    work["_lk_upper"] = work["localkey"].astype(str).str.upper()
-    for lk_upper, group in work.groupby("_lk_upper"):
-        mode = _infer_key_mode(group["romanNumeral"])
-        if mode is None:
-            # TODO: FlexOHR will be able to infer the mode from the scale
-            # degree and global-key mode in this case in the future.
-            mode = "major"
-        result[str(lk_upper)] = mode
-    return result
-
-
 def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
     """Build the Complete RN column using FlexOHR OHR objects.
 
-    Each row's five principal task predictions (degree1, degree2, inversion,
+    Each row's principal task predictions (degree1, degree2, inversion,
     quality, localkey) are used to construct a FlexOHR OHR, which is then
     rendered via ``.to_format('dcml')``.
 
-    The mode (major/minor) of each local key is **not** taken from the
-    case of the ``localkey`` prediction directly.  Instead, it is inferred
-    from the ``romanNumeral`` predictions: within all rows that share the
-    same localkey pitch class, the counts of ``"I"`` (major tonic) vs
-    ``"i"`` (minor tonic) determine the mode.  This is the same principle
-    used by :func:`_derive_global_key` for the global key.
+    The mode (major/minor) of each local key and tonicized key is read
+    directly from the case of the ``localkey`` and ``tonkey`` predictions
+    (uppercase = major, lowercase = minor), matching the DCML convention
+    and the 50-class vocabulary used by the model.
     """
     if df is None or len(df) == 0:
         return pd.Series(dtype=object)
@@ -369,9 +301,7 @@ def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
         return pd.Series([""] * len(df), index=df.index, dtype=object)
 
     gk = _agnn_to_flx_pitch(global_key)
-
-    # Infer localkey modes from romanNumeral tonic counts (I vs i)
-    localkey_modes = _build_localkey_mode_map(df)
+    has_tonkey = "tonkey" in df.columns
 
     out: List[str] = []
     for _, row in df.iterrows():
@@ -384,11 +314,7 @@ def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
                 str(int(row["inversion"])),
                 "analysisgnn",
             )
-            # Apply inferred mode to the localkey string so that FlexOHR's
-            # infer_collection_type() picks up the correct major/minor.
-            lk_raw = str(row["localkey"])
-            lk_mode = localkey_modes.get(lk_raw.upper(), "major")
-            lk_str = _apply_key_mode(_agnn_to_flx_pitch(lk_raw), lk_mode)
+            lk_str = _agnn_to_flx_pitch(str(row["localkey"]))
             lk_coll = flx.paradigms.pitchspace.scale.infer_collection_type(lk_str)
 
             degree2_val = row.get("degree2")
@@ -397,20 +323,26 @@ def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
                     str(degree2_val),
                     collection_type=lk_coll,
                 )
-                # TODO: The tonicized key mode cannot be inferred from the
-                # AnalysisGNN output alone (degree2 is a bare integer with
-                # no case encoding).  FlexOHR will be able to infer the
-                # mode from the scale degree and key context in the future.
-                # Defaulting to major for now.
+                # Infer tonicized key mode from the tonkey prediction's
+                # case — the 50-class vocabulary encodes mode via case,
+                # just like localkey.
+                tonicized_coll = flx.harmony.harmony_enums.CollectionType.major
+                if has_tonkey:
+                    tk_val = row.get("tonkey")
+                    if pd.notna(tk_val) and str(tk_val).strip() not in ("", "None"):
+                        tonicized_coll = (
+                            flx.paradigms.pitchspace.scale.infer_collection_type(
+                                _agnn_to_flx_pitch(str(tk_val))
+                            )
+                        )
                 ref_ohr = flx.paradigms.pitchspace.scale.build_key_context(
                     gk,
                     lk_str,
                     tonicized_key=sd2,
-                    tonicized_coll=flx.harmony.harmony_enums.CollectionType.major,
+                    tonicized_coll=tonicized_coll,
                 )
-                tonic_coll = flx.harmony.harmony_enums.CollectionType.major
+                tonic_coll = tonicized_coll
             else:
-                # Normalise the row's localkey for FlexOHR before delegating
                 norm_row = dict(row)
                 norm_row["localkey"] = lk_str
                 ref_ohr = flx.codecs.analysisgnn.build_key_context_from_row(

@@ -583,12 +583,15 @@ Key changes in `examples/gradio_hybrid_analysis_app.py`:
 - Imports: `flexohr.codecs.analysisgnn` (codec activation), `OHR`, `ChordQuality`,
   `Inversion`, `CollectionType`, `SD`, `build_key_context`, `infer_collection_type`,
   `build_key_context_from_row`
-- `_derive_global_key(df)`: finds the most frequent `(romanNumeral, localkey)` pair
-  where `romanNumeral` is `"I"` or `"i"`; returns uppercase SPC for major, lowercase
-  for minor; raises `ValueError` if derivation fails
+- `_derive_global_key(df)`: groups tonic chords (romanNumeral `"I"` / `"i"`) by pitch
+  class (case-insensitive), takes the most frequent cased `localkey` variant — case
+  encodes mode directly from the 50-class vocabulary; returns raw localkey string
 - `_build_complete_rn_column(df, global_key)`: per-row FlexOHR OHR construction from
   five principal tasks (degree1, degree2, inversion, quality, localkey), rendered via
-  `.to_format('dcml')` — output format is `chord/localkey/globalkey` (e.g. `V7/V/I/G`)
+  `.to_format('dcml')` — localkey and tonkey mode read directly from prediction case
+  (uppercase = major, lowercase = minor); tonicized key mode from `tonkey` when available
+- Removed `_infer_key_mode`, `_apply_key_mode`, `_build_localkey_mode_map` — these
+  inferred mode from romanNumeral counts instead of trusting the localkey/tonkey case
 - `global_key` parameter threaded through `_build_complete_rn_spans`,
   `_build_graph_overlay_payload`, `_build_visual_payload`
 - New Gradio `global_key_field` text field in Module 2, auto-populated on inference /
@@ -689,10 +692,10 @@ model has no class for them. No action needed.
 
 #### Existing Usage Patterns
 
-**Step 4b** (`_build_complete_rn_column` in the Gradio app, line 323) constructs one OHR
-per row from the argmax predictions of the five core tasks. It infers localkey mode
-from romanNumeral tonic counts (`I` vs `i`), handles tonicization via `degree2`, and
-renders via `.to_format('dcml')`. No enumeration, no top-k — pure argmax.
+**Step 4b** (`_build_complete_rn_column` in the Gradio app) constructs one OHR per row
+from the argmax predictions of the five core tasks. Localkey and tonkey mode are read
+directly from prediction case (the 50-class vocabulary encodes mode via uppercase =
+major, lowercase = minor). No enumeration, no top-k — pure argmax.
 
 **The notebook** (`flexohr_project/flexohr/docs/notebooks/analysisgnn_tasks.py`) goes
 further: section 6 validates OHRs against redundant columns (tonkey, root, bass) via
