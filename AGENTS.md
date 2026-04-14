@@ -603,229 +603,66 @@ Key changes in `examples/gradio_hybrid_analysis_app.py`:
   `refresh_visual_tab`; returned as output from `run_full_inference`,
   `load_from_delta_lake`, and `run_edit_conditioned`
 
-### Step 5: Top-k Roman Numeral Enumeration from Task Distributions
+### Step 5a: FlexOHR Codec Extension + Scoring Framework — DONE
 
-The core mechanism for aggregation: given per-task probability distributions for a
-note (or group of notes), enumerate which Roman-numeral labels (OHRs) are possible,
-rank them by composite likelihood, and return the top-k candidates.
+Extended FlexOHR to handle all 15 model quality labels and built a context-aware
+scoring framework that operates on Delta Lake DataFrames.
 
-#### FlexOHR API Available for This Step
+**FlexOHR changes** (in `flexohr_project/flexohr/`):
+- `ChordQuality.generic_augmented_sixth` enum member + `genAug6` alias, with Italian
+  sixth's 3-note interval structure, classified as `ChordClass.augmented_sixth`
+- `CodecRegistry.register_decode_alias()` + `FancyStrEnum.register_decode_alias()` for
+  decode-only aliases (encoding still returns the primary label)
+- Codec registrations in `codecs/analysisgnn.py`: `"augmented sixth"` ↔
+  `generic_augmented_sixth` (bidirectional), `"incomplete dominant-seventh chord"` →
+  `dominant_seventh`, `"minor-augmented tetrachord"` → `minor_major_seventh`
 
-The FlexOHR library (dev-installed from `flexohr_project/flexohr/`) provides the
-construction, validation, and rendering backend. Key API:
+**`analysisgnn/aggregation/scoring.py`** — `ScoringContext` + pluggable scorers:
+- `ScoringContext(note_ids, notes_df, probs_df, edges_df, ...)` — thin wrapper over
+  full DataFrames; filters on the fly, no data copied; exposes `distribution(note_id,
+  task)`, `distribution_matrix(task)`, `top_k(task, k)`, `argmax(task)`,
+  `note_edges(note_id)`, `internal_edges`, `adjacent_edges`, `subcontext(note_ids)`
+- `Scorer` ABC with `score(context, candidate) -> ScoringResult`; candidate is a
+  `dict[str, str]` mapping task -> class_label; result carries per-note `contributions`
+  (note_id, weight, per-task probabilities) and a structured `trace` list
+- `ProductScorer`, `GeometricMeanScorer`, `WeightedTaskScorer`, `SeparateScorer` —
+  each accepts an optional `note_weight_fn: (ScoringContext, str) -> float`
+- `nct_weight(ctx, note_id)` — returns `P("True")` from `tpc_in_label`;
+  `binary_nct_filter(threshold)` — factory for hard-cutoff weight functions
 
-**Construction:**
-- `OHR.from_(quality, sd, inversion=inv, reference_ohr=ctx)` — builds a chord OHR
-  from a `ChordQuality`, root `SD`, optional `Inversion`, and key-context OHR
-- `ChordQuality.from_format(label, "analysisgnn")` — decodes model quality labels
-- `Inversion.from_format(str(n), "analysisgnn")` — decodes model inversion integers
-- `SD.from_string(label, collection_type=ct)` / `SD.from_int(n, collection_type=ct)`
-  — decodes model degree labels (e.g., `"5"`, `"#4"`, `"-7"`)
-- `build_key_context(global_key, local_key, tonicized_key=, tonicized_coll=)` — nested
-  key-context OHR (global -> local [-> tonicized])
-- `build_key_context_from_row(row, global_key)` — row-level helper in
-  `flexohr.codecs.analysisgnn`
-- `build_ohrs_from_dataframe(df, global_key)` — bulk OHR construction with confidence
-  snaks, also in `flexohr.codecs.analysisgnn`
+Tests: 27 in `test_codec_extension.py`, 40 in `test_scoring.py`. All 175/176 pass
+(1 pre-existing failure in `test_model_creation`).
 
-**Validation:**
-- `InversionBassConsistency()` — validator checking bass/inversion/interval agreement;
-  returns `ValidationResult(is_valid, messages)`. Validators compose via `&`, `|`, `~`.
-- `validate_ohrs(df, ohrs)` — cross-checks resolved OHRs against redundant columns
-  (tonkey, root, bass); returns DataFrame with `*_ok` columns
+### Step 5b: Top-k Roman Numeral Enumeration
 
-**Rendering:**
-- `ohr.to_format('dcml')` — renders as DCML label string
-  (e.g., `V65/V/I/G` = dominant 6/5 of V in I in G)
-
-**Mutation / annotation:**
-- `ohr.with_(reference=..., bass=SPC(...))` — returns modified copy
-- `ohr.with_snak("chord_quality", confidence=0.91)` — attaches confidence metadata
-- OHR is `@dataclass(frozen=True)` — hashable, equality-comparable, usable as dict keys
-
-**Introspection:**
-- `ohr.get_property("chord_quality")` → `ChordQuality` enum member
-- `ohr.get_property("inversion")` → `Inversion` enum member
-- `ohr.component("r")` → root Component
-- `ohr.components("b", depth=1, tone_function=ToneFunction.root)` → iterator
-- `ohr.resolve()` → new OHR with all relative values resolved to absolute
-
-**Legality tables** (in `flexohr.harmony.chord_tables`):
-- `CHORD_QUALITY_INTERVALS` — maps each `ChordQuality` to its interval structure
-- `CHORD_QUALITY_TO_CLASS` — maps quality to `ChordClass` (triad, seventh, aug6, ...)
-- `CHORD_CLASS_MAX_INVERSION` — `{triad: 2, seventh: 3, augmented_sixth: 3}`;
-  classes not in this dict (dyad, suspended, unclassified) do not support inversion
-- `INVERSION_TO_INDEX` / `INDEX_TO_INVERSION` — bidirectional int ↔ `Inversion` enum
-
-#### AnalysisGNN Task Vocabulary Summary (RN-relevant tasks)
-
-The model produces per-note probability distributions over these classes:
-
-| Task | # Classes | Content |
-|------|-----------|---------|
-| `quality` | 15 | Verbose English labels (see mismatch below) |
-| `inversion` | 4 | Integer 0–3 |
-| `degree1` | 22 | `-1`..`-7`, `1`..`7`, `#1`..`#7`, `None` |
-| `degree2` | 22 | Same as degree1 (NaN = no tonicization) |
-| `localkey` | 50 | 28 major + 22 minor key names (case = mode) |
-| `romanNumeral` | 185 | Simple RN labels (no slash), e.g., `I`, `viio7`, `bVI` |
-| `root` | 38 | Pitch spellings + `None` |
-| `bass` | 38 | Pitch spellings + `None` |
-| `tonkey` | 50 | Same vocab as localkey |
-
-**Task roles in enumeration:**
-- **Core five** (define the OHR): `quality`, `degree1`, `inversion`, `localkey`, `degree2`
-- **Redundant/validating** (cross-check): `romanNumeral` (encodes root + chord type),
-  `root`, `bass`, `tonkey`
-
-#### Quality Vocabulary Mismatch
-
-The FlexOHR `analysisgnn` codec registers 18 quality labels; the model predicts 15.
-
-**Model-only** (no FlexOHR mapping yet — to be added to the codec):
-- `"incomplete dominant-seventh chord"` — map to `dominant_seventh` or new enum member
-- `"augmented sixth"` (generic) — map to `italian_sixth` or a generic aug6 member
-- `"minor-augmented tetrachord"` — needs new enum member or mapping
-
-**Codec-only** (model never predicts): `minor-major seventh chord`,
-`augmented seventh chord`, `augmented major seventh chord`, `suspended second`,
-`suspended fourth`, `power chord` — these exist in the FlexOHR enum but the
-model has no class for them. No action needed.
-
-**Decision:** Extend the FlexOHR `analysisgnn` codec to handle the 3 model-only labels.
-
-#### Existing Usage Patterns
-
-**Step 4b** (`_build_complete_rn_column` in the Gradio app) constructs one OHR per row
-from the argmax predictions of the five core tasks. Localkey and tonkey mode are read
-directly from prediction case (the 50-class vocabulary encodes mode via uppercase =
-major, lowercase = minor). No enumeration, no top-k — pure argmax.
-
-**The notebook** (`flexohr_project/flexohr/docs/notebooks/analysisgnn_tasks.py`) goes
-further: section 6 validates OHRs against redundant columns (tonkey, root, bass) via
-`validate_ohrs()`, and section 7 (`compare_alternatives`) builds alternative OHRs by
-trusting contradicting columns, computes likelihoods as products of per-task
-confidences, and picks the higher-likelihood interpretation. This is the prototype
-for the enumeration logic.
+The enumerator: given a `ScoringContext` for a note group, enumerate legal
+Roman-numeral candidates (OHRs), score them, and return top-k.
 
 #### Enumeration Design
 
-**Strategy:** Cartesian product of top-k predictions per core task, filtered for
-legality, scored by composite likelihood. The `romanNumeral` task is treated as an
-additional evidence source for root + chord type (not as an enumeration anchor).
+Cartesian product of top-k (default k=3) predictions per core task, filtered for
+legality, scored via the `scoring.py` framework. At k=3 the product space is at
+most 3^5 = 243 combinations; after legality + deduplication, typically < 50 unique
+candidates. Fixed top-k avoids vocabulary-size bias inherent in probability thresholds.
 
-**Top-k per task (default k=3, configurable):** For each of the 5 core tasks, take
-the top-k class labels with their probabilities. The cartesian product of 5 tasks at
-k=3 yields at most 3^5 = 243 combinations before pruning. After legality filtering
-(inversion ≤ max for quality class), this drops to roughly 100–150 valid combos.
-After deduplication (different input combos producing the same DCML label), typically
-fewer than 50 unique candidates remain. This is computationally trivial — sub-second
-for a single note — and eliminates the need for threshold-based pruning.
+**Steps per group:**
+1. Extract top-k per core task from `ScoringContext.top_k(task, k)`
+2. Cartesian product of `(quality, degree1, inversion, localkey, degree2)`
+3. Prune illegal inversions via `CHORD_QUALITY_TO_CLASS` + `CHORD_CLASS_MAX_INVERSION`
+4. Construct OHR via `OHR.from_(quality, sd, inversion, reference_ohr=ctx)`
+5. Validate via `InversionBassConsistency`
+6. Score core tasks via scorer; cross-validate against redundant tasks (romanNumeral,
+   root, bass, tonkey) as separate validation score
+7. Deduplicate by DCML label string (OHRs are hashable)
+8. Rank and return top-k
 
-**Why fixed top-k, not probability thresholds:** The 9 relevant tasks have
-vocabulary sizes ranging from 4 (inversion) to 185 (romanNumeral). A task with 4
-classes will typically have a top-1 probability of 0.7–0.95 and a top-2 of 0.1–0.25,
-while a 185-class task might have top-1 at 0.1–0.5 and top-2 at 0.03–0.10. Any
-absolute probability threshold (e.g., "only consider P > 0.1") would systematically
-over-prune high-vocabulary tasks and under-prune low-vocabulary ones. A fixed k
-avoids this entirely: the scoring step naturally ranks low-probability candidates
-low unless other tasks corroborate them. Since the combinatorial space at k=3 is
-already small, there is no computational pressure to prune more aggressively.
+#### What Needs to Be Built
 
-**Note on tonicization and task count:** Non-tonicized chords use `degree2 = "None"`
-(class 21 in the 22-class vocabulary), which carries its own probability. Every
-candidate therefore uses exactly 5 core tasks — the tonicization dimension does not
-create a task-count asymmetry in the core score.
-
-**Steps for a single note:**
-1. For each of the 5 core tasks, extract top-k class labels with probabilities
-   (from the `probabilities` Delta Lake table or in-memory distributions)
-2. Enumerate all `(quality, degree1, inversion, localkey, degree2)` combinations
-   from the cartesian product
-3. **Prune illegal combinations:** inversion must be ≤ max for the quality's chord
-   class (via `CHORD_QUALITY_TO_CLASS` + `CHORD_CLASS_MAX_INVERSION`)
-4. **Construct OHR:** `OHR.from_(quality, sd, inversion=inv, reference_ohr=ctx)`
-5. **Validate:** `InversionBassConsistency()(ohr)` — discard if invalid
-6. **Score:** compute composite likelihood from per-task probabilities (core score)
-7. **Cross-validate:** look up implied root, bass, tonkey from the resolved OHR;
-   find these values in the corresponding task distributions and incorporate as
-   additional evidence (validation score, reported separately)
-8. **Deduplicate:** OHRs are hashable; group by DCML label string for human
-   deduplication (different input combos may produce the same label)
-9. **Rank and return top-k** candidates with composite likelihoods
-
-**For a group of notes (aggregation):**
-The per-note top-k candidate lists are combined across all notes in the group.
-Candidates supported by multiple notes accumulate evidence; candidates contradicted
-by other notes are penalized. The exact combination method (product, mean, vote, etc.)
-is the V3 Aggregation Operator from the variable-parts table.
-
-#### Composite Likelihood: The Task-Count Bias Problem
-
-The core score (from the 5 core tasks) is always composed from the same number of
-factors, so it is directly comparable across candidates. The bias problem arises when
-incorporating the **redundant/validating tasks** (romanNumeral, root, bass, tonkey).
-
-**The problem:** A candidate that finds corroboration from all 4 redundant tasks has
-its score multiplied by 4 additional factors (each ≤ 1), while a candidate matched by
-only 2 redundant tasks has fewer multiplicands. Under a raw product, the candidate
-with *more* supporting evidence can receive a *lower* composite score. For example,
-if `root` and `romanNumeral` both support a given degree1 prediction, and `bass` and
-`tonkey` further confirm the candidate, the 4-factor product may be lower than a
-2-factor product for a different candidate that simply wasn't checkable against bass
-or tonkey.
-
-**Vocabulary-size disparity in scores:** Even within the core 5, the tasks have very
-different numbers of classes (inversion: 4, quality: 15, degree1/2: 22, localkey: 50).
-A probability of 0.5 for a 4-class task is far less informative than 0.5 for a
-50-class task (the uniform baseline is 0.25 vs. 0.02). This does not affect the
-ranking of candidates that all use the same 5 tasks — the product is still
-monotonically related to how well each task supports the candidate. But it matters
-when **interpreting** scores and when **weighting** tasks: a task with a larger
-vocabulary contributes more bits of information per probability unit and arguably
-deserves more weight.
-
-**Required:** A modular scoring framework that supports multiple approaches:
-- **Simple product** — baseline, easy to inspect, biased by task count when
-  incorporating redundant tasks
-- **Log-probability sum** — numerically stable equivalent of product, same bias
-- **Geometric mean** (= exp(log-sum / n)) — normalizes by number of contributing
-  tasks, removing the task-count bias for redundant-task incorporation
-- **Weighted product** — per-task weights allow tuning for vocabulary size and
-  task reliability (e.g., weight romanNumeral higher because a match against 185
-  classes is more informative)
-- **Separate core vs. validation scores** — report the core-5 likelihood and the
-  redundant-task support score independently, let the user decide how to combine;
-  this cleanly avoids the task-count bias by keeping the two score dimensions
-  orthogonal
-
-The scoring function should be a pluggable component (V7 Certainty/Confidence Model
-in the variable-parts table), and the number of contributing tasks should always be
-reported alongside the score so that comparisons are interpretable.
-
-#### What Needs to Be Built (in `analysisgnn/aggregation/`)
-
-1. **`roman_numeral.py`** — the enumerator:
-   - `enumerate_candidates(probs_df, global_key, top_k_per_task, threshold)` →
-     list of `(OHR, score, metadata)` tuples
-   - Legal-combination filter using FlexOHR chord tables
-   - OHR construction via FlexOHR `OHR.from_()`
-   - Validation via `InversionBassConsistency`
-   - Cross-validation against redundant tasks
-
-2. **`scoring.py`** — pluggable scoring functions:
-   - `ProductScorer`, `LogSumScorer`, `GeometricMeanScorer`, `WeightedScorer`
-   - Each takes a dict of `{task: probability}` and returns a composite score
-   - Reports task count alongside score
-
-3. **FlexOHR codec extension** — add the 3 model-only quality labels to the
-   `analysisgnn` codec in `flexohr/codecs/analysisgnn.py`
-
-4. **Integration with aggregation framework** — register as a new strategy in the
-   existing `analysisgnn/aggregation/registry.py`, callable from the Gradio app
-
-5. **Group-level aggregation** — extend single-note enumeration to note groups by
-   combining per-note distributions before or after enumeration
+1. **`analysisgnn/aggregation/roman_numeral.py`** — the enumerator module
+2. **Integration with aggregation registry** — register as a strategy callable from
+   the Gradio app
+3. **Tests** — synthetic single-note + multi-note groups, legality filtering,
+   deduplication, cross-validation scoring
 
 ---
 
