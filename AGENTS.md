@@ -633,36 +633,52 @@ scoring framework that operates on Delta Lake DataFrames.
 Tests: 27 in `test_codec_extension.py`, 40 in `test_scoring.py`. All 175/176 pass
 (1 pre-existing failure in `test_model_creation`).
 
-### Step 5b: Top-k Roman Numeral Enumeration
+### Step 5b: Top-k Roman Numeral Enumeration — DONE
 
-The enumerator: given a `ScoringContext` for a note group, enumerate legal
-Roman-numeral candidates (OHRs), score them, and return top-k.
+Created `analysisgnn/aggregation/roman_numeral.py`:
 
-#### Enumeration Design
+- `enumerate_roman_numerals(context, global_key, *, scorer, k, top_n, derive_validation)`
+  — main entry point; returns `(list[RankedCandidate], EnumerationTrace)`
+- Pipeline: `_group_top_k_labels` (mean distribution, top-k per task) → Cartesian
+  product → `_is_legal_inversion` pre-filter → `_build_candidate_ohr` (FlexOHR OHR
+  construction + `InversionBassConsistency` validation) → DCML dedup →
+  `SeparateScorer` scoring → rank
+- `RankedCandidate(ohr, dcml, candidate, result, rank)` with `_repr_html_()`
+- `EnumerationTrace` with pipeline stage counts and pruned-reasons dict
 
-Cartesian product of top-k (default k=3) predictions per core task, filtered for
-legality, scored via the `scoring.py` framework. At k=3 the product space is at
-most 3^5 = 243 combinations; after legality + deduplication, typically < 50 unique
-candidates. Fixed top-k avoids vocabulary-size bias inherent in probability thresholds.
+Performance: `ScoringContext.distribution_matrix` cached via `@functools.cache`;
+`_collect_contributions` vectorised (one column extraction per task from cached
+matrix, dict comprehension for per-note probabilities). 95 beat groups enumerate
+in ~20s on K.1 (256 notes, k=3).
 
-**Steps per group:**
-1. Extract top-k per core task from `ScoringContext.top_k(task, k)`
-2. Cartesian product of `(quality, degree1, inversion, localkey, degree2)`
-3. Prune illegal inversions via `CHORD_QUALITY_TO_CLASS` + `CHORD_CLASS_MAX_INVERSION`
-4. Construct OHR via `OHR.from_(quality, sd, inversion, reference_ohr=ctx)`
-5. Validate via `InversionBassConsistency`
-6. Score core tasks via scorer; cross-validate against redundant tasks (romanNumeral,
-   root, bass, tonkey) as separate validation score
-7. Deduplicate by DCML label string (OHRs are hashable)
-8. Rank and return top-k
+Also done:
+- `ScoringContext.from_delta(output_dir)` convenience constructor
+- `ScoringContext._repr_html_()`, `__hash__`/`__eq__` (enables `@cache`)
+- Demo notebook `notebooks/roman_numeral_enumeration.py` (jupytext, 7 sections)
+- 28 tests in `tests/test_roman_numeral.py`; all 203 tests pass (1 pre-existing)
+
+### Step 5c: Gradio Integration + Onset-Level Enumeration
+
+Wire the enumerator into the Gradio app so users can trigger enumeration from the
+UI, and extend from beat-level to onset-level grouping.
 
 #### What Needs to Be Built
 
-1. **`analysisgnn/aggregation/roman_numeral.py`** — the enumerator module
-2. **Integration with aggregation registry** — register as a strategy callable from
-   the Gradio app
-3. **Tests** — synthetic single-note + multi-note groups, legality filtering,
-   deduplication, cross-validation scoring
+1. **Register as aggregation strategy** — `RomanNumeralEnumeration` in
+   `aggregation/registry.py`, callable from the aggregation dropdown. The strategy
+   runs `enumerate_roman_numerals` per group and produces an argmax-summary DataFrame
+   with the top-1 DCML label per group.
+2. **Onset-level enumeration** — the notebook showed beat-level; onset groups are
+   finer-grained and may yield different results. Support configurable `edge_type`
+   parameter (beat, onset, measure) in the strategy.
+3. **Confidence-weighted scoring** — use `nct_weight` or `binary_nct_filter` to
+   downweight non-chord tones during enumeration; expose as a checkbox in the Gradio
+   app.
+4. **Verovio overlay** — render enumerated RN labels (top-1 per group) as the RN
+   overlay in the visual score tab, replacing or augmenting the current argmax-based
+   spans.
+5. **Top-k inspection panel** — when clicking a note/group in the visual score,
+   show the top-k enumerated candidates with scores in the note info panel.
 
 ---
 
@@ -770,3 +786,21 @@ Full option reference: https://book.verovio.org/toolkit-reference/toolkit-option
   `vacuum(retention_hours=0)` to remove orphaned parquet files. First write to a
   non-existent table uses plain `write_deltalake`. Callers do not need existence
   guards — the merge handles both creation and update.
+
+### Notebook Style
+
+These rules are **mandatory** for all `.py` (jupytext) and `.ipynb` notebook files:
+
+1. **Never use `print()` in loops.** Build a DataFrame or dict instead. A `for` loop
+   with `print()` inside it is always wrong in a notebook.
+2. **Vectorize.** Use pandas/numpy operations, not Python loops over rows or groups.
+   When iterating over groups is unavoidable, collect results into a list of dicts
+   and convert to a DataFrame in one shot — never print intermediate results.
+3. **No `print()` for inspection.** Use `__repr__()` / `_repr_html_()` methods on
+   classes, or bare expressions that the notebook renderer displays automatically.
+   Use on-the-fly dicts only when a quick one-off inspection is needed.
+4. **Never use `df.head()`.** The IDE / notebook renderer handles output truncation.
+   Just return the bare DataFrame expression.
+5. **Prefer rich display.** Classes that appear in notebook output should have
+   `_repr_html_()` returning an HTML table or summary. Dataclasses should have a
+   concise `__repr__`.

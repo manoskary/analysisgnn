@@ -23,6 +23,11 @@ Scoring (for Roman-numeral candidate ranking)::
 """
 
 from analysisgnn.aggregation.registry import get_strategy, list_strategies, register
+from analysisgnn.aggregation.roman_numeral import (
+    EnumerationTrace,
+    RankedCandidate,
+    enumerate_roman_numerals,
+)
 from analysisgnn.aggregation.scoring import (
     CORE_TASKS,
     VALIDATION_TASKS,
@@ -52,4 +57,7 @@ __all__ = [
     "SeparateScoringResult",
     "NoteContribution",
     "nct_weight",
+    "enumerate_roman_numerals",
+    "RankedCandidate",
+    "EnumerationTrace",
 ]

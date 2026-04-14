@@ -42,8 +42,8 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from functools import cache
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -119,6 +119,12 @@ class ScoringContext:
         self._edges = edges
         self._hyperedges = hyperedges
         self._metadata = metadata
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
 
     # ── identity ──
 
@@ -205,11 +211,12 @@ class ScoringContext:
         )
         return self._probabilities.loc[mask].set_index("class_label")["probability"]
 
+    @cache
     def distribution_matrix(self, task: str) -> pd.DataFrame:
         """Probability matrix for one task across all notes in the group.
 
         Returns a DataFrame: rows = note_ids, columns = class_labels,
-        values = probabilities.  Each row sums to 1.
+        values = probabilities.  Each row sums to 1.  Cached per task.
         """
         task_probs = self._probabilities[
             (self._probabilities["task"] == task)
@@ -271,8 +278,76 @@ class ScoringContext:
             metadata=self._metadata,
         )
 
+    # ── constructors ──
+
+    @classmethod
+    def from_delta(
+        cls,
+        output_dir: str,
+        note_ids: Optional[Sequence[str]] = None,
+    ) -> ScoringContext:
+        """Build a context directly from a Delta Lake output directory.
+
+        Parameters
+        ----------
+        output_dir : str
+            Path to the per-score Delta Lake directory (e.g.
+            ``"outputs/Minuet_in_G_Major_K.1"``).
+        note_ids : sequence of str or None
+            Subset of note IDs to include.  ``None`` means all notes.
+
+        Returns
+        -------
+        ScoringContext
+        """
+        from analysisgnn.storage.delta_reader import (
+            load_edges,
+            load_hyperedges,
+            load_metadata,
+            load_notes,
+            load_probabilities,
+        )
+
+        notes = load_notes(output_dir)
+        probs = load_probabilities(output_dir)
+        edges = load_edges(output_dir)
+        hyperedges = load_hyperedges(output_dir)
+        metadata = load_metadata(output_dir)
+
+        ids = list(note_ids) if note_ids is not None else notes["note_id"].tolist()
+        return cls(
+            note_ids=ids,
+            notes=notes,
+            probabilities=probs,
+            edges=edges,
+            hyperedges=hyperedges,
+            metadata=metadata,
+        )
+
+    # ── display ──
+
     def __repr__(self) -> str:
         return f"ScoringContext({len(self._note_ids)} notes)"
+
+    def _repr_html_(self) -> str:
+        n = len(self._note_ids)
+        tasks = self.tasks
+        n_edges = len(self.internal_edges)
+        rows = [
+            ("Notes", str(n)),
+            ("Tasks", f"{len(tasks)}: {', '.join(tasks[:6])}{'...' if len(tasks) > 6 else ''}"),
+            ("Internal edges", str(n_edges)),
+        ]
+        if self._hyperedges is not None:
+            he = self.hyperedges
+            if he is not None and len(he) > 0:
+                types = he["edge_type"].unique().tolist()
+                rows.append(("Hyperedge types", ", ".join(sorted(types))))
+        html = "<table><tr><th colspan='2'>ScoringContext</th></tr>"
+        for k, v in rows:
+            html += f"<tr><td><b>{k}</b></td><td>{v}</td></tr>"
+        html += "</table>"
+        return html
 
 
 # ── Result dataclasses ──
@@ -457,22 +532,35 @@ class Scorer(ABC):
         -------
         list[NoteContribution]
         """
-        contributions: List[NoteContribution] = []
-        for note_id in context.note_ids:
-            w = note_weights.get(note_id, 0.0)
-            if w == 0.0:
-                continue
-            task_probs: Dict[str, float] = {}
-            for task, label in candidate.items():
-                dist = context.distribution(note_id, task)
-                task_probs[task] = dist.get(label, 0.0) if len(dist) > 0 else 0.0
-            contributions.append(
-                NoteContribution(
-                    note_id=note_id,
-                    weight=w,
-                    task_probabilities=task_probs,
-                )
+        # Filter to active notes (weight > 0)
+        active_ids = [nid for nid in context.note_ids if note_weights.get(nid, 0.0) > 0]
+        if not active_ids or not candidate:
+            trace.append({"step": "collect_contributions", "num_notes": 0, "tasks": list(candidate.keys())})
+            if not candidate:
+                return [
+                    NoteContribution(note_id=nid, weight=note_weights[nid], task_probabilities={})
+                    for nid in active_ids
+                ]
+            return []
+
+        # Precompute per-task lookup: (task -> {note_id -> prob})
+        task_lookups: Dict[str, Dict[str, float]] = {}
+        for task, label in candidate.items():
+            mat = context.distribution_matrix(task)
+            if label in mat.columns:
+                col = mat[label]
+                task_lookups[task] = {nid: col.get(nid, 0.0) for nid in active_ids}
+            else:
+                task_lookups[task] = {nid: 0.0 for nid in active_ids}
+
+        contributions = [
+            NoteContribution(
+                note_id=nid,
+                weight=note_weights[nid],
+                task_probabilities={task: lookup[nid] for task, lookup in task_lookups.items()},
             )
+            for nid in active_ids
+        ]
         trace.append(
             {
                 "step": "collect_contributions",
