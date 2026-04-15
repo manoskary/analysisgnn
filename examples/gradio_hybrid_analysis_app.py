@@ -207,6 +207,32 @@ def _value_or_none(value: Any) -> Any:
     return value
 
 
+def _prepare_prediction_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply app-only presentation cleanup for the note prediction table."""
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+
+    confidence_cols = [col for col in out.columns if col.endswith("_confidence")]
+    for col in confidence_cols:
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        if numeric.notna().any():
+            out[col] = numeric.round(3)
+
+    if "romanNumeral_full" in out.columns:
+        cols = [col for col in out.columns if col != "romanNumeral_full"]
+        if "pitch_midi" in cols:
+            insert_at = cols.index("pitch_midi") + 1
+        elif "cadence" in cols:
+            insert_at = cols.index("cadence")
+        else:
+            insert_at = len(cols)
+        cols.insert(insert_at, "romanNumeral_full")
+        out = out[cols]
+
+    return out
+
+
 def _derive_global_key(df: pd.DataFrame) -> str:
     """Derive the global key from tonic chords (``romanNumeral`` is ``"I"``
     or ``"i"``).
@@ -1167,6 +1193,7 @@ def run_full_inference(
             display_df["romanNumeral_full"] = _build_complete_rn_column(
                 display_df, global_key
             )
+        display_df = _prepare_prediction_table_for_display(display_df)
 
         # Build visual payload
         visual_payload = _build_visual_payload(
@@ -1325,6 +1352,7 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             display_df["romanNumeral_full"] = _build_complete_rn_column(
                 display_df, global_key
             )
+        display_df = _prepare_prediction_table_for_display(display_df)
 
         csv_path = _write_csv_to_temp(display_df, score_path)
 
@@ -1422,6 +1450,7 @@ def run_aggregation(
                 display_df["romanNumeral_full"] = _build_complete_rn_column(
                     display_df, global_key
                 )
+            display_df = _prepare_prediction_table_for_display(display_df)
             _aggregation_cache[strategy_name] = display_df
             log_text = _log(
                 log_text,
@@ -1632,6 +1661,7 @@ def run_edit_conditioned(
             display_df["romanNumeral_full"] = _build_complete_rn_column(
                 display_df, global_key
             )
+        display_df = _prepare_prediction_table_for_display(display_df)
 
         visual_payload = _build_visual_payload(
             score_path=score_path,
