@@ -458,8 +458,9 @@ def _enumerate_rn_candidates(
     global_key: str,
     k: int = 3,
     top_n: int = 3,
+    grouping: str = "beat",
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Enumerate top-N Roman-numeral candidates per beat group.
+    """Enumerate top-N Roman-numeral candidates per note group.
 
     Returns a dict mapping ``note_id`` to a list of candidate dicts, each
     containing ``dcml``, ``score``, and ``expected`` (task→value mapping
@@ -473,6 +474,19 @@ def _enumerate_rn_candidates(
 
     gk = _agnn_to_flx_pitch(global_key)
 
+    # Build localkey mode map from display_df (which has correct case from _fix_key_mode)
+    localkey_mode_map: Dict[str, str] = {}
+    if "localkey" in display_df.columns:
+        for lk in display_df["localkey"].dropna().unique():
+            lk_str = str(lk).strip()
+            if lk_str:
+                # Map uppercase key → mode-corrected key (e.g. "F" → "f")
+                lk_upper = lk_str.upper()
+                # FlexOHR uses "b" for flats; display uses "-"
+                lk_flx = lk_str.replace("-", "b")
+                lk_upper_flx = lk_upper.replace("-", "b")
+                localkey_mode_map[lk_upper_flx] = lk_flx
+
     # Build full scoring context from Delta-style DataFrames
     edges_df = pd.DataFrame({"src": pd.Series(dtype=str), "dst": pd.Series(dtype=str), "edge_type": pd.Series(dtype=str)})
     ctx = ScoringContext(
@@ -482,15 +496,20 @@ def _enumerate_rn_candidates(
         edges=edges_df,
     )
 
-    # Beat groups: note_id -> group_id
-    beat_groups = hyperedges_df[hyperedges_df["edge_type"] == "beat"]
-    if beat_groups.empty:
-        # Fallback to onset groups
-        beat_groups = hyperedges_df[hyperedges_df["edge_type"] == "onset"]
-    if beat_groups.empty:
-        return {}
-
-    group_note_map = beat_groups.groupby("group_id")["note_id"].apply(list).to_dict()
+    # Build group_note_map based on grouping parameter
+    if grouping == "none":
+        # Per-note: each note is its own group
+        all_nids = list(notes_df["note_id"])
+        group_note_map = {f"note_{nid}": [nid] for nid in all_nids}
+    else:
+        grp_df = hyperedges_df[hyperedges_df["edge_type"] == grouping]
+        if grp_df.empty and grouping != "beat":
+            grp_df = hyperedges_df[hyperedges_df["edge_type"] == "beat"]
+        if grp_df.empty:
+            grp_df = hyperedges_df[hyperedges_df["edge_type"] == "onset"]
+        if grp_df.empty:
+            return {}
+        group_note_map = grp_df.groupby("group_id")["note_id"].apply(list).to_dict()
 
     # note_id -> pitch_spelling (for tpc_in_label / note_degree derivation)
     note_pitch: Dict[str, str] = {}
@@ -514,6 +533,7 @@ def _enumerate_rn_candidates(
             sub = ctx.subcontext(valid_notes)
             candidates, _trace = enumerate_roman_numerals(
                 sub, gk, k=k, top_n=top_n, scorer=scorer,
+                localkey_mode_map=localkey_mode_map,
             )
         except Exception:
             continue
@@ -840,19 +860,23 @@ def _build_graph_overlay_payload(
     rn_spans = _build_complete_rn_spans(spans_df, global_key)
 
     # Compute expected labels for agreement coloring (fallback when no candidates)
-    expected_labels: List[Dict[str, str]] = []
+    expected_labels: List[Dict[str, str]] = [{} for _ in range(n)]
     if not rn_candidates_map and global_key:
         prepared = _prepare_df_for_flexohr(data)
-        ohrs = _build_ohrs(data, global_key)
-        expected_labels = flx.codecs.analysisgnn.derive_expected_labels(
-            prepared, ohrs, _agnn_to_flx_pitch(global_key)
-        )
-        # Copy tpc_in_label -> pitch_spelling for Pitch tile coloring
-        for rec in expected_labels:
-            if "tpc_in_label" in rec:
-                rec["pitch_spelling"] = rec["tpc_in_label"]
-    if not expected_labels:
-        expected_labels = [{}] * n
+        gk = _agnn_to_flx_pitch(global_key)
+        # Filter to rows with valid core numeric columns (NaN = no OHR)
+        core_numeric = ["degree1", "inversion"]
+        valid_mask = prepared[core_numeric].notna().all(axis=1)
+        valid_prepared = prepared.loc[valid_mask]
+        if len(valid_prepared) > 0:
+            ohrs = flx.codecs.analysisgnn.build_ohrs_from_dataframe(valid_prepared, gk)
+            valid_labels = flx.codecs.analysisgnn.derive_expected_labels(
+                valid_prepared, ohrs, gk
+            )
+            for rec, (orig_idx, _) in zip(valid_labels, valid_prepared.iterrows()):
+                if "tpc_in_label" in rec:
+                    rec["pitch_spelling"] = rec["tpc_in_label"]
+                expected_labels[orig_idx] = rec
 
     notes_payload: List[Dict[str, Any]] = []
     for idx in range(n):
@@ -1591,7 +1615,22 @@ def _clear_aggregation_cache() -> None:
     _aggregation_cache.clear()
 
 
+def _resolve_strategy_name(group: str, strategy: str) -> str:
+    """Compose a strategy registry name from the two dropdown values.
+
+    Mapping:
+    - group=None → "none" (passthrough, ignores strategy dropdown)
+    - group=Onset/Beat/Measure + strategy=Mean → "onset_mean" / "beat_mean" / "measure_mean"
+    """
+    group = (group or "None").strip().lower()
+    strategy = (strategy or "Mean").strip().lower()
+    if group == "none":
+        return "none"
+    return f"{group}_{strategy}"
+
+
 def run_aggregation(
+    group_name: str,
     strategy_name: str,
     delta_dfs_state: Any,
     tasks_state: Any,
@@ -1607,7 +1646,7 @@ def run_aggregation(
     Returns: (display_df, log_text, visual_payload, csv_path)
     """
     try:
-        strategy_name = (strategy_name or "none").strip().lower()
+        resolved_name = _resolve_strategy_name(group_name, strategy_name)
         tasks = tasks_state or []
         delta_dfs = delta_dfs_state or {}
         intermediates = intermediates_state or {}
@@ -1619,11 +1658,11 @@ def run_aggregation(
             )
 
         # Check cache
-        if strategy_name in _aggregation_cache:
-            display_df = _aggregation_cache[strategy_name]
+        if resolved_name in _aggregation_cache:
+            display_df = _aggregation_cache[resolved_name]
             log_text = _log(
                 log_text,
-                f"Aggregation '{strategy_name}' (cached). Rows={len(display_df)}.",
+                f"Aggregation '{resolved_name}' (cached). Rows={len(display_df)}.",
             )
         else:
             probs_df = delta_dfs["probs_df"]
@@ -1631,7 +1670,7 @@ def run_aggregation(
             hyperedges_df = delta_dfs["hyperedges_df"]
             metadata = delta_dfs.get("metadata", {})
 
-            strategy = get_strategy(strategy_name)
+            strategy = get_strategy(resolved_name)
             result_df = strategy.aggregate(
                 probs_df, notes_df, hyperedges_df, metadata, tasks=tasks
             )
@@ -1647,10 +1686,10 @@ def run_aggregation(
                 display_df, global_key
             )
             display_df = _prepare_prediction_table_for_display(display_df)
-            _aggregation_cache[strategy_name] = display_df
+            _aggregation_cache[resolved_name] = display_df
             log_text = _log(
                 log_text,
-                f"Aggregation '{strategy_name}' applied. Rows={len(display_df)}.",
+                f"Aggregation '{resolved_name}' applied. Rows={len(display_df)}.",
             )
 
         # Build visual payload if score is available
@@ -1959,6 +1998,7 @@ def refresh_visual_tab(
     edge_type_labels: List[str],
     nct_color_labels: List[str],
     global_key_text: str,
+    aggregation_group: str,
     visual_state: Dict[str, Any],
     intermediates_state: Any,
     edges_state: Any,
@@ -2007,12 +2047,14 @@ def refresh_visual_tab(
             delta_dfs = delta_dfs_state if isinstance(delta_dfs_state, dict) else {}
             if global_key and delta_dfs.get("probs_df") is not None:
                 try:
+                    rn_grouping = (aggregation_group or "none").strip().lower()
                     rn_cands_map = _enumerate_rn_candidates(
                         display_df=df,
                         probs_df=delta_dfs["probs_df"],
                         notes_df=delta_dfs["notes_df"],
                         hyperedges_df=delta_dfs["hyperedges_df"],
                         global_key=global_key,
+                        grouping=rn_grouping,
                     )
                     log_text = _log(
                         log_text,
@@ -2202,11 +2244,17 @@ def build_demo() -> gr.Blocks:
                 max_lines=1,
                 scale=0,
             )
-            aggregation_dropdown = gr.Dropdown(
-                label="Aggregation Strategy",
-                choices=[s.capitalize() for s in list_strategies()],
+            aggregation_groups_dropdown = gr.Dropdown(
+                label="Aggregation Groups",
+                choices=["None", "Onset", "Beat", "Measure"],
                 value="None",
-                info="Select an aggregation strategy and click 'Aggregate!' to apply.",
+                info="Grouping level for combining probability distributions.",
+            )
+            aggregation_strategy_dropdown = gr.Dropdown(
+                label="Aggregation Strategy",
+                choices=["Mean"],
+                value="Mean",
+                info="How distributions are combined within each group.",
             )
             aggregate_btn = gr.Button("Aggregate!", variant="secondary")
             save_delta_btn = gr.Button("Save Delta Lake", variant="secondary")
@@ -2414,7 +2462,8 @@ def build_demo() -> gr.Blocks:
         aggregate_btn.click(
             fn=run_aggregation,
             inputs=[
-                aggregation_dropdown,
+                aggregation_groups_dropdown,
+                aggregation_strategy_dropdown,
                 delta_dfs_state,
                 tasks_state,
                 score_path_state,
@@ -2461,6 +2510,7 @@ def build_demo() -> gr.Blocks:
                 visual_edge_types,
                 nct_color_group,
                 global_key_field,
+                aggregation_groups_dropdown,
                 visual_payload_state,
                 intermediates_state,
                 edges_state,

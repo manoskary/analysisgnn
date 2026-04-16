@@ -278,6 +278,7 @@ def enumerate_roman_numerals(
     k: int = 3,
     top_n: int = 10,
     derive_validation: bool = False,
+    localkey_mode_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[RankedCandidate], EnumerationTrace]:
     """Enumerate and rank legal Roman-numeral candidates for a note group.
 
@@ -298,6 +299,10 @@ def enumerate_roman_numerals(
         If ``True``, derive validation task labels (romanNumeral, root,
         bass, tonkey) from each OHR and include them in the
         :class:`SeparateScorer` evaluation.
+    localkey_mode_map : dict or None
+        Maps uppercase localkey labels (from the probabilities vocabulary)
+        to mode-corrected labels (e.g. ``{"F": "f", "C": "c"}``).
+        When ``None``, localkey labels are used as-is.
 
     Returns
     -------
@@ -327,6 +332,9 @@ def enumerate_roman_numerals(
     degree1s = task_labels["degree1"]
     inversions = task_labels["inversion"]
     localkeys = task_labels["localkey"]
+    # Apply mode correction to localkey labels (vocabulary is always uppercase)
+    if localkey_mode_map:
+        localkeys = [localkey_mode_map.get(lk, lk) for lk in localkeys]
     degree2s = task_labels["degree2"]
 
     # 2. Cartesian product

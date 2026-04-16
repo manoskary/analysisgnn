@@ -600,37 +600,43 @@ Demo notebook: `notebooks/roman_numeral_enumeration.py`.
 ### Step 5c: Grouped Note Panel + Agreement Coloring — DONE
 
 Restructured Verovio note info panel with grouped tiles and agreement coloring.
+Top-k DCML labels as button group; clicking a candidate recolors harmony tiles.
+Tiles: (localkey, globalkey), paired core|validation grid, Note (pitch + note_degree
++ tpc_in_label + timing), Structure.  `derive_expected_labels()` in FlexOHR codec
+derives expected values from OHRs for all tasks.
 
-**FlexOHR** (`flexohr_project/flexohr/`):
-- `SD.from_format/to_format("analysisgnn")` — numeric degree strings (`"b3"`, `"#5"`)
-- `derive_expected_labels(df, ohrs, global_key)` in `codecs/analysisgnn.py` — derives
-  expected values for all tasks from OHRs: core from row, validation from resolved OHR,
-  note_degree from scale + pitch, tpc_in_label from chord component membership
+### Step 5d: Two-Dropdown Aggregation UI + Bug Fixes — DONE
 
-**Gradio app** (`examples/gradio_hybrid_analysis_app.py`):
-- `_build_ohrs(df, global_key)` wraps `build_ohrs_from_dataframe`;
-  `_build_complete_rn_column` refactored to use it
-- `_prepare_df_for_flexohr(df)` normalises string "None" → NaN, numeric conversion
-- `_enumerate_rn_candidates(display_df, probs_df, notes_df, hyperedges_df, global_key)`
-  runs `enumerate_roman_numerals` per beat group, returns `note_id → [{dcml, score,
-  expected}, ...]` with per-note tpc_in_label and note_degree derivation
-- `_build_graph_overlay_payload` accepts `rn_candidates_map`, populates per-note
-  `rn_candidates` and `rn_expected`; top-1 candidate DCML becomes `romanNumeral_full`
-- `refresh_visual_tab` triggers enumeration when Delta Lake data is available
+Split aggregation controls into two independent dimensions:
 
-**Verovio panel** (`examples/assets/verovio_score_graph.{js,css}`):
-- Top-k DCML labels shown as a **button group** (`agn-rn-group`); clicking a candidate
-  recolors all harmony tiles via that candidate's `expected` dict
-- Tiles grouped: **(global key, localkey)** pair at top of Harmony, then paired
-  core|validation grid (degree1|root, quality|romanNumeral, inversion|bass,
-  degree2|tonkey), Note (identity + note_degree + tpc_in_label), Structure
-  (phrase, section, cadence)
-- Core tiles: bold labels; agreement: green/red left-stripe + background tint
+- **"Aggregation Groups"** dropdown: `None`, `Onset`, `Beat`, `Measure` (default: None).
+  Controls the hyperedge grouping level over which probability distributions are
+  combined.  `None` = raw per-note predictions (no grouping/averaging).
+- **"Aggregation Strategy"** dropdown: `Mean` (default), plus future scorers
+  (`GeometricMean`, `WeightedTask`, etc. from `aggregation/scoring.py`).  Controls
+  *how* distributions are combined within each group.
+- `GroupedMeanAggregation(level)` in `mean.py`: single-level mean at onset/beat/measure.
+  Registered as `onset_mean`, `beat_mean`, `measure_mean`.
+- `_enumerate_rn_candidates` accepts `grouping=` parameter; `"none"` enumerates per
+  note (each note is its own group), other values use the corresponding hyperedge type.
+- **Future**: scorer-based strategies (`GeometricMeanScorer`, etc.) will be registered
+  as aggregation strategies that operate on the grouped probabilities, replacing the
+  fixed `scatter_mean` with pluggable combination operators.
 
-Alternative-RN display is a **core feature**, orthogonal to aggregation strategies.
-Each strategy produces different per-note distributions; the enumerator runs on top
-of whichever distributions are current. Grouping granularity (beat, onset, measure)
-is an implementation detail of the aggregation, not a user-facing parameter.
+**Bug fixes in same changeset:**
+- FlexOHR `build_key_context()`: infer global key mode from string case (was hardcoded
+  `CollectionType.major`); reject bare SPC
+- `_build_complete_rn_column`: filters NaN rows before OHR build (per-row data issues →
+  empty string); structural failures raise
+- `_build_graph_overlay_payload`: same NaN-safe OHR build for expected labels
+- DCML format `f: i/i` (global key prefix, colon+space) via `_format_dcml_with_global_key`
+- Global key derivation errors propagate (no silent swallowing)
+- `global_key_field.blur()` → regenerate `romanNumeral_full` column
+- Verovio JS: localkey/globalkey tile swap, note_degree before Timing, Pitch tile
+  agreement coloring
+- Localkey mode map: `_enumerate_rn_candidates` builds a map from the display_df's
+  corrected localkey case and passes it to `enumerate_roman_numerals`, which applies
+  it to localkey candidates from the vocabulary (always uppercase) before OHR build
 
 ---
 
