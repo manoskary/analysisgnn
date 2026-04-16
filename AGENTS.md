@@ -574,136 +574,63 @@ score=1.
 
 ### Step 4b: FlexOHR-Based Complete RN Column — DONE
 
-Replaced the hand-rolled `decode_roman_numeral()` (from `analysisgnn/utils/roman_decode.py`)
-with FlexOHR's `OHR.from_()` + `.to_format('dcml')` for the "Complete RN" column in the
-Gradio app. The old `_parse_inversion_value`, `_build_complete_rn_column` (old version),
-and the `decode_roman_numeral` import were removed entirely.
-
-Key changes in `examples/gradio_hybrid_analysis_app.py`:
-- Imports: `flexohr.codecs.analysisgnn` (codec activation), `OHR`, `ChordQuality`,
-  `Inversion`, `CollectionType`, `SD`, `build_key_context`, `infer_collection_type`,
-  `build_key_context_from_row`
-- `_fix_key_mode(df)`: corrects localkey/tonkey case in-place — the model's 50-class
-  key softmax does not reliably distinguish major/minor via case, so mode is inferred
-  from romanNumeral tonic counts (`"i"` = minor, `"I"` = major) per pitch-class group;
-  applied to `display_df` at all 4 `format_table_output` call sites so all downstream
-  consumers (global key, Complete RN, table display) see corrected case
-- `_derive_global_key(df, k=5)`: takes the first *k* tonic chords (romanNumeral
-  `"I"` / `"i"`) in score order and lets their `localkey` values vote (case-insensitive
-  pitch-class grouping, most frequent cased variant wins); avoids bias from extended
-  middle sections whose key may outnumber the main key's tonic chords
-- `_build_complete_rn_column(df, global_key)`: per-row FlexOHR OHR construction from
-  five principal tasks (degree1, degree2, inversion, quality, localkey), rendered via
-  `.to_format('dcml')` — localkey and tonkey mode read directly from prediction case
-  (uppercase = major, lowercase = minor); tonicized key mode from `tonkey` when available
-- `global_key` parameter threaded through `_build_complete_rn_spans`,
-  `_build_graph_overlay_payload`, `_build_visual_payload`
-- New Gradio `global_key_field` text field in Module 2, auto-populated on inference /
-  Delta Lake load, editable by the user; passed as input to `run_aggregation` and
-  `refresh_visual_tab`; returned as output from `run_full_inference`,
-  `load_from_delta_lake`, and `run_edit_conditioned`
+Replaced hand-rolled `decode_roman_numeral()` with FlexOHR's `OHR.from_()` +
+`.to_format('dcml')`. Key additions:
+- `_fix_key_mode(df)`: infers major/minor from romanNumeral tonic counts per key
+- `_derive_global_key(df, k=5)`: votes from first *k* tonic chords' localkey values
+- `_build_complete_rn_column(df, global_key)`: uses `build_ohrs_from_dataframe`
+- `global_key_field` text field in Module 2, auto-populated, editable
 
 ### Step 5a: FlexOHR Codec Extension + Scoring Framework — DONE
 
-Extended FlexOHR to handle all 15 model quality labels and built a context-aware
-scoring framework that operates on Delta Lake DataFrames.
-
-**FlexOHR changes** (in `flexohr_project/flexohr/`):
-- `ChordQuality.generic_augmented_sixth` enum member + `genAug6` alias, with Italian
-  sixth's 3-note interval structure, classified as `ChordClass.augmented_sixth`
-- `CodecRegistry.register_decode_alias()` + `FancyStrEnum.register_decode_alias()` for
-  decode-only aliases (encoding still returns the primary label)
-- Codec registrations in `codecs/analysisgnn.py`: `"augmented sixth"` ↔
-  `generic_augmented_sixth` (bidirectional), `"incomplete dominant-seventh chord"` →
-  `dominant_seventh`, `"minor-augmented tetrachord"` → `minor_major_seventh`
-
-**`analysisgnn/aggregation/scoring.py`** — `ScoringContext` + pluggable scorers:
-- `ScoringContext(note_ids, notes_df, probs_df, edges_df, ...)` — thin wrapper over
-  full DataFrames; filters on the fly, no data copied; exposes `distribution(note_id,
-  task)`, `distribution_matrix(task)`, `top_k(task, k)`, `argmax(task)`,
-  `note_edges(note_id)`, `internal_edges`, `adjacent_edges`, `subcontext(note_ids)`
-- `Scorer` ABC with `score(context, candidate) -> ScoringResult`; candidate is a
-  `dict[str, str]` mapping task -> class_label; result carries per-note `contributions`
-  (note_id, weight, per-task probabilities) and a structured `trace` list
-- `ProductScorer`, `GeometricMeanScorer`, `WeightedTaskScorer`, `SeparateScorer` —
-  each accepts an optional `note_weight_fn: (ScoringContext, str) -> float`
-- `nct_weight(ctx, note_id)` — returns `P("True")` from `tpc_in_label`;
-  `binary_nct_filter(threshold)` — factory for hard-cutoff weight functions
-
-Tests: 27 in `test_codec_extension.py`, 40 in `test_scoring.py`. All 175/176 pass
-(1 pre-existing failure in `test_model_creation`).
+Created `analysisgnn/aggregation/scoring.py` with `ScoringContext` (thin wrapper
+over Delta Lake DataFrames, filters on the fly) and pluggable scorers
+(`ProductScorer`, `GeometricMeanScorer`, `WeightedTaskScorer`, `SeparateScorer`).
+Extended FlexOHR with `ChordQuality.generic_augmented_sixth`, decode-only aliases,
+and full 15-quality codec in `codecs/analysisgnn.py`.
 
 ### Step 5b: Top-k Roman Numeral Enumeration — DONE
 
 Created `analysisgnn/aggregation/roman_numeral.py`:
-
-- `enumerate_roman_numerals(context, global_key, *, scorer, k, top_n, derive_validation)`
-  — main entry point; returns `(list[RankedCandidate], EnumerationTrace)`
-- Pipeline: `_group_top_k_labels` (mean distribution, top-k per task) → Cartesian
-  product → `_is_legal_inversion` pre-filter → `_build_candidate_ohr` (FlexOHR OHR
-  construction + `InversionBassConsistency` validation) → DCML dedup →
-  `SeparateScorer` scoring → rank
-- `RankedCandidate(ohr, dcml, candidate, result, rank)` with `_repr_html_()`
-- `EnumerationTrace` with pipeline stage counts and pruned-reasons dict
-
-Performance: `ScoringContext.distribution_matrix` cached via `@functools.cache`;
-`_collect_contributions` vectorised (one column extraction per task from cached
-matrix, dict comprehension for per-note probabilities). 95 beat groups enumerate
-in ~20s on K.1 (256 notes, k=3).
-
-Also done:
-- `ScoringContext.from_delta(output_dir)` convenience constructor
-- `ScoringContext._repr_html_()`, `__hash__`/`__eq__` (enables `@cache`)
-- Demo notebook `notebooks/roman_numeral_enumeration.py` (jupytext, 7 sections)
-- 28 tests in `tests/test_roman_numeral.py`; all 203 tests pass (1 pre-existing)
+`enumerate_roman_numerals(context, global_key, *, scorer, k, top_n)` returns
+`(list[RankedCandidate], EnumerationTrace)`. Pipeline: top-k per task → Cartesian
+product → inversion legality → OHR construction + validation → DCML dedup → score → rank.
+Demo notebook: `notebooks/roman_numeral_enumeration.py`.
 
 ### Step 5c: Grouped Note Panel + Agreement Coloring — DONE
 
-Restructured the Verovio note info panel to group task tiles by category and show
-agreement coloring (green/red) against the Complete RN.
+Restructured Verovio note info panel with grouped tiles and agreement coloring.
 
-**FlexOHR changes** (in `flexohr_project/flexohr/`):
-- `SD.from_format("analysisgnn", ...)` / `SD.to_format("analysisgnn")` in
-  `paradigms/pitchspace/scale_degrees.py` — numeric degree strings (`"b3"`, `"#5"`)
+**FlexOHR** (`flexohr_project/flexohr/`):
+- `SD.from_format/to_format("analysisgnn")` — numeric degree strings (`"b3"`, `"#5"`)
 - `derive_expected_labels(df, ohrs, global_key)` in `codecs/analysisgnn.py` — derives
-  expected values for all tasks from OHRs: core tasks from row, validation tasks
-  (romanNumeral, root, bass, tonkey) from resolved OHR, note_degree from scale +
-  pitch, tpc_in_label from chord component membership
+  expected values for all tasks from OHRs: core from row, validation from resolved OHR,
+  note_degree from scale + pitch, tpc_in_label from chord component membership
 
-**Gradio app changes** (`examples/gradio_hybrid_analysis_app.py`):
-- `_build_ohrs(df, global_key)` wraps `build_ohrs_from_dataframe`; `_build_complete_rn_column`
-  refactored to use it instead of inline OHR construction
-- `_build_graph_overlay_payload` computes `rn_expected` per note via
-  `derive_expected_labels` and includes it in the Verovio payload
+**Gradio app** (`examples/gradio_hybrid_analysis_app.py`):
+- `_build_ohrs(df, global_key)` wraps `build_ohrs_from_dataframe`;
+  `_build_complete_rn_column` refactored to use it
+- `_prepare_df_for_flexohr(df)` normalises string "None" → NaN, numeric conversion
+- `_enumerate_rn_candidates(display_df, probs_df, notes_df, hyperedges_df, global_key)`
+  runs `enumerate_roman_numerals` per beat group, returns `note_id → [{dcml, score,
+  expected}, ...]` with per-note tpc_in_label and note_degree derivation
+- `_build_graph_overlay_payload` accepts `rn_candidates_map`, populates per-note
+  `rn_candidates` and `rn_expected`; top-1 candidate DCML becomes `romanNumeral_full`
+- `refresh_visual_tab` triggers enumeration when Delta Lake data is available
 
 **Verovio panel** (`examples/assets/verovio_score_graph.{js,css}`):
-- Tiles grouped into sections: **Complete RN** (prominent, centered), **Harmony**
-  (paired 2-column grid: core left, validation right — degree1|root, quality|romanNumeral,
-  inversion|bass, degree2|tonkey, localkey), **Note** (identity + note_degree,
-  tpc_in_label with agreement coloring), **Structure** (phrase, section, cadence)
-- Agreement coloring: green left-stripe + tint (`agn-agree`) when task argmax matches
-  `rn_expected`, red (`agn-disagree`) when it doesn't; core tiles have a subtle accent
-  (`agn-core`) that yields to agreement color when present
+- Top-k DCML labels shown as a **button group** (`agn-rn-group`); clicking a candidate
+  recolors all harmony tiles via that candidate's `expected` dict
+- Tiles grouped: **(global key, localkey)** pair at top of Harmony, then paired
+  core|validation grid (degree1|root, quality|romanNumeral, inversion|bass,
+  degree2|tonkey), Note (identity + note_degree + tpc_in_label), Structure
+  (phrase, section, cadence)
+- Core tiles: bold labels; agreement: green/red left-stripe + background tint
 
-### Step 5d: Enumeration Integration + Alternative RN Candidates
-
-Wire the enumerator into the Gradio app for top-k RN candidate display and
-aggregation-strategy registration.
-
-#### What Needs to Be Built
-
-1. **Register as aggregation strategy** — `RomanNumeralEnumeration` in
-   `aggregation/registry.py`, callable from the aggregation dropdown. Runs
-   `enumerate_roman_numerals` per group, produces argmax-summary DataFrame with
-   top-1 DCML label per group. Configurable `edge_type` (beat, onset, measure).
-2. **Alternative RN candidates in panel** — extend payload with `rn_candidates`
-   list per note/group: `[{dcml, score, expected}, ...]`. The JS shows top-k
-   candidates below the Complete RN; selecting one recolors harmony tiles via its
-   `expected` dict. The current `rn_expected` becomes `rn_candidates[0].expected`.
-3. **Confidence-weighted scoring** — expose `nct_weight` / `binary_nct_filter` as
-   a Gradio checkbox.
-4. **Verovio overlay** — render enumerated top-1 labels as RN spans, replacing
-   the argmax-based spans.
+Alternative-RN display is a **core feature**, orthogonal to aggregation strategies.
+Each strategy produces different per-note distributions; the enumerator runs on top
+of whichever distributions are current. Grouping granularity (beat, onset, measure)
+is an implementation detail of the aggregation, not a user-facing parameter.
 
 ---
 

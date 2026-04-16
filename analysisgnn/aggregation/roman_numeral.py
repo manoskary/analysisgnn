@@ -251,7 +251,7 @@ def _derive_validation_labels(ohr: OHR, global_key: str) -> Dict[str, str]:
         if tonicized is not None:
             result["tonkey"] = tonicized.reference.value.name
         else:
-            local = find_scale_by_key_function(resolved, KeyFunction.local_key)
+            local = find_scale_by_key_function(resolved, KeyFunction.local)
             if local is not None:
                 result["tonkey"] = local.reference.value.name
 

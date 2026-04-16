@@ -408,6 +408,151 @@ def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
     return pd.Series(out, index=df.index, dtype=object)
 
 
+def _enumerate_rn_candidates(
+    display_df: pd.DataFrame,
+    probs_df: pd.DataFrame,
+    notes_df: pd.DataFrame,
+    hyperedges_df: pd.DataFrame,
+    global_key: str,
+    k: int = 3,
+    top_n: int = 3,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Enumerate top-N Roman-numeral candidates per beat group.
+
+    Returns a dict mapping ``note_id`` to a list of candidate dicts, each
+    containing ``dcml``, ``score``, and ``expected`` (task→value mapping
+    for agreement coloring).
+    """
+    from analysisgnn.aggregation.roman_numeral import (
+        _derive_validation_labels,
+        enumerate_roman_numerals,
+    )
+    from analysisgnn.aggregation.scoring import GeometricMeanScorer, ScoringContext
+
+    gk = _agnn_to_flx_pitch(global_key)
+
+    # Build full scoring context from Delta-style DataFrames
+    edges_df = pd.DataFrame({"src": pd.Series(dtype=str), "dst": pd.Series(dtype=str), "edge_type": pd.Series(dtype=str)})
+    ctx = ScoringContext(
+        note_ids=list(notes_df["note_id"]),
+        notes=notes_df,
+        probabilities=probs_df,
+        edges=edges_df,
+    )
+
+    # Beat groups: note_id -> group_id
+    beat_groups = hyperedges_df[hyperedges_df["edge_type"] == "beat"]
+    if beat_groups.empty:
+        # Fallback to onset groups
+        beat_groups = hyperedges_df[hyperedges_df["edge_type"] == "onset"]
+    if beat_groups.empty:
+        return {}
+
+    group_note_map = beat_groups.groupby("group_id")["note_id"].apply(list).to_dict()
+
+    # note_id -> pitch_spelling (for tpc_in_label / note_degree derivation)
+    note_pitch: Dict[str, str] = {}
+    if "pitch_spelling" in notes_df.columns:
+        note_pitch = dict(zip(notes_df["note_id"], notes_df["pitch_spelling"]))
+
+    # note_id -> localkey from display_df (for note_degree)
+    note_localkey: Dict[str, str] = {}
+    if "note_id" in display_df.columns and "localkey" in display_df.columns:
+        note_localkey = dict(zip(display_df["note_id"], display_df["localkey"]))
+
+    scorer = GeometricMeanScorer()
+    result: Dict[str, List[Dict[str, Any]]] = {}
+
+    for gid, gnotes in group_note_map.items():
+        # Filter to notes that exist in the scoring context
+        valid_notes = [nid for nid in gnotes if nid in ctx.note_id_set]
+        if not valid_notes:
+            continue
+        try:
+            sub = ctx.subcontext(valid_notes)
+            candidates, _trace = enumerate_roman_numerals(
+                sub, gk, k=k, top_n=top_n, scorer=scorer,
+            )
+        except Exception:
+            continue
+
+        # Build per-candidate expected labels (core from candidate + validation from OHR)
+        group_candidates: List[Dict[str, Any]] = []
+        for cand in candidates:
+            base_expected = dict(cand.candidate)  # core tasks
+            try:
+                val_labels = _derive_validation_labels(cand.ohr, gk)
+                base_expected.update(val_labels)
+            except Exception:
+                pass
+            # Fallback: tonkey = localkey when no tonicization
+            if "tonkey" not in base_expected:
+                d2 = base_expected.get("degree2", "None")
+                if d2 in ("None", "", None):
+                    base_expected["tonkey"] = base_expected.get("localkey", "")
+            group_candidates.append({
+                "dcml": cand.dcml,
+                "score": round(cand.result.core.score, 4),
+                "base_expected": base_expected,
+            })
+
+        # Per-note candidates: add note-level expected (tpc_in_label, note_degree)
+        for nid in valid_notes:
+            note_cands: List[Dict[str, Any]] = []
+            for gc in group_candidates:
+                expected = dict(gc["base_expected"])
+                # Derive note-level expected from candidate OHR + note pitch
+                pitch = note_pitch.get(nid, "")
+                if pitch:
+                    import re as _re
+
+                    m = _re.match(r"^([A-Ga-g][#b]*)(\d+)?$", pitch)
+                    if m:
+                        pc = m.group(1)
+                        # tpc_in_label: check if pitch is in chord components
+                        try:
+                            cand_obj = [c for c in candidates if c.dcml == gc["dcml"]][0]
+                            resolved = cand_obj.ohr.resolve()
+                            chord_names = set()
+                            for comp in resolved.components("b", depth=1):
+                                if hasattr(comp, "value") and hasattr(comp.value, "name"):
+                                    chord_names.add(comp.value.name)
+                            expected["tpc_in_label"] = "True" if pc in chord_names else "False"
+                        except Exception:
+                            pass
+                        # note_degree from localkey + pitch
+                        lk = note_localkey.get(nid, "")
+                        if lk and lk not in ("", "None", "nan"):
+                            try:
+                                from flexohr.paradigms.pitchspace.pitch import (
+                                    SpecificPitchClass as SPC,
+                                )
+                                from flexohr.paradigms.pitchspace.scale import (
+                                    get_scale,
+                                    infer_collection_type,
+                                )
+
+                                lk_str = lk.replace("-", "b")
+                                lk_coll = infer_collection_type(lk_str)
+                                lk_root = SPC(lk_str[0].upper() + lk_str[1:])
+                                lk_scale = get_scale(lk_coll, lk_root)
+                                note_spc = SPC(pc)
+                                sic = note_spc - lk_root
+                                sd = lk_scale.make_scale_degree(sic)
+                                expected["note_degree"] = sd.to_format("analysisgnn")
+                            except Exception:
+                                pass
+
+                note_cands.append({
+                    "dcml": gc["dcml"],
+                    "score": gc["score"],
+                    "expected": expected,
+                })
+            result[nid] = note_cands
+
+    return result
+
+
 def _inject_note_ids(xml_text: str, score: pt.score.Score) -> str:
     """Inject partitura note IDs into ``<note>`` elements of the original MusicXML.
 
@@ -619,16 +764,27 @@ def _build_graph_overlay_payload(
     edge_types: List[str],
     edges_all: Dict[str, List[List[int]]],
     global_key: str = "",
+    rn_candidates_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Build the Verovio overlay payload."""
     n = min(len(df), len(note_array))
     data = df.iloc[:n].reset_index(drop=True).copy()
-    if "romanNumeral_full" in data.columns:
+
+    # Use top-1 enumerated candidate as the Complete RN when available
+    if rn_candidates_map and "note_id" in data.columns:
+        rn_vals = []
+        for idx in range(n):
+            nid = str(data.iloc[idx].get("note_id", ""))
+            cands = rn_candidates_map.get(nid, [])
+            rn_vals.append(cands[0]["dcml"] if cands else "")
+        rn_full = pd.Series(rn_vals, dtype=object)
+    elif "romanNumeral_full" in data.columns:
         rn_full = data["romanNumeral_full"].fillna("").astype(str)
     elif global_key:
         rn_full = _build_complete_rn_column(data, global_key)
     else:
         rn_full = pd.Series([""] * n, dtype=object)
+
     spans_df = data.copy()
     if "onset_div" in note_array.dtype.names:
         spans_df["onset_div"] = note_array["onset_div"][:n]
@@ -637,9 +793,9 @@ def _build_graph_overlay_payload(
     spans_df["romanNumeral_full"] = rn_full
     rn_spans = _build_complete_rn_spans(spans_df, global_key)
 
-    # Compute expected labels for agreement coloring
+    # Compute expected labels for agreement coloring (fallback when no candidates)
     expected_labels: List[Dict[str, str]] = []
-    if global_key:
+    if not rn_candidates_map and global_key:
         prepared = _prepare_df_for_flexohr(data)
         ohrs = _build_ohrs(data, global_key)
         if ohrs:
@@ -703,6 +859,11 @@ def _build_graph_overlay_payload(
                 if idx < len(rn_full)
                 else "",
                 "rn_expected": expected_labels[idx] if idx < len(expected_labels) else {},
+                "rn_candidates": (
+                    rn_candidates_map.get(str(note_id), [])
+                    if rn_candidates_map and note_id
+                    else []
+                ),
             }
         )
 
@@ -714,6 +875,7 @@ def _build_graph_overlay_payload(
             "selected_tasks": list(tasks),
             "visible_edge_types": visible,
             "edge_warning": "",
+            "global_key": global_key,
             "roman_spans": [
                 {
                     "start_onset_div": int(s),
@@ -758,6 +920,7 @@ def _build_visual_payload(
     edge_types: List[str],
     edges_all: Dict[str, List[List[int]]],
     global_key: str = "",
+    rn_candidates_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     note_array = _sorted_note_array(score)
     payload = _build_graph_overlay_payload(
@@ -767,6 +930,7 @@ def _build_visual_payload(
         edge_types=edge_types,
         edges_all=edges_all,
         global_key=global_key,
+        rn_candidates_map=rn_candidates_map,
     )
     payload["score_xml"] = _read_score_xml_text(score_path, score)
     payload["score_format"] = "musicxml"
@@ -1764,6 +1928,7 @@ def refresh_visual_tab(
     intermediates_state: Any,
     edges_state: Any,
     log_text: str,
+    delta_dfs_state: Any = None,
 ):
     try:
         selected_edge_types = [
@@ -1802,6 +1967,28 @@ def refresh_visual_tab(
                     f"Warning: score has {n_score} notes but predictions table has {n_table} rows. "
                     f"Rendering min({n_score}, {n_table}) notes; overlay alignment may be approximate.",
                 )
+            # Enumerate RN candidates if Delta Lake data is available
+            rn_cands_map = None
+            delta_dfs = delta_dfs_state if isinstance(delta_dfs_state, dict) else {}
+            if global_key and delta_dfs.get("probs_df") is not None:
+                try:
+                    rn_cands_map = _enumerate_rn_candidates(
+                        display_df=df,
+                        probs_df=delta_dfs["probs_df"],
+                        notes_df=delta_dfs["notes_df"],
+                        hyperedges_df=delta_dfs["hyperedges_df"],
+                        global_key=global_key,
+                    )
+                    log_text = _log(
+                        log_text,
+                        f"Enumerated RN candidates for {len(rn_cands_map)} notes.",
+                    )
+                except Exception as enum_exc:
+                    log_text = _log(
+                        log_text,
+                        f"RN enumeration failed: {enum_exc}",
+                    )
+
             payload = _build_visual_payload(
                 score_path=score_path,
                 score=score_obj,
@@ -1810,6 +1997,7 @@ def refresh_visual_tab(
                 edge_types=selected_edge_types,
                 edges_all=edges_all,
                 global_key=global_key,
+                rn_candidates_map=rn_cands_map,
             )
             # Apply NCT coloring
             if nct_color:
@@ -2194,6 +2382,7 @@ def build_demo() -> gr.Blocks:
                 intermediates_state,
                 edges_state,
                 log_output,
+                delta_dfs_state,
             ],
             outputs=[visual_html, log_output, visual_payload_state],
         )

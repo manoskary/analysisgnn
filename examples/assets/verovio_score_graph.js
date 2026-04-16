@@ -19,11 +19,11 @@
 
   // Paired layout: core (left) paired with its validation counterpart (right)
   const HARMONY_PAIRS = [
+    ["localkey", null],
     ["degree1", "root"],
     ["quality", "romanNumeral"],
     ["inversion", "bass"],
     ["degree2", "tonkey"],
-    ["localkey", null],
   ];
 
   function setStatus(msg) {
@@ -86,6 +86,35 @@
     return `<div class="agn-section"><div class="agn-section-title">${escapeHtml(title)}</div>${content}</div>`;
   }
 
+  // Track which RN candidate is active (for future multi-candidate support)
+  let activeRnIndex = 0;
+
+  function renderRnGroup(note) {
+    const candidates = note.rn_candidates || [];
+    const fallbackDcml = note.romanNumeral_full || "";
+    // If no candidates list, show the single Complete RN
+    if (candidates.length === 0 && fallbackDcml) {
+      return `<div class="agn-section agn-section-rn"><div class="agn-rn-group"><button class="agn-rn-btn agn-rn-active">${escapeHtml(fallbackDcml)}</button></div></div>`;
+    }
+    if (candidates.length === 0) return "";
+    let btns = "";
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      const active = i === activeRnIndex ? " agn-rn-active" : "";
+      const scoreStr = c.score != null ? `<span class="agn-rn-score">${Number(c.score).toFixed(3)}</span>` : "";
+      btns += `<button class="agn-rn-btn${active}" data-rn-idx="${i}">${escapeHtml(c.dcml)}${scoreStr}</button>`;
+    }
+    return `<div class="agn-section agn-section-rn"><div class="agn-rn-group">${btns}</div></div>`;
+  }
+
+  function getActiveExpected(note) {
+    const candidates = note.rn_candidates || [];
+    if (candidates.length > 0 && candidates[activeRnIndex]) {
+      return candidates[activeRnIndex].expected || {};
+    }
+    return note.rn_expected || {};
+  }
+
   function renderPanel(note) {
     if (!panelEl) return;
     if (!note) {
@@ -94,14 +123,29 @@
     }
     const tasks = note.tasks || {};
     const conf = note.confidence || {};
-    const expected = note.rn_expected || {};
+    const expected = getActiveExpected(note);
 
-    // ── Complete RN (prominent) ──
-    const rnHtml = `<div class="agn-section agn-section-rn"><div class="agn-rn-display">${escapeHtml(note.romanNumeral_full || "\u2014")}</div></div>`;
+    // ── Complete RN (button group) ──
+    const rnHtml = renderRnGroup(note);
 
     // ── Harmony: paired core (left) + validation (right) ──
+    // First row: globalkey | localkey
     let harmonyCards = "";
+    const globalKey = (payload.meta && payload.meta.global_key) || "";
+    const localKeyVal = tasks["localkey"];
+    if (globalKey || localKeyVal != null) {
+      harmonyCards += `<div class="agn-harmony-pair">`;
+      harmonyCards += makeCard("global key", globalKey || "\u2014");
+      if (localKeyVal != null) {
+        harmonyCards += makeTaskCard("localkey", localKeyVal, conf["localkey"], expected["localkey"], true);
+      } else {
+        harmonyCards += `<div></div>`;
+      }
+      harmonyCards += `</div>`;
+    }
+    // Remaining pairs (skip localkey since it's handled above)
     for (const [core, val] of HARMONY_PAIRS) {
+      if (core === "localkey") continue;
       const coreVal = tasks[core];
       const valVal = val ? tasks[val] : undefined;
       if (coreVal == null && valVal == null) continue;
@@ -158,6 +202,18 @@
     const otherHtml = otherCards.length ? makeSection("Other", `<div class="agn-grid">${otherCards.join("")}</div>`) : "";
 
     panelEl.innerHTML = `<h3>Note Analysis</h3>${rnHtml}${harmonyHtml}${noteHtml}${structHtml}${otherHtml}`;
+
+    // Attach click handlers for RN candidate buttons
+    panelEl.currentNote = note;
+    for (const btn of panelEl.querySelectorAll(".agn-rn-btn[data-rn-idx]")) {
+      btn.addEventListener("click", function () {
+        const idx = Number(this.dataset.rnIdx);
+        if (idx !== activeRnIndex) {
+          activeRnIndex = idx;
+          renderPanel(panelEl.currentNote);
+        }
+      });
+    }
   }
 
   function findNoteElementById(noteId) {
