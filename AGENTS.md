@@ -657,28 +657,53 @@ Also done:
 - Demo notebook `notebooks/roman_numeral_enumeration.py` (jupytext, 7 sections)
 - 28 tests in `tests/test_roman_numeral.py`; all 203 tests pass (1 pre-existing)
 
-### Step 5c: Gradio Integration + Onset-Level Enumeration
+### Step 5c: Grouped Note Panel + Agreement Coloring — DONE
 
-Wire the enumerator into the Gradio app so users can trigger enumeration from the
-UI, and extend from beat-level to onset-level grouping.
+Restructured the Verovio note info panel to group task tiles by category and show
+agreement coloring (green/red) against the Complete RN.
+
+**FlexOHR changes** (in `flexohr_project/flexohr/`):
+- `SD.from_format("analysisgnn", ...)` / `SD.to_format("analysisgnn")` in
+  `paradigms/pitchspace/scale_degrees.py` — numeric degree strings (`"b3"`, `"#5"`)
+- `derive_expected_labels(df, ohrs, global_key)` in `codecs/analysisgnn.py` — derives
+  expected values for all tasks from OHRs: core tasks from row, validation tasks
+  (romanNumeral, root, bass, tonkey) from resolved OHR, note_degree from scale +
+  pitch, tpc_in_label from chord component membership
+
+**Gradio app changes** (`examples/gradio_hybrid_analysis_app.py`):
+- `_build_ohrs(df, global_key)` wraps `build_ohrs_from_dataframe`; `_build_complete_rn_column`
+  refactored to use it instead of inline OHR construction
+- `_build_graph_overlay_payload` computes `rn_expected` per note via
+  `derive_expected_labels` and includes it in the Verovio payload
+
+**Verovio panel** (`examples/assets/verovio_score_graph.{js,css}`):
+- Tiles grouped into sections: **Complete RN** (prominent, centered), **Harmony**
+  (paired 2-column grid: core left, validation right — degree1|root, quality|romanNumeral,
+  inversion|bass, degree2|tonkey, localkey), **Note** (identity + note_degree,
+  tpc_in_label with agreement coloring), **Structure** (phrase, section, cadence)
+- Agreement coloring: green left-stripe + tint (`agn-agree`) when task argmax matches
+  `rn_expected`, red (`agn-disagree`) when it doesn't; core tiles have a subtle accent
+  (`agn-core`) that yields to agreement color when present
+
+### Step 5d: Enumeration Integration + Alternative RN Candidates
+
+Wire the enumerator into the Gradio app for top-k RN candidate display and
+aggregation-strategy registration.
 
 #### What Needs to Be Built
 
 1. **Register as aggregation strategy** — `RomanNumeralEnumeration` in
-   `aggregation/registry.py`, callable from the aggregation dropdown. The strategy
-   runs `enumerate_roman_numerals` per group and produces an argmax-summary DataFrame
-   with the top-1 DCML label per group.
-2. **Onset-level enumeration** — the notebook showed beat-level; onset groups are
-   finer-grained and may yield different results. Support configurable `edge_type`
-   parameter (beat, onset, measure) in the strategy.
-3. **Confidence-weighted scoring** — use `nct_weight` or `binary_nct_filter` to
-   downweight non-chord tones during enumeration; expose as a checkbox in the Gradio
-   app.
-4. **Verovio overlay** — render enumerated RN labels (top-1 per group) as the RN
-   overlay in the visual score tab, replacing or augmenting the current argmax-based
-   spans.
-5. **Top-k inspection panel** — when clicking a note/group in the visual score,
-   show the top-k enumerated candidates with scores in the note info panel.
+   `aggregation/registry.py`, callable from the aggregation dropdown. Runs
+   `enumerate_roman_numerals` per group, produces argmax-summary DataFrame with
+   top-1 DCML label per group. Configurable `edge_type` (beat, onset, measure).
+2. **Alternative RN candidates in panel** — extend payload with `rn_candidates`
+   list per note/group: `[{dcml, score, expected}, ...]`. The JS shows top-k
+   candidates below the Complete RN; selecting one recolors harmony tiles via its
+   `expected` dict. The current `rn_expected` becomes `rn_candidates[0].expected`.
+3. **Confidence-weighted scoring** — expose `nct_weight` / `binary_nct_filter` as
+   a Gradio checkbox.
+4. **Verovio overlay** — render enumerated top-1 labels as RN spans, replacing
+   the argmax-based spans.
 
 ---
 

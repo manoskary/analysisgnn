@@ -345,86 +345,63 @@ def _agnn_to_flx_pitch(name: str) -> str:
     return name.replace("-", "b")
 
 
+def _prepare_df_for_flexohr(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare a prediction DataFrame for FlexOHR consumption.
+
+    Normalises string ``"None"`` to NaN in ``degree2`` and converts numeric
+    task columns (``degree1``, ``degree2``, ``inversion``) from strings to
+    floats, as ``build_ohrs_from_dataframe`` expects.  Also normalises
+    pitch-class strings (``localkey``, ``tonkey``) from ``-`` to ``b``.
+    """
+    work = df.copy()
+    # degree2: string "None" -> NaN
+    if "degree2" in work.columns:
+        work["degree2"] = work["degree2"].replace({"None": np.nan, "": np.nan})
+        work["degree2"] = pd.to_numeric(work["degree2"], errors="coerce")
+    # degree1, inversion: ensure numeric
+    for col in ("degree1", "inversion"):
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+    # Normalise pitch-class columns
+    for col in ("localkey", "tonkey"):
+        if col in work.columns:
+            work[col] = work[col].astype(str).str.replace("-", "b", regex=False)
+    return work
+
+
+def _build_ohrs(df: pd.DataFrame, global_key: str) -> list:
+    """Build OHRs from a prediction DataFrame using FlexOHR's bulk builder.
+
+    Returns a list of OHRs (one per row).  On failure returns an empty list.
+    """
+    if df is None or len(df) == 0:
+        return []
+    required = ["degree1", "degree2", "inversion", "quality", "localkey"]
+    if any(k not in df.columns for k in required):
+        return []
+    gk = _agnn_to_flx_pitch(global_key)
+    try:
+        work = _prepare_df_for_flexohr(df)
+        return flx.codecs.analysisgnn.build_ohrs_from_dataframe(work, gk)
+    except Exception:
+        return []
+
+
 def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
     """Build the Complete RN column using FlexOHR OHR objects.
 
     Each row's principal task predictions (degree1, degree2, inversion,
     quality, localkey) are used to construct a FlexOHR OHR, which is then
     rendered via ``.to_format('dcml')``.
-
-    The mode (major/minor) of each local key and tonicized key is read
-    directly from the case of the ``localkey`` and ``tonkey`` predictions
-    (uppercase = major, lowercase = minor), matching the DCML convention
-    and the 50-class vocabulary used by the model.
     """
     if df is None or len(df) == 0:
         return pd.Series(dtype=object)
-    required = ["degree1", "degree2", "inversion", "quality", "localkey"]
-    missing = [k for k in required if k not in df.columns]
-    if missing:
+    ohrs = _build_ohrs(df, global_key)
+    if not ohrs:
         return pd.Series([""] * len(df), index=df.index, dtype=object)
-
-    gk = _agnn_to_flx_pitch(global_key)
-    has_tonkey = "tonkey" in df.columns
-
     out: List[str] = []
-    for _, row in df.iterrows():
+    for ohr in ohrs:
         try:
-            quality = flx.harmony.harmony_enums.ChordQuality.from_format(
-                str(row["quality"]),
-                "analysisgnn",
-            )
-            inv = flx.harmony.harmony_enums.Inversion.from_format(
-                str(int(row["inversion"])),
-                "analysisgnn",
-            )
-            lk_str = _agnn_to_flx_pitch(str(row["localkey"]))
-            lk_coll = flx.paradigms.pitchspace.scale.infer_collection_type(lk_str)
-
-            degree2_val = row.get("degree2")
-            if pd.notna(degree2_val) and str(degree2_val).strip() not in ("", "None"):
-                sd2 = flx.paradigms.pitchspace.scale_degrees.SD.from_string(
-                    str(degree2_val),
-                    collection_type=lk_coll,
-                )
-                # Infer tonicized key mode from the tonkey prediction's
-                # case — the 50-class vocabulary encodes mode via case,
-                # just like localkey.
-                tonicized_coll = flx.harmony.harmony_enums.CollectionType.major
-                if has_tonkey:
-                    tk_val = row.get("tonkey")
-                    if pd.notna(tk_val) and str(tk_val).strip() not in ("", "None"):
-                        tonicized_coll = (
-                            flx.paradigms.pitchspace.scale.infer_collection_type(
-                                _agnn_to_flx_pitch(str(tk_val))
-                            )
-                        )
-                ref_ohr = flx.paradigms.pitchspace.scale.build_key_context(
-                    gk,
-                    lk_str,
-                    tonicized_key=sd2,
-                    tonicized_coll=tonicized_coll,
-                )
-                tonic_coll = tonicized_coll
-            else:
-                norm_row = dict(row)
-                norm_row["localkey"] = lk_str
-                ref_ohr = flx.codecs.analysisgnn.build_key_context_from_row(
-                    norm_row,
-                    gk,
-                )
-                tonic_coll = lk_coll
-
-            degree1_sd = flx.paradigms.pitchspace.scale_degrees.SD.from_string(
-                str(row["degree1"]),
-                collection_type=tonic_coll,
-            )
-            ohr = flx.OHR.from_(
-                quality,
-                degree1_sd,
-                inversion=inv,
-                reference_ohr=ref_ohr,
-            )
             out.append(ohr.to_format("dcml"))
         except Exception:
             out.append("")
@@ -660,6 +637,21 @@ def _build_graph_overlay_payload(
     spans_df["romanNumeral_full"] = rn_full
     rn_spans = _build_complete_rn_spans(spans_df, global_key)
 
+    # Compute expected labels for agreement coloring
+    expected_labels: List[Dict[str, str]] = []
+    if global_key:
+        prepared = _prepare_df_for_flexohr(data)
+        ohrs = _build_ohrs(data, global_key)
+        if ohrs:
+            try:
+                expected_labels = flx.codecs.analysisgnn.derive_expected_labels(
+                    prepared, ohrs, _agnn_to_flx_pitch(global_key)
+                )
+            except Exception:
+                pass
+    if not expected_labels:
+        expected_labels = [{}] * n
+
     notes_payload: List[Dict[str, Any]] = []
     for idx in range(n):
         row = data.iloc[idx]
@@ -710,6 +702,7 @@ def _build_graph_overlay_payload(
                 "romanNumeral_full": str(rn_full.iloc[idx])
                 if idx < len(rn_full)
                 else "",
+                "rn_expected": expected_labels[idx] if idx < len(expected_labels) else {},
             }
         )
 

@@ -11,6 +11,21 @@
     rest: "#f59e0b",
   };
 
+  // Task category sets for panel grouping
+  const CORE_TASKS = new Set(["quality", "degree1", "degree2", "inversion", "localkey"]);
+  const VALIDATION_TASKS = new Set(["romanNumeral", "root", "bass", "tonkey"]);
+  const NOTE_ANALYSIS_TASKS = new Set(["note_degree", "tpc_in_label"]);
+  const STRUCTURE_TASKS = new Set(["phrase", "section", "cadence"]);
+
+  // Paired layout: core (left) paired with its validation counterpart (right)
+  const HARMONY_PAIRS = [
+    ["degree1", "root"],
+    ["quality", "romanNumeral"],
+    ["inversion", "bass"],
+    ["degree2", "tonkey"],
+    ["localkey", null],
+  ];
+
   function setStatus(msg) {
     if (statusEl) statusEl.textContent = msg;
   }
@@ -51,31 +66,98 @@
     return null;
   }
 
+  function makeCard(label, value, extraCls) {
+    const cls = "agn-card" + (extraCls ? " " + extraCls : "");
+    return `<div class="${cls}"><div class="agn-label">${escapeHtml(label)}</div><div class="agn-value">${escapeHtml(value)}</div></div>`;
+  }
+
+  function makeTaskCard(task, value, conf, expected, isCore) {
+    const confTxt = conf != null ? ` (${Number(conf).toFixed(3)})` : "";
+    const classes = ["agn-card"];
+    if (isCore) classes.push("agn-core");
+    if (expected != null) {
+      classes.push(String(value) === String(expected) ? "agn-agree" : "agn-disagree");
+    }
+    return `<div class="${classes.join(" ")}"><div class="agn-label">${escapeHtml(task)}</div><div class="agn-value">${escapeHtml(value)}${escapeHtml(confTxt)}</div></div>`;
+  }
+
+  function makeSection(title, content) {
+    if (!content) return "";
+    return `<div class="agn-section"><div class="agn-section-title">${escapeHtml(title)}</div>${content}</div>`;
+  }
+
   function renderPanel(note) {
     if (!panelEl) return;
     if (!note) {
       panelEl.innerHTML = "No note selected.";
       return;
     }
-    const taskEntries = Object.entries(note.tasks || {});
-    const confEntries = Object.entries(note.confidence || {});
-    const cards = [];
-    cards.push(`<div class="agn-card"><div class="agn-label">Row</div><div class="agn-value">${escapeHtml(note.row)}</div></div>`);
-    cards.push(`<div class="agn-card"><div class="agn-label">Score Note ID</div><div class="agn-value">${escapeHtml(note.note_id || "")}</div></div>`);
+    const tasks = note.tasks || {};
+    const conf = note.confidence || {};
+    const expected = note.rn_expected || {};
+
+    // ── Complete RN (prominent) ──
+    const rnHtml = `<div class="agn-section agn-section-rn"><div class="agn-rn-display">${escapeHtml(note.romanNumeral_full || "\u2014")}</div></div>`;
+
+    // ── Harmony: paired core (left) + validation (right) ──
+    let harmonyCards = "";
+    for (const [core, val] of HARMONY_PAIRS) {
+      const coreVal = tasks[core];
+      const valVal = val ? tasks[val] : undefined;
+      if (coreVal == null && valVal == null) continue;
+      harmonyCards += `<div class="agn-harmony-pair">`;
+      if (coreVal != null) {
+        harmonyCards += makeTaskCard(core, coreVal, conf[core], expected[core], true);
+      } else {
+        harmonyCards += `<div></div>`;
+      }
+      if (val && valVal != null) {
+        harmonyCards += makeTaskCard(val, valVal, conf[val], expected[val], false);
+      } else {
+        harmonyCards += `<div></div>`;
+      }
+      harmonyCards += `</div>`;
+    }
+    const harmonyHtml = harmonyCards ? makeSection("Harmony", `<div class="agn-harmony-grid">${harmonyCards}</div>`) : "";
+
+    // ── Note Identity + Note Analysis ──
+    const noteCards = [];
+    noteCards.push(makeCard("Row", note.row));
+    noteCards.push(makeCard("Note ID", note.note_id || ""));
     if (note.table_note_id != null && String(note.table_note_id).trim() !== "") {
-      cards.push(`<div class="agn-card"><div class="agn-label">Table Note ID</div><div class="agn-value">${escapeHtml(note.table_note_id)}</div></div>`);
+      noteCards.push(makeCard("Table Note ID", note.table_note_id));
     }
-    cards.push(`<div class="agn-card"><div class="agn-label">Pitch</div><div class="agn-value">${escapeHtml(note.pitch_spelling || "")} (${escapeHtml(note.pitch_midi || "")})</div></div>`);
-    cards.push(`<div class="agn-card"><div class="agn-label">Timing</div><div class="agn-value">m${escapeHtml(note.measure || "")} @ ${escapeHtml(note.onset_beat || "")}</div></div>`);
-    cards.push(`<div class="agn-card"><div class="agn-label">Complete RN</div><div class="agn-value">${escapeHtml(note.romanNumeral_full || "")}</div></div>`);
-    for (const [task, value] of taskEntries) {
-      const conf = confEntries.find(([k]) => k === task);
-      const confTxt = conf ? ` (${Number(conf[1]).toFixed(3)})` : "";
-      cards.push(
-        `<div class="agn-card"><div class="agn-label">${escapeHtml(task)}</div><div class="agn-value">${escapeHtml(value)}${escapeHtml(confTxt)}</div></div>`
-      );
+    noteCards.push(makeCard("Pitch", `${note.pitch_spelling || ""} (${note.pitch_midi || ""})`));
+    noteCards.push(makeCard("Timing", `m${note.measure || ""} @ ${note.onset_beat || ""}`));
+    // note_degree and tpc_in_label with agreement coloring
+    for (const task of ["note_degree", "tpc_in_label"]) {
+      if (tasks[task] != null) {
+        noteCards.push(makeTaskCard(task, tasks[task], conf[task], expected[task], false));
+      }
     }
-    panelEl.innerHTML = `<h3>Note Analysis</h3><div class="agn-grid">${cards.join("")}</div>`;
+    const noteHtml = makeSection("Note", `<div class="agn-grid">${noteCards.join("")}</div>`);
+
+    // ── Structure ──
+    const structCards = [];
+    for (const task of ["phrase", "section", "cadence"]) {
+      if (tasks[task] != null) {
+        const confTxt = conf[task] != null ? ` (${Number(conf[task]).toFixed(3)})` : "";
+        structCards.push(makeCard(task, `${tasks[task]}${confTxt}`));
+      }
+    }
+    const structHtml = structCards.length ? makeSection("Structure", `<div class="agn-grid">${structCards.join("")}</div>`) : "";
+
+    // ── Other tasks (anything not categorized above) ──
+    const categorized = new Set([...CORE_TASKS, ...VALIDATION_TASKS, ...NOTE_ANALYSIS_TASKS, ...STRUCTURE_TASKS]);
+    const otherCards = [];
+    for (const [task, value] of Object.entries(tasks)) {
+      if (categorized.has(task) || value == null) continue;
+      const confTxt = conf[task] != null ? ` (${Number(conf[task]).toFixed(3)})` : "";
+      otherCards.push(makeCard(task, `${value}${confTxt}`));
+    }
+    const otherHtml = otherCards.length ? makeSection("Other", `<div class="agn-grid">${otherCards.join("")}</div>`) : "";
+
+    panelEl.innerHTML = `<h3>Note Analysis</h3>${rnHtml}${harmonyHtml}${noteHtml}${structHtml}${otherHtml}`;
   }
 
   function findNoteElementById(noteId) {

@@ -100,6 +100,76 @@
   font-weight: 600;
 }
 
+/* ── Panel sections ── */
+.agn-section {
+  margin-bottom: 10px;
+}
+
+.agn-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+/* ── Complete RN prominent display ── */
+.agn-section-rn {
+  text-align: center;
+  padding: 8px 0;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.agn-rn-display {
+  font-size: 22px;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+/* ── Harmony paired grid: core (left) + validation (right) ── */
+.agn-harmony-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 10px;
+  font-size: 12px;
+}
+
+.agn-harmony-pair {
+  display: contents;
+}
+
+/* Core tiles get a stronger left accent to distinguish from validation */
+.agn-card.agn-core {
+  border-left: 3px solid #94a3b8;
+  background: #f1f5f9;
+}
+
+/* ── Agreement coloring ── */
+.agn-card.agn-agree {
+  border-left: 3px solid #22c55e;
+  background: #f0fdf4;
+}
+
+.agn-card.agn-disagree {
+  border-left: 3px solid #ef4444;
+  background: #fef2f2;
+}
+
+/* Core + agree/disagree: agreement color wins over core accent */
+.agn-card.agn-core.agn-agree {
+  border-left: 3px solid #22c55e;
+  background: #f0fdf4;
+}
+
+.agn-card.agn-core.agn-disagree {
+  border-left: 3px solid #ef4444;
+  background: #fef2f2;
+}
+
 g.note.agn-colored use,
 g.note.agn-colored > use,
 g.note.agn-colored path,
