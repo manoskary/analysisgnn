@@ -129,18 +129,18 @@
     const rnHtml = renderRnGroup(note);
 
     // ── Harmony: paired core (left) + validation (right) ──
-    // First row: globalkey | localkey
+    // First row: localkey | globalkey
     let harmonyCards = "";
     const globalKey = (payload.meta && payload.meta.global_key) || "";
     const localKeyVal = tasks["localkey"];
     if (globalKey || localKeyVal != null) {
       harmonyCards += `<div class="agn-harmony-pair">`;
-      harmonyCards += makeCard("global key", globalKey || "\u2014");
       if (localKeyVal != null) {
         harmonyCards += makeTaskCard("localkey", localKeyVal, conf["localkey"], expected["localkey"], true);
       } else {
         harmonyCards += `<div></div>`;
       }
+      harmonyCards += makeCard("global key", globalKey || "\u2014");
       harmonyCards += `</div>`;
     }
     // Remaining pairs (skip localkey since it's handled above)
@@ -171,14 +171,22 @@
     if (note.table_note_id != null && String(note.table_note_id).trim() !== "") {
       noteCards.push(makeCard("Table Note ID", note.table_note_id));
     }
-    noteCards.push(makeCard("Pitch", `${note.pitch_spelling || ""} (${note.pitch_midi || ""})`));
-    noteCards.push(makeCard("Timing", `m${note.measure || ""} @ ${note.onset_beat || ""}`));
+    const pitchVal = `${note.pitch_spelling || ""} (${note.pitch_midi || ""})`;
+    const pitchExpected = expected["pitch_spelling"];
+    if (pitchExpected != null) {
+      const pitchCls = ["agn-card"];
+      pitchCls.push(String(pitchExpected) === "True" ? "agn-agree" : "agn-disagree");
+      noteCards.push(`<div class="${pitchCls.join(" ")}"><div class="agn-label">Pitch</div><div class="agn-value">${escapeHtml(pitchVal)}</div></div>`);
+    } else {
+      noteCards.push(makeCard("Pitch", pitchVal));
+    }
     // note_degree and tpc_in_label with agreement coloring
     for (const task of ["note_degree", "tpc_in_label"]) {
       if (tasks[task] != null) {
         noteCards.push(makeTaskCard(task, tasks[task], conf[task], expected[task], false));
       }
     }
+    noteCards.push(makeCard("Timing", `m${note.measure || ""} @ ${note.onset_beat || ""}`));
     const noteHtml = makeSection("Note", `<div class="agn-grid">${noteCards.join("")}</div>`);
 
     // ── Structure ──

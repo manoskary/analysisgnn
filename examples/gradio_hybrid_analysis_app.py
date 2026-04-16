@@ -336,6 +336,21 @@ def _derive_global_key(df: pd.DataFrame, k: int = _GLOBAL_KEY_K) -> str:
     return str(candidates[pc_mask].value_counts().index[0])
 
 
+def _format_dcml_with_global_key(dcml: str, global_key: str) -> str:
+    """Reformat a FlexOHR DCML string to show the global key as a prefix.
+
+    FlexOHR's ``OHR.to_format('dcml')`` produces ``V7/I/G`` (global key
+    last).  This function reformats to ``G: V7/I`` (global key first,
+    separated by colon + space).
+    """
+    parts = dcml.split("/")
+    if len(parts) < 2:
+        return f"{global_key}: {dcml}"
+    # The last segment is the global key — drop it and use the explicit
+    # global_key parameter (which preserves the user's chosen mode/case).
+    return f"{global_key}: {'/'.join(parts[:-1])}"
+
+
 def _agnn_to_flx_pitch(name: str) -> str:
     """Normalise an AnalysisGNN pitch-class string for FlexOHR.
 
@@ -369,22 +384,37 @@ def _prepare_df_for_flexohr(df: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
+def _build_ohrs_check(df: pd.DataFrame, global_key: str) -> None:
+    """Validate preconditions for OHR construction.
+
+    Raises
+    ------
+    ValueError
+        If *global_key* is empty, *df* is empty, or required columns are
+        missing.
+    """
+    if not global_key:
+        raise ValueError("Cannot build OHRs: global_key is required.")
+    if df is None or len(df) == 0:
+        raise ValueError("Cannot build OHRs: DataFrame is empty.")
+    required = ["degree1", "degree2", "inversion", "quality", "localkey"]
+    missing = [k for k in required if k not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Cannot build OHRs: missing columns {missing}."
+        )
+
+
 def _build_ohrs(df: pd.DataFrame, global_key: str) -> list:
     """Build OHRs from a prediction DataFrame using FlexOHR's bulk builder.
 
-    Returns a list of OHRs (one per row).  On failure returns an empty list.
+    Returns a list of OHRs (one per row).  Validates preconditions first,
+    then delegates to ``build_ohrs_from_dataframe``.
     """
-    if df is None or len(df) == 0:
-        return []
-    required = ["degree1", "degree2", "inversion", "quality", "localkey"]
-    if any(k not in df.columns for k in required):
-        return []
+    _build_ohrs_check(df, global_key)
     gk = _agnn_to_flx_pitch(global_key)
-    try:
-        work = _prepare_df_for_flexohr(df)
-        return flx.codecs.analysisgnn.build_ohrs_from_dataframe(work, gk)
-    except Exception:
-        return []
+    work = _prepare_df_for_flexohr(df)
+    return flx.codecs.analysisgnn.build_ohrs_from_dataframe(work, gk)
 
 
 def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
@@ -393,19 +423,31 @@ def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
     Each row's principal task predictions (degree1, degree2, inversion,
     quality, localkey) are used to construct a FlexOHR OHR, which is then
     rendered via ``.to_format('dcml')``.
+
+    Structural failures (empty global key, missing columns) raise.
+    Per-row failures (e.g. NaN degree values for individual notes) produce
+    empty strings — these are data-quality issues, not programming errors.
     """
     if df is None or len(df) == 0:
         return pd.Series(dtype=object)
-    ohrs = _build_ohrs(df, global_key)
-    if not ohrs:
-        return pd.Series([""] * len(df), index=df.index, dtype=object)
-    out: List[str] = []
-    for ohr in ohrs:
-        try:
-            out.append(ohr.to_format("dcml"))
-        except Exception:
-            out.append("")
-    return pd.Series(out, index=df.index, dtype=object)
+    # Validate structural preconditions (raises on failure)
+    _build_ohrs_check(df, global_key)
+
+    gk = _agnn_to_flx_pitch(global_key)
+    work = _prepare_df_for_flexohr(df)
+
+    # Identify rows with valid numeric core columns (NaN = no label)
+    core_numeric = ["degree1", "inversion"]
+    valid_mask = work[core_numeric].notna().all(axis=1)
+
+    out = pd.Series("", index=df.index, dtype=object)
+    valid_df = work.loc[valid_mask]
+    if len(valid_df) > 0:
+        ohrs = flx.codecs.analysisgnn.build_ohrs_from_dataframe(valid_df, gk)
+        for ohr, idx in zip(ohrs, valid_df.index):
+            dcml = ohr.to_format("dcml")
+            out.at[idx] = _format_dcml_with_global_key(dcml, global_key)
+    return out
 
 
 def _enumerate_rn_candidates(
@@ -491,9 +533,10 @@ def _enumerate_rn_candidates(
                 if d2 in ("None", "", None):
                     base_expected["tonkey"] = base_expected.get("localkey", "")
             group_candidates.append({
-                "dcml": cand.dcml,
+                "dcml": _format_dcml_with_global_key(cand.dcml, global_key),
                 "score": round(cand.result.core.score, 4),
                 "base_expected": base_expected,
+                "_raw_dcml": cand.dcml,
             })
 
         # Per-note candidates: add note-level expected (tpc_in_label, note_degree)
@@ -511,7 +554,7 @@ def _enumerate_rn_candidates(
                         pc = m.group(1)
                         # tpc_in_label: check if pitch is in chord components
                         try:
-                            cand_obj = [c for c in candidates if c.dcml == gc["dcml"]][0]
+                            cand_obj = [c for c in candidates if c.dcml == gc["_raw_dcml"]][0]
                             resolved = cand_obj.ohr.resolve()
                             chord_names = set()
                             for comp in resolved.components("b", depth=1):
@@ -543,6 +586,9 @@ def _enumerate_rn_candidates(
                             except Exception:
                                 pass
 
+                # Copy tpc_in_label -> pitch_spelling for Pitch tile coloring
+                if "tpc_in_label" in expected:
+                    expected["pitch_spelling"] = expected["tpc_in_label"]
                 note_cands.append({
                     "dcml": gc["dcml"],
                     "score": gc["score"],
@@ -798,13 +844,13 @@ def _build_graph_overlay_payload(
     if not rn_candidates_map and global_key:
         prepared = _prepare_df_for_flexohr(data)
         ohrs = _build_ohrs(data, global_key)
-        if ohrs:
-            try:
-                expected_labels = flx.codecs.analysisgnn.derive_expected_labels(
-                    prepared, ohrs, _agnn_to_flx_pitch(global_key)
-                )
-            except Exception:
-                pass
+        expected_labels = flx.codecs.analysisgnn.derive_expected_labels(
+            prepared, ohrs, _agnn_to_flx_pitch(global_key)
+        )
+        # Copy tpc_in_label -> pitch_spelling for Pitch tile coloring
+        for rec in expected_labels:
+            if "tpc_in_label" in rec:
+                rec["pitch_spelling"] = rec["tpc_in_label"]
     if not expected_labels:
         expected_labels = [{}] * n
 
@@ -1335,18 +1381,13 @@ def run_full_inference(
         # Precompute DataFrames for aggregation (cached)
         delta_dfs = _precompute_delta_dfs(predictions, intermediates_state)
 
-        # Derive global key from predictions
-        try:
-            global_key = _derive_global_key(display_df)
-        except ValueError as gk_exc:
-            global_key = ""
-            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+        # Derive global key from predictions — must always succeed
+        global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        if global_key:
-            display_df["romanNumeral_full"] = _build_complete_rn_column(
-                display_df, global_key
-            )
+        display_df["romanNumeral_full"] = _build_complete_rn_column(
+            display_df, global_key
+        )
         display_df = _prepare_prediction_table_for_display(display_df)
 
         # Build visual payload
@@ -1495,18 +1536,13 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             "metadata": metadata,
         }
 
-        # Derive global key from predictions
-        try:
-            global_key = _derive_global_key(display_df)
-        except ValueError as gk_exc:
-            global_key = ""
-            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+        # Derive global key from predictions — must always succeed
+        global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        if global_key:
-            display_df["romanNumeral_full"] = _build_complete_rn_column(
-                display_df, global_key
-            )
+        display_df["romanNumeral_full"] = _build_complete_rn_column(
+            display_df, global_key
+        )
         display_df = _prepare_prediction_table_for_display(display_df)
 
         csv_path = _write_csv_to_temp(display_df, score_path)
@@ -1602,10 +1638,14 @@ def run_aggregation(
             display_df = format_table_output(result_df, tasks)
             _fix_key_mode(display_df)
             # Add Complete RN column
-            if global_key:
-                display_df["romanNumeral_full"] = _build_complete_rn_column(
-                    display_df, global_key
+            if not global_key:
+                raise ValueError(
+                    "Global key is required for aggregation. "
+                    "Set it in the Global Key field."
                 )
+            display_df["romanNumeral_full"] = _build_complete_rn_column(
+                display_df, global_key
+            )
             display_df = _prepare_prediction_table_for_display(display_df)
             _aggregation_cache[strategy_name] = display_df
             log_text = _log(
@@ -1806,18 +1846,13 @@ def run_edit_conditioned(
         delta_dfs = _precompute_delta_dfs(predictions, new_intermediates)
         _clear_aggregation_cache()
 
-        # Derive global key from predictions
-        try:
-            global_key = _derive_global_key(display_df)
-        except ValueError as gk_exc:
-            global_key = ""
-            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+        # Derive global key from predictions — must always succeed
+        global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        if global_key:
-            display_df["romanNumeral_full"] = _build_complete_rn_column(
-                display_df, global_key
-            )
+        display_df["romanNumeral_full"] = _build_complete_rn_column(
+            display_df, global_key
+        )
         display_df = _prepare_prediction_table_for_display(display_df)
 
         visual_payload = _build_visual_payload(
@@ -2035,6 +2070,41 @@ def refresh_visual_tab(
             log_text,
             visual_state if isinstance(visual_state, dict) else {},
         )
+
+
+# ---------------------------------------------------------------------------
+# Global Key Change → Regenerate romanNumeral_full
+# ---------------------------------------------------------------------------
+
+
+def regenerate_rn_column(
+    global_key_text: str,
+    table_data: Any,
+    tasks_state: Any,
+    score_path_state: str,
+    log_text: str,
+):
+    """Regenerate the romanNumeral_full column after a global key change.
+
+    Called on global_key_field blur.  Updates the table and CSV download.
+    """
+    try:
+        global_key = (global_key_text or "").strip()
+        if not global_key:
+            raise ValueError("Global key must not be empty.")
+        df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
+        if len(df) == 0:
+            return df, log_text, None
+        tasks = tasks_state or []
+        df["romanNumeral_full"] = _build_complete_rn_column(df, global_key)
+        df = _prepare_prediction_table_for_display(df)
+        csv_path = _write_csv_to_temp(df, score_path_state)
+        log_text = _log(log_text, f"Regenerated RN column with global key '{global_key}'.")
+        return df, log_text, csv_path
+    except Exception as exc:
+        log_text = _log(log_text, f"RN regeneration error: {exc}")
+        df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
+        return df, log_text, None
 
 
 # ---------------------------------------------------------------------------
@@ -2365,6 +2435,19 @@ def build_demo() -> gr.Blocks:
                 log_output,
             ],
             outputs=[log_output],
+        )
+
+        # ---- Module 2: Global Key Change → Regenerate RN column ----
+        global_key_field.blur(
+            fn=regenerate_rn_column,
+            inputs=[
+                global_key_field,
+                table,
+                tasks_state,
+                score_path_state,
+                log_output,
+            ],
+            outputs=[table, log_output, csv_download],
         )
 
         # ---- Module 2: Refresh Visual ----
