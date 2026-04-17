@@ -807,23 +807,30 @@ def _build_group_table(
 
     rows: List[Dict[str, Any]] = []
     for group_id, member_nids in group_members.items():
-        rep_row = None
+        # Find all member rows and pick the first as representative
+        member_str_ids = [str(nid) for nid in member_nids]
         if note_id_col:
-            for nid in member_nids:
-                match = agg_note_df[agg_note_df[note_id_col] == str(nid)]
-                if not match.empty:
-                    rep_row = match.iloc[0]
-                    break
-        if rep_row is None:
+            member_rows = agg_note_df[
+                agg_note_df[note_id_col].isin(member_str_ids)
+            ]
+        else:
+            member_rows = pd.DataFrame()
+        if member_rows.empty:
             continue
+        rep_row = member_rows.iloc[0]
         row: Dict[str, Any] = {
             "group_id": group_id,
             "note_count": len(member_nids),
         }
-        if "measure" in agg_note_df.columns:
-            row["measure"] = rep_row.get("measure")
-        if "onset_beat" in agg_note_df.columns:
-            row["onset_beat"] = rep_row.get("onset_beat")
+        # Use minimum onset_beat / measure across all group members
+        if "measure" in member_rows.columns:
+            row["measure"] = int(
+                pd.to_numeric(member_rows["measure"], errors="coerce").min()
+            )
+        if "onset_beat" in member_rows.columns:
+            row["onset_beat"] = float(
+                pd.to_numeric(member_rows["onset_beat"], errors="coerce").min()
+            )
         for col in task_cols:
             row[col] = rep_row.get(col)
         rows.append(row)
@@ -1048,6 +1055,11 @@ def _build_graph_overlay_payload(
                 "note_label": str(rn_full.iloc[idx])
                 if idx < len(rn_full)
                 else "",
+                "agg_labels": {
+                    col: str(_value_or_none(row.get(col)) or "")
+                    for col in data.columns
+                    if col.endswith("_label") and col != "note_label"
+                },
                 "rn_expected": expected_labels[idx] if idx < len(expected_labels) else {},
                 "rn_candidates": (
                     rn_candidates_map.get(str(note_id), [])
@@ -1097,7 +1109,7 @@ def _build_verovio_html(payload: Dict[str, Any]) -> str:
     srcdoc = html_lib.escape(doc, quote=True)
     return (
         "<iframe "
-        "style='width:100%;height:600px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
+        "style='width:100%;min-height:980px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
         f'srcdoc="{srcdoc}"></iframe>'
     )
 

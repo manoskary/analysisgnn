@@ -530,47 +530,19 @@ updated. All 52 tests pass.
 ### Step 4: Gradio Restructuring + Delta Lake Integration — DONE
 
 Rewrote `examples/gradio_hybrid_analysis_app.py` into a 3-module layout:
-- **Module 1** — Data Source: "Analyse Score" tab (inference with `aggregation=none`,
-  `return_intermediates=True`, auto-writes Delta Lake via merge) and "Load Delta Lake"
-  tab (`gr.FileExplorer` for `metadata.json` selection)
-- **Module 2** — Analysis Results: aggregation dropdown (`list_strategies()`), cached
-  post-hoc aggregation via `Aggregate!` button, `gr.DownloadButton` auto-updated CSV,
-  `Save Delta Lake` button, editable predictions table, Verovio visual score tab
-- **Module 3** — Edit-Conditioned Re-Inference: grayed out until Module 1a runs;
-  tasks CSV override lives here
+- **Module 1** — Data Source: inference (`aggregation=none`, `return_intermediates`)
+  with auto Delta Lake write, or load via `gr.FileExplorer`
+- **Module 2** — Analysis Results: aggregation, CSV download, editable table, Verovio
+- **Module 3** — Edit-Conditioned Re-Inference (grayed out until Module 1a runs)
 
-Key changes in `hybrid_predictor.py`:
-- `HybridAnalysisPredictor.predict()` now forwards `return_intermediates=True`
-
-Key changes in `delta_writer.py`:
-- `_merge_or_create()` replaces `write_deltalake(mode="overwrite")`: standard Delta
-  Lake merge (`when_matched_update_all` / `when_not_matched_insert_all` /
-  `when_not_matched_by_source_delete`) + `vacuum(retention_hours=0)` after each merge
-
-Also done: voter logic commented out; `_extract_graph_edges_from_score` replaced by
-`_edges_from_pyg_data()` reading `intermediates["data"].edge_index_dict`; single log
-textbox replaces all status fields; aggregation results cached in-memory per strategy
-name; `_precompute_delta_dfs()` converts raw predictions to long-format DataFrames
-once after inference. All 52 tests pass.
+Key: `_merge_or_create()` in `delta_writer.py` (Delta merge + vacuum);
+`_precompute_delta_dfs()` converts predictions to long-format once after inference.
 
 ### Step 4a: Verovio Score Upload + Note Coloring — DONE
 
-The Verovio Visual Score tab now has its own `gr.File` upload, auto-filled from
-Module 1a's score file via `score_file.change()`. Users can upload an alternative
-edition; if note counts differ, a warning is logged and rendering uses
-`min(n_score, n_table)` notes.
-
-**Note coloring interface**: the visual payload accepts `note_colors` (dict of note
-index -> CSS color string). The JS applies colors via CSS custom property
-`--agn-note-color` + class `.agn-colored`, so the active-note highlight (`.agn-active`
-with `!important`) still overrides. Any future coloring scheme (e.g., aggregation
-confidence heatmaps) can populate `note_colors` the same way.
-
-**NCT coloring** ("Colour non-chord tones grey" checkbox): uses `tpc_in_label` and
-`tpc_in_label_confidence` from the predictions table. Effective in-label score =
-`P("True")` (confidence if argmax is "True", else 1-confidence). Color = linear
-interpolation from lightgrey `rgb(211,211,211)` at score=0 to black `rgb(0,0,0)` at
-score=1.
+Verovio tab has its own `gr.File` upload (auto-filled from Module 1a). NCT coloring
+via `tpc_in_label` confidence → linear grey interpolation. Note coloring interface:
+`payload.note_colors` dict → CSS `--agn-note-color` + `.agn-colored`.
 
 ### Step 4b: FlexOHR-Based Complete RN Column — DONE
 
@@ -599,44 +571,40 @@ Demo notebook: `notebooks/roman_numeral_enumeration.py`.
 
 ### Step 5c: Grouped Note Panel + Agreement Coloring — DONE
 
-Restructured Verovio note info panel with grouped tiles and agreement coloring.
-Top-k DCML labels as button group; clicking a candidate recolors harmony tiles.
-Tiles: (localkey, globalkey), paired core|validation grid, Note (pitch + note_degree
-+ tpc_in_label + timing), Structure.  `derive_expected_labels()` in FlexOHR codec
-derives expected values from OHRs for all tasks.
+Verovio note info panel with grouped tiles and agreement coloring. Top-k DCML
+labels as button group; clicking a candidate recolors harmony tiles.
+`derive_expected_labels()` in FlexOHR codec derives expected values from OHRs.
 
-### Step 5d: Two-Dropdown Aggregation UI + Bug Fixes — DONE
+### Step 5d: Two-Dropdown Aggregation UI — DONE
 
-Split aggregation controls into two independent dimensions:
-
-- **"Aggregation Groups"** dropdown: `None`, `Onset`, `Beat`, `Measure` (default: None).
-  Controls the hyperedge grouping level over which probability distributions are
-  combined.  `None` = raw per-note predictions (no grouping/averaging).
-- **"Aggregation Strategy"** dropdown: `Mean` (default), plus future scorers
-  (`GeometricMean`, `WeightedTask`, etc. from `aggregation/scoring.py`).  Controls
-  *how* distributions are combined within each group.
+- **"Aggregation Groups"** dropdown: `None`, `Onset`, `Beat`, `Measure`.
+- **"Aggregation Strategy"** dropdown: `Mean` (+ future scorers).
 - `GroupedMeanAggregation(level)` in `mean.py`: single-level mean at onset/beat/measure.
-  Registered as `onset_mean`, `beat_mean`, `measure_mean`.
-- `_enumerate_rn_candidates` accepts `grouping=` parameter; `"none"` enumerates per
-  note (each note is its own group), other values use the corresponding hyperedge type.
-- **Future**: scorer-based strategies (`GeometricMeanScorer`, etc.) will be registered
-  as aggregation strategies that operate on the grouped probabilities, replacing the
-  fixed `scatter_mean` with pluggable combination operators.
+- `_enumerate_rn_candidates` accepts `grouping=` parameter.
+- Bug fixes: FlexOHR `build_key_context()` mode inference, NaN-safe OHR builds,
+  DCML global-key prefix format, localkey mode map for enumeration.
 
-**Bug fixes in same changeset:**
-- FlexOHR `build_key_context()`: infer global key mode from string case (was hardcoded
-  `CollectionType.major`); reject bare SPC
-- `_build_complete_rn_column`: filters NaN rows before OHR build (per-row data issues →
-  empty string); structural failures raise
-- `_build_graph_overlay_payload`: same NaN-safe OHR build for expected labels
-- DCML format `f: i/i` (global key prefix, colon+space) via `_format_dcml_with_global_key`
-- Global key derivation errors propagate (no silent swallowing)
-- `global_key_field.blur()` → regenerate `romanNumeral_full` column
-- Verovio JS: localkey/globalkey tile swap, note_degree before Timing, Pitch tile
-  agreement coloring
-- Localkey mode map: `_enumerate_rn_candidates` builds a map from the display_df's
-  corrected localkey case and passes it to `enumerate_roman_numerals`, which applies
-  it to localkey candidates from the vocabulary (always uppercase) before OHR build
+### Step 5e: Multi-Table Aggregation + Agreement Coloring Fixes — DONE
+
+**Multi-table UI**: Aggregation now produces two outputs — a group-level table and
+an updated notes table with a label column. `gr.Radio` (`table_selector`) switches
+between tables. Naming: column `{group}_{strategy}_label` (e.g., `measure_mean_label`),
+Radio label `{Group_plural} ({Strategy})` (e.g., `Measures (Mean)`). Tables accumulate
+across aggregations. Group-level table built by `_build_group_table()` (representative
+note per hyperedge group, min onset_beat, FlexOHR label). Labels mapped to notes via
+`_map_group_labels_to_notes()`.
+
+**Column rename**: `romanNumeral_full` → `note_label` in the display layer (Gradio app,
+JS payload, tests). Internal model/utility code retains `romanNumeral_full`.
+
+**Agreement coloring fixes** (FlexOHR codec + `roman_numeral.py`):
+- romanNumeral expected value: `ohr.with_(inversion=0)` for root-position DCML (vocab
+  excludes inversion figures)
+- Pitch-class notation: `_flx_to_agnn()` converts FlexOHR `b` → AnalysisGNN `-` for
+  root, bass, tonkey, localkey expected values
+- Aggregation labels shown as tiles in Verovio note panel (`agg_labels` payload field)
+
+**Verovio iframe**: `ResizeObserver` auto-resize, `min-height:980px` initial.
 
 ---
 
@@ -644,86 +612,26 @@ Split aggregation controls into two independent dimensions:
 
 ### Overview
 
-The Gradio app embeds a Verovio-based score viewer in an iframe. Verovio renders
-MusicXML into SVG; the app's JS then overlays graph edges, note coloring, RN labels,
-and click-to-inspect interactivity on top of the rendered SVG.
+Verovio-based score viewer embedded as an `<iframe srcdoc>`. Python builds a payload
+dict (`_build_visual_payload()`) containing `score_xml` (original MusicXML, never
+partitura re-export), per-note metadata, edges, and `meta.roman_spans`. The JS
+renders via Verovio WASM 5.0.0, maps notes by ID, overlays edges/RN labels.
 
-### Version & CDN
+**Do not upgrade to Verovio 6.x** — version 6.0.0 changed SVG styling structure,
+breaking the `.page-margin` selector.
 
-Currently using **Verovio 5.0.0** via the CDN at
-`https://www.verovio.org/javascript/5.0.0/verovio-toolkit-wasm.js`
-(loaded in `examples/assets/verovio_score_graph.html`). To update, change the version
-number in the `<script src>` tag; available versions are at
-`https://www.verovio.org/javascript/<version>/` (not all releases have JS builds —
-e.g., 6.1.1 was CocoaPods-only). **Do not upgrade to Verovio 6.x without adapting
-the JS**: version 6.0.0 changed the SVG styling structure ("Remove default css
-scoping"), which breaks the `.page-margin` selector used by our JS to anchor edge
-overlays and RN labels.
-
-### File layout
+### Files
 
 | File | Role |
 |------|------|
-| `examples/assets/verovio_score_graph.html` | Template: loads CSS, JS, payload, Verovio CDN script |
-| `examples/assets/verovio_score_graph.js` | All rendering logic: Verovio init, note mapping, edge overlay, RN labels, click handler |
-| `examples/assets/verovio_score_graph.css` | Styling: toolbar, note panel, `.agn-colored`/`.agn-active` note highlighting, edges, RN labels |
-
-### Data flow
-
-1. Python builds a **payload** dict (`_build_visual_payload()` in the Gradio app):
-   - `score_xml`: the **original** MusicXML text (read directly from the uploaded
-     file via `_read_score_xml_text()`; partitura re-export is only used as fallback
-     for non-XML formats like `.mxl`)
-   - `notes`: per-note metadata (pitch, onset, tasks, confidence, RN)
-   - `edges`: graph edge lists per type
-   - `meta.roman_spans`: RN label spans for the JS overlay
-   - `note_colors`: optional per-note CSS color strings (e.g., NCT coloring)
-2. The payload is JSON-serialized into the HTML template as `window.__AGN_PAYLOAD__`.
-3. The HTML is escaped and embedded as an `<iframe srcdoc="...">`.
-4. Inside the iframe, the JS:
-   - Waits for the Verovio WASM runtime to initialize (`ensureVerovioReady()`)
-   - Calls `tk.setOptions(...)` then `tk.loadData(payload.score_xml)`
-   - Renders SVG pages via `tk.renderToSVG(page)`
-   - Maps payload notes to SVG `<g class="note">` elements by ID (first by
-     `findNoteElementById()` which tries exact match, endsWith, includes; then
-     falls back to sequential order for unmapped notes)
-   - Draws edge overlays as SVG `<path>` elements
-   - Draws RN labels as SVG `<text>` elements from `meta.roman_spans`
-   - Applies `note_colors` via CSS custom property `--agn-note-color`
+| `examples/assets/verovio_score_graph.html` | Template: CSS, JS, payload, Verovio CDN |
+| `examples/assets/verovio_score_graph.js` | Rendering: Verovio init, note mapping, overlays, panel |
+| `examples/assets/verovio_score_graph.css` | Styling: toolbar, panel, note highlighting, edges |
 
 ### Important: always use the original MusicXML
 
-The score XML sent to Verovio **must** be the original uploaded MusicXML, not a
-partitura re-export. Partitura's `save_musicxml()` strips `<accidental>` elements
-(it writes `<alter>` inside `<pitch>` but not the display-controlling `<accidental>`),
-causing Verovio to render notes without accidental symbols. The original file
-preserves both. RN annotations are handled entirely by the JS overlay (not embedded
-in the MusicXML), so there is no reason to re-export.
-
-### Verovio options (current)
-
-```js
-tk.setOptions({
-  breaks: "none",        // horizontal continuous layout
-  footer: "none",
-  header: "none",
-  adjustPageHeight: true,
-  adjustPageWidth: true,
-  pageMarginBottom: 0,
-  pageMarginTop: 0,
-});
-```
-
-Full option reference: https://book.verovio.org/toolkit-reference/toolkit-options.html
-
-### Extending
-
-- **Note coloring**: set `payload.note_colors = { "<noteIndex>": "<css-color>" }`;
-  the JS applies class `.agn-colored` + CSS variable `--agn-note-color`
-- **Edge visibility**: controlled by `payload.meta.visible_edge_types` (list of
-  edge type strings); toggled via the Gradio checkboxes
-- **New overlays**: add SVG elements to `pageMargin` containers in the JS
-  (same pattern as `renderRomanNumeralOverlay()`)
+Partitura's `save_musicxml()` strips `<accidental>` elements. Always use the
+original uploaded file; re-export only as fallback for `.mxl` format.
 
 ---
 

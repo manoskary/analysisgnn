@@ -128,6 +128,17 @@
     // ── Complete RN (button group) ──
     const rnHtml = renderRnGroup(note);
 
+    // ── Aggregation labels (from additional *_label columns) ──
+    let aggLabelHtml = "";
+    const aggLabels = note.agg_labels || {};
+    const aggKeys = Object.keys(aggLabels).filter(function (k) { return aggLabels[k]; });
+    if (aggKeys.length > 0) {
+      const aggCards = aggKeys.map(function (k) {
+        return makeCard(k.replace(/_/g, " "), aggLabels[k]);
+      });
+      aggLabelHtml = `<div class="agn-grid">${aggCards.join("")}</div>`;
+    }
+
     // ── Harmony: paired core (left) + validation (right) ──
     // First row: localkey | globalkey
     let harmonyCards = "";
@@ -209,7 +220,7 @@
     }
     const otherHtml = otherCards.length ? makeSection("Other", `<div class="agn-grid">${otherCards.join("")}</div>`) : "";
 
-    panelEl.innerHTML = `<h3>Note Analysis</h3>${rnHtml}${harmonyHtml}${noteHtml}${structHtml}${otherHtml}`;
+    panelEl.innerHTML = `<h3>Note Analysis</h3>${rnHtml}${aggLabelHtml}${harmonyHtml}${noteHtml}${structHtml}${otherHtml}`;
 
     // Attach click handlers for RN candidate buttons
     panelEl.currentNote = note;
