@@ -95,6 +95,14 @@ EDGE_LABELS = {
     "during": "During",
     "rest": "Rest",
 }
+# Group naming for multi-table aggregation UI
+GROUP_NAMES: Dict[str, Tuple[str, str]] = {
+    "none": ("note", "Notes"),
+    "onset": ("onset", "Onsets"),
+    "beat": ("beat", "Beats"),
+    "measure": ("measure", "Measures"),
+}
+DEFAULT_TABLE_LABEL = "Notes (None)"
 
 
 # ---------------------------------------------------------------------------
@@ -219,16 +227,24 @@ def _prepare_prediction_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
         if numeric.notna().any():
             out[col] = numeric.round(3)
 
-    if "romanNumeral_full" in out.columns:
-        cols = [col for col in out.columns if col != "romanNumeral_full"]
-        if "pitch_midi" in cols:
-            insert_at = cols.index("pitch_midi") + 1
-        elif "cadence" in cols:
-            insert_at = cols.index("cadence")
+    # Collect all label columns: note_label first, then any *_label columns
+    label_cols = []
+    if "note_label" in out.columns:
+        label_cols.append("note_label")
+    label_cols.extend(
+        c for c in out.columns if c.endswith("_label") and c != "note_label"
+    )
+    if label_cols:
+        other_cols = [c for c in out.columns if c not in label_cols]
+        if "pitch_midi" in other_cols:
+            insert_at = other_cols.index("pitch_midi") + 1
+        elif "cadence" in other_cols:
+            insert_at = other_cols.index("cadence")
         else:
-            insert_at = len(cols)
-        cols.insert(insert_at, "romanNumeral_full")
-        out = out[cols]
+            insert_at = len(other_cols)
+        for i, lc in enumerate(label_cols):
+            other_cols.insert(insert_at + i, lc)
+        out = out[other_cols]
 
     return out
 
@@ -702,8 +718,8 @@ def _build_complete_rn_spans(
         return []
 
     work = df.copy()
-    if "romanNumeral_full" not in work.columns:
-        work["romanNumeral_full"] = _build_complete_rn_column(work, global_key)
+    if "note_label" not in work.columns:
+        work["note_label"] = _build_complete_rn_column(work, global_key)
     if "duration_div" not in work.columns:
         return []
 
@@ -711,8 +727,8 @@ def _build_complete_rn_spans(
     work["duration_div"] = pd.to_numeric(work["duration_div"], errors="coerce").fillna(
         0
     )
-    work["romanNumeral_full"] = (
-        work["romanNumeral_full"].fillna("").astype(str).str.strip()
+    work["note_label"] = (
+        work["note_label"].fillna("").astype(str).str.strip()
     )
     work = work.dropna(subset=["onset_div"])
     if len(work) == 0:
@@ -725,7 +741,7 @@ def _build_complete_rn_spans(
     onset_rn: List[str] = []
     for onset, group in by_onset:
         onset_i = int(onset)
-        candidates = [v for v in group["romanNumeral_full"].tolist() if v]
+        candidates = [v for v in group["note_label"].tolist() if v]
         rn_value = candidates[0] if candidates else ""
         onset_points.append(onset_i)
         onset_rn.append(rn_value)
@@ -752,6 +768,110 @@ def _build_complete_rn_spans(
         final_end = max(current_start + 1, score_end)
         spans.append((current_start, final_end, current_rn))
     return spans
+
+
+# ---------------------------------------------------------------------------
+# Multi-table helpers: group-level table + label mapping
+# ---------------------------------------------------------------------------
+
+
+def _build_group_table(
+    agg_note_df: pd.DataFrame,
+    hyperedges_df: pd.DataFrame,
+    level: str,
+    tasks: List[str],
+    global_key: str,
+    label_col: str,
+) -> pd.DataFrame:
+    """Build a group-level table from aggregated per-note predictions.
+
+    For each hyperedge group at *level*, picks the first note as
+    representative (all chord-tone notes share the same aggregated
+    predictions after mean-broadcast) and extracts its task columns.
+    """
+    groups = hyperedges_df[hyperedges_df["edge_type"] == level]
+    if groups.empty:
+        return pd.DataFrame()
+
+    group_members = groups.groupby("group_id")["note_id"].apply(list).to_dict()
+    note_id_col = "note_id" if "note_id" in agg_note_df.columns else None
+
+    # Determine which task columns exist
+    task_cols: List[str] = []
+    for t in tasks:
+        if t in agg_note_df.columns:
+            task_cols.append(t)
+        conf_col = f"{t}_confidence"
+        if conf_col in agg_note_df.columns:
+            task_cols.append(conf_col)
+
+    rows: List[Dict[str, Any]] = []
+    for group_id, member_nids in group_members.items():
+        rep_row = None
+        if note_id_col:
+            for nid in member_nids:
+                match = agg_note_df[agg_note_df[note_id_col] == str(nid)]
+                if not match.empty:
+                    rep_row = match.iloc[0]
+                    break
+        if rep_row is None:
+            continue
+        row: Dict[str, Any] = {
+            "group_id": group_id,
+            "note_count": len(member_nids),
+        }
+        if "measure" in agg_note_df.columns:
+            row["measure"] = rep_row.get("measure")
+        if "onset_beat" in agg_note_df.columns:
+            row["onset_beat"] = rep_row.get("onset_beat")
+        for col in task_cols:
+            row[col] = rep_row.get(col)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    group_df = pd.DataFrame(rows)
+    # Sort by numeric suffix of group_id
+    sort_key = group_df["group_id"].str.extract(r"(\d+)$", expand=False)
+    sort_key = pd.to_numeric(sort_key, errors="coerce")
+    group_df = group_df.iloc[sort_key.argsort()].reset_index(drop=True)
+
+    # Build label column via FlexOHR
+    if global_key:
+        try:
+            group_df[label_col] = _build_complete_rn_column(group_df, global_key)
+        except Exception:
+            group_df[label_col] = ""
+    else:
+        group_df[label_col] = ""
+
+    group_df = _prepare_prediction_table_for_display(group_df)
+    return group_df
+
+
+def _map_group_labels_to_notes(
+    notes_df: pd.DataFrame,
+    group_df: pd.DataFrame,
+    hyperedges_df: pd.DataFrame,
+    level: str,
+    label_col: str,
+) -> pd.DataFrame:
+    """Map group-level labels back to individual notes."""
+    out = notes_df.copy()
+    groups = hyperedges_df[hyperedges_df["edge_type"] == level]
+    if groups.empty or label_col not in group_df.columns:
+        out[label_col] = ""
+        return out
+
+    note_to_group = dict(zip(groups["note_id"].astype(str), groups["group_id"]))
+    group_to_label = dict(
+        zip(group_df["group_id"].astype(str), group_df[label_col].astype(str))
+    )
+    out[label_col] = out["note_id"].astype(str).map(
+        lambda nid: group_to_label.get(note_to_group.get(nid, ""), "")
+    )
+    return out
 
 
 def _sorted_note_array(score: pt.score.Score) -> np.ndarray:
@@ -844,8 +964,8 @@ def _build_graph_overlay_payload(
             cands = rn_candidates_map.get(nid, [])
             rn_vals.append(cands[0]["dcml"] if cands else "")
         rn_full = pd.Series(rn_vals, dtype=object)
-    elif "romanNumeral_full" in data.columns:
-        rn_full = data["romanNumeral_full"].fillna("").astype(str)
+    elif "note_label" in data.columns:
+        rn_full = data["note_label"].fillna("").astype(str)
     elif global_key:
         rn_full = _build_complete_rn_column(data, global_key)
     else:
@@ -856,7 +976,7 @@ def _build_graph_overlay_payload(
         spans_df["onset_div"] = note_array["onset_div"][:n]
     if "duration_div" in note_array.dtype.names:
         spans_df["duration_div"] = note_array["duration_div"][:n]
-    spans_df["romanNumeral_full"] = rn_full
+    spans_df["note_label"] = rn_full
     rn_spans = _build_complete_rn_spans(spans_df, global_key)
 
     # Compute expected labels for agreement coloring (fallback when no candidates)
@@ -925,7 +1045,7 @@ def _build_graph_overlay_payload(
                 "pitch_spelling": str(_value_or_none(row.get("pitch_spelling")) or ""),
                 "tasks": task_vals,
                 "confidence": conf,
-                "romanNumeral_full": str(rn_full.iloc[idx])
+                "note_label": str(rn_full.iloc[idx])
                 if idx < len(rn_full)
                 else "",
                 "rn_expected": expected_labels[idx] if idx < len(expected_labels) else {},
@@ -977,7 +1097,7 @@ def _build_verovio_html(payload: Dict[str, Any]) -> str:
     srcdoc = html_lib.escape(doc, quote=True)
     return (
         "<iframe "
-        "style='width:100%;height:980px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
+        "style='width:100%;height:600px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
         f'srcdoc="{srcdoc}"></iframe>'
     )
 
@@ -1118,7 +1238,7 @@ def _beat_payload_to_dataframe(
             "measure": row.get("measure"),
             "onset_beat": row.get("onset_beat"),
             "note_count": row.get("note_count"),
-            "romanNumeral_full": row.get("romanNumeral_full", ""),
+            "note_label": row.get("note_label", ""),
         }
         task_map = row.get("tasks", {}) if isinstance(row, dict) else {}
         for task in tasks:
@@ -1137,7 +1257,7 @@ def _beat_payload_to_dataframe(
         "measure",
         "onset_beat",
         "note_count",
-        "romanNumeral_full",
+        "note_label",
         "chordSymbol_abs",
         "chordSymbol_context",
         "chordSymbol_supported",
@@ -1409,7 +1529,7 @@ def run_full_inference(
         global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        display_df["romanNumeral_full"] = _build_complete_rn_column(
+        display_df["note_label"] = _build_complete_rn_column(
             display_df, global_key
         )
         display_df = _prepare_prediction_table_for_display(display_df)
@@ -1459,6 +1579,8 @@ def run_full_inference(
 
         csv_path = _write_csv_to_temp(display_df, score_path)
 
+        tables_init = {DEFAULT_TABLE_LABEL: display_df}
+
         return (
             display_df,
             log_text,
@@ -1472,6 +1594,8 @@ def run_full_inference(
             edges_all,
             True,  # model_available
             global_key,
+            tables_init,
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error: {exc}")
@@ -1488,6 +1612,8 @@ def run_full_inference(
             {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
             "",
+            {},
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
 
 
@@ -1564,12 +1690,14 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
         global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        display_df["romanNumeral_full"] = _build_complete_rn_column(
+        display_df["note_label"] = _build_complete_rn_column(
             display_df, global_key
         )
         display_df = _prepare_prediction_table_for_display(display_df)
 
         csv_path = _write_csv_to_temp(display_df, score_path)
+
+        tables_init = {DEFAULT_TABLE_LABEL: display_df}
 
         return (
             display_df,
@@ -1584,6 +1712,8 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             edges_all,
             False,  # model NOT available
             global_key,
+            tables_init,
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error loading Delta Lake: {exc}")
@@ -1600,6 +1730,8 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
             "",
+            {},
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
 
 
@@ -1607,8 +1739,8 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
 # Module 2: Post-hoc Aggregation (with caching)
 # ---------------------------------------------------------------------------
 
-# Cache: maps strategy name -> display_df so repeat clicks are instant.
-_aggregation_cache: Dict[str, pd.DataFrame] = {}
+# Cache: maps strategy name -> (agg_note_df, group_df) so repeat clicks are instant.
+_aggregation_cache: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
 
 
 def _clear_aggregation_cache() -> None:
@@ -1638,12 +1770,14 @@ def run_aggregation(
     edges_state: Any,
     intermediates_state: Any,
     global_key_text: str,
+    tables_state_val: Any,
     log_text: str,
 ):
-    """Apply an aggregation strategy.  Uses a cache so that toggling back and
-    forth between strategies is instant.
+    """Apply an aggregation strategy.  Produces a group-level table and adds
+    a label column to the notes table.
 
-    Returns: (display_df, log_text, visual_payload, csv_path)
+    Returns: (display_df, log_text, visual_payload, csv_path,
+              tables_state, table_selector_update)
     """
     try:
         resolved_name = _resolve_strategy_name(group_name, strategy_name)
@@ -1651,48 +1785,92 @@ def run_aggregation(
         delta_dfs = delta_dfs_state or {}
         intermediates = intermediates_state or {}
         global_key = (global_key_text or "").strip()
+        tables = dict(tables_state_val) if tables_state_val else {}
 
         if not delta_dfs or "probs_df" not in delta_dfs:
             raise ValueError(
                 "No data available. Run inference or load Delta Lake first."
             )
+        if not global_key:
+            raise ValueError(
+                "Global key is required for aggregation. "
+                "Set it in the Global Key field."
+            )
 
-        # Check cache
+        # Group/strategy naming
+        group_lower = (group_name or "None").strip().lower()
+        strategy_lower = (strategy_name or "Mean").strip().lower()
+        group_singular, group_plural = GROUP_NAMES.get(
+            group_lower, (group_lower, group_lower.title() + "s")
+        )
+        strategy_title = (strategy_name or "Mean").strip()
+        label_col = f"{group_singular}_{strategy_lower}_label"
+        table_display_name = f"{group_plural} ({strategy_title})"
+
+        # Handle "None" group: no new aggregation, just show notes table
+        if group_lower == "none":
+            notes_df = tables.get(DEFAULT_TABLE_LABEL, pd.DataFrame())
+            if notes_df.empty:
+                raise ValueError("Notes table not available.")
+            csv_path = _write_csv_to_temp(notes_df, score_path_state)
+            choices = list(tables.keys())
+            return (
+                notes_df, log_text, {}, csv_path, tables,
+                gr.update(choices=choices, value=DEFAULT_TABLE_LABEL),
+            )
+
+        # Run aggregation (with cache)
         if resolved_name in _aggregation_cache:
-            display_df = _aggregation_cache[resolved_name]
+            agg_note_df, group_df = _aggregation_cache[resolved_name]
             log_text = _log(
                 log_text,
-                f"Aggregation '{resolved_name}' (cached). Rows={len(display_df)}.",
+                f"Aggregation '{resolved_name}' (cached). "
+                f"Notes={len(agg_note_df)}, Groups={len(group_df)}.",
             )
         else:
             probs_df = delta_dfs["probs_df"]
-            notes_df = delta_dfs["notes_df"]
+            notes_df_raw = delta_dfs["notes_df"]
             hyperedges_df = delta_dfs["hyperedges_df"]
             metadata = delta_dfs.get("metadata", {})
 
             strategy = get_strategy(resolved_name)
             result_df = strategy.aggregate(
-                probs_df, notes_df, hyperedges_df, metadata, tasks=tasks
+                probs_df, notes_df_raw, hyperedges_df, metadata, tasks=tasks
             )
-            display_df = format_table_output(result_df, tasks)
-            _fix_key_mode(display_df)
-            # Add Complete RN column
-            if not global_key:
-                raise ValueError(
-                    "Global key is required for aggregation. "
-                    "Set it in the Global Key field."
-                )
-            display_df["romanNumeral_full"] = _build_complete_rn_column(
-                display_df, global_key
+            agg_note_df = format_table_output(result_df, tasks)
+            _fix_key_mode(agg_note_df)
+            agg_note_df["note_label"] = _build_complete_rn_column(
+                agg_note_df, global_key
             )
-            display_df = _prepare_prediction_table_for_display(display_df)
-            _aggregation_cache[resolved_name] = display_df
-            log_text = _log(
-                log_text,
-                f"Aggregation '{resolved_name}' applied. Rows={len(display_df)}.",
+            agg_note_df = _prepare_prediction_table_for_display(agg_note_df)
+
+            # Build group-level table
+            group_df = _build_group_table(
+                agg_note_df, hyperedges_df, group_lower,
+                tasks, global_key, label_col,
             )
 
-        # Build visual payload if score is available
+            _aggregation_cache[resolved_name] = (agg_note_df, group_df)
+            log_text = _log(
+                log_text,
+                f"Aggregation '{resolved_name}' applied. "
+                f"Notes={len(agg_note_df)}, Groups={len(group_df)}.",
+            )
+
+        # Update notes table with aggregation label column
+        notes_df = tables.get(DEFAULT_TABLE_LABEL, pd.DataFrame())
+        if not notes_df.empty and not group_df.empty:
+            hyperedges_df = delta_dfs.get("hyperedges_df", pd.DataFrame())
+            notes_df = _map_group_labels_to_notes(
+                notes_df, group_df, hyperedges_df, group_lower, label_col,
+            )
+            notes_df = _prepare_prediction_table_for_display(notes_df)
+            tables[DEFAULT_TABLE_LABEL] = notes_df
+
+        # Store group-level table
+        tables[table_display_name] = group_df
+
+        # Build visual payload from aggregated note df
         score_obj = intermediates.get("score")
         note_array = intermediates.get("note_array")
         score_path = score_path_state or intermediates.get("score_path", "")
@@ -1702,18 +1880,27 @@ def run_aggregation(
             visual_payload = _build_visual_payload(
                 score_path=score_path,
                 score=score_obj,
-                df=display_df,
+                df=agg_note_df,
                 tasks=tasks,
                 edge_types=[],
                 edges_all=edges_all,
                 global_key=global_key,
             )
 
-        csv_path = _write_csv_to_temp(display_df, score_path)
-        return display_df, log_text, visual_payload, csv_path
+        csv_path = _write_csv_to_temp(notes_df, score_path)
+        choices = list(tables.keys())
+        return (
+            notes_df, log_text, visual_payload, csv_path, tables,
+            gr.update(choices=choices, value=DEFAULT_TABLE_LABEL),
+        )
     except Exception as exc:
         log_text = _log(log_text, f"Aggregation error: {exc}")
-        return pd.DataFrame(), log_text, {}, None
+        tables = dict(tables_state_val) if tables_state_val else {}
+        choices = list(tables.keys()) or [DEFAULT_TABLE_LABEL]
+        return (
+            pd.DataFrame(), log_text, {}, None, tables,
+            gr.update(choices=choices),
+        )
 
 
 def save_delta_lake(
@@ -1889,7 +2076,7 @@ def run_edit_conditioned(
         global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        display_df["romanNumeral_full"] = _build_complete_rn_column(
+        display_df["note_label"] = _build_complete_rn_column(
             display_df, global_key
         )
         display_df = _prepare_prediction_table_for_display(display_df)
@@ -1915,6 +2102,8 @@ def run_edit_conditioned(
 
         csv_path = _write_csv_to_temp(display_df, score_path)
 
+        tables_init = {DEFAULT_TABLE_LABEL: display_df}
+
         return (
             display_df,
             log_text,
@@ -1928,6 +2117,8 @@ def run_edit_conditioned(
             edges_all,
             True,
             global_key,
+            tables_init,
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error: {exc}")
@@ -1944,6 +2135,8 @@ def run_edit_conditioned(
             edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
             "",
+            {},
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
 
 
@@ -2115,7 +2308,7 @@ def refresh_visual_tab(
 
 
 # ---------------------------------------------------------------------------
-# Global Key Change → Regenerate romanNumeral_full
+# Global Key Change → Regenerate note_label
 # ---------------------------------------------------------------------------
 
 
@@ -2124,9 +2317,10 @@ def regenerate_rn_column(
     table_data: Any,
     tasks_state: Any,
     score_path_state: str,
+    tables_state_val: Any,
     log_text: str,
 ):
-    """Regenerate the romanNumeral_full column after a global key change.
+    """Regenerate the note_label column after a global key change.
 
     Called on global_key_field blur.  Updates the table and CSV download.
     """
@@ -2136,17 +2330,37 @@ def regenerate_rn_column(
             raise ValueError("Global key must not be empty.")
         df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
         if len(df) == 0:
-            return df, log_text, None
+            return df, log_text, None, tables_state_val
         tasks = tasks_state or []
-        df["romanNumeral_full"] = _build_complete_rn_column(df, global_key)
+        df["note_label"] = _build_complete_rn_column(df, global_key)
         df = _prepare_prediction_table_for_display(df)
         csv_path = _write_csv_to_temp(df, score_path_state)
+        # Update tables_state
+        tables = dict(tables_state_val) if tables_state_val else {}
+        tables[DEFAULT_TABLE_LABEL] = df
         log_text = _log(log_text, f"Regenerated RN column with global key '{global_key}'.")
-        return df, log_text, csv_path
+        return df, log_text, csv_path, tables
     except Exception as exc:
         log_text = _log(log_text, f"RN regeneration error: {exc}")
         df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
-        return df, log_text, None
+        return df, log_text, None, tables_state_val
+
+
+# ---------------------------------------------------------------------------
+# Table switching
+# ---------------------------------------------------------------------------
+
+
+def _switch_table(
+    selected: str,
+    tables_state_val: Any,
+    score_path_state: str,
+) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Switch the displayed table based on the Radio selection."""
+    tables = tables_state_val if isinstance(tables_state_val, dict) else {}
+    df = tables.get(selected, pd.DataFrame())
+    csv_path = _write_csv_to_temp(df, score_path_state) if len(df) > 0 else None
+    return df, csv_path
 
 
 # ---------------------------------------------------------------------------
@@ -2176,6 +2390,7 @@ def build_demo() -> gr.Blocks:
         enable_iterative = gr.State(False)
         iterative_steps = gr.State(10)
         keep_percentile_per_step = gr.State(10.0)
+        tables_state = gr.State({})  # display_name -> DataFrame
 
         # ==================================================================
         # MODULE 1: DATA SOURCE
@@ -2263,6 +2478,12 @@ def build_demo() -> gr.Blocks:
         with gr.Tabs():
             # ------ Tab: Analysis Results ------
             with gr.Tab("Analysis Results"):
+                table_selector = gr.Radio(
+                    choices=[DEFAULT_TABLE_LABEL],
+                    value=DEFAULT_TABLE_LABEL,
+                    label="Table View",
+                    info="Switch between note-level and aggregated tables.",
+                )
                 table = gr.Dataframe(
                     label="Predictions (editable)",
                     interactive=True,
@@ -2372,6 +2593,24 @@ def build_demo() -> gr.Blocks:
         def _on_new_data(*args):
             _clear_aggregation_cache()
 
+        # Common output list for inference / load / edit-conditioned
+        _data_source_outputs = [
+            table,
+            log_output,
+            visual_payload_state,
+            csv_download,
+            raw_predictions_state,
+            intermediates_state,
+            delta_dfs_state,
+            tasks_state,
+            score_path_state,
+            edges_state,
+            model_available_state,
+            global_key_field,
+            tables_state,
+            table_selector,
+        ]
+
         # ---- Module 1a: Run Inference ----
         run_inference_btn.click(
             fn=_on_new_data,
@@ -2392,20 +2631,7 @@ def build_demo() -> gr.Blocks:
                 show_trace,
                 log_output,
             ],
-            outputs=[
-                table,
-                log_output,
-                visual_payload_state,
-                csv_download,
-                raw_predictions_state,
-                intermediates_state,
-                delta_dfs_state,
-                tasks_state,
-                score_path_state,
-                edges_state,
-                model_available_state,
-                global_key_field,
-            ],
+            outputs=_data_source_outputs,
         ).then(
             fn=_update_module3_interactivity,
             inputs=[model_available_state],
@@ -2432,20 +2658,7 @@ def build_demo() -> gr.Blocks:
         ).then(
             fn=load_from_delta_lake,
             inputs=[delta_lake_explorer, log_output],
-            outputs=[
-                table,
-                log_output,
-                visual_payload_state,
-                csv_download,
-                raw_predictions_state,
-                intermediates_state,
-                delta_dfs_state,
-                tasks_state,
-                score_path_state,
-                edges_state,
-                model_available_state,
-                global_key_field,
-            ],
+            outputs=_data_source_outputs,
         ).then(
             fn=_update_module3_interactivity,
             inputs=[model_available_state],
@@ -2470,9 +2683,13 @@ def build_demo() -> gr.Blocks:
                 edges_state,
                 intermediates_state,
                 global_key_field,
+                tables_state,
                 log_output,
             ],
-            outputs=[table, log_output, visual_payload_state, csv_download],
+            outputs=[
+                table, log_output, visual_payload_state, csv_download,
+                tables_state, table_selector,
+            ],
         )
 
         # ---- Module 2: Save Delta Lake ----
@@ -2494,9 +2711,17 @@ def build_demo() -> gr.Blocks:
                 table,
                 tasks_state,
                 score_path_state,
+                tables_state,
                 log_output,
             ],
-            outputs=[table, log_output, csv_download],
+            outputs=[table, log_output, csv_download, tables_state],
+        )
+
+        # ---- Module 2: Table switching ----
+        table_selector.change(
+            fn=_switch_table,
+            inputs=[table_selector, tables_state, score_path_state],
+            outputs=[table, csv_download],
         )
 
         # ---- Module 2: Refresh Visual ----
@@ -2546,20 +2771,7 @@ def build_demo() -> gr.Blocks:
                 edges_state,
                 log_output,
             ],
-            outputs=[
-                table,
-                log_output,
-                visual_payload_state,
-                csv_download,
-                raw_predictions_state,
-                intermediates_state,
-                delta_dfs_state,
-                tasks_state,
-                score_path_state,
-                edges_state,
-                model_available_state,
-                global_key_field,
-            ],
+            outputs=_data_source_outputs,
         )
 
     return demo

@@ -91,7 +91,7 @@
 
   function renderRnGroup(note) {
     const candidates = note.rn_candidates || [];
-    const fallbackDcml = note.romanNumeral_full || "";
+    const fallbackDcml = note.note_label || "";
     // If no candidates list, show the single Complete RN
     if (candidates.length === 0 && fallbackDcml) {
       return `<div class="agn-section agn-section-rn"><div class="agn-rn-group"><button class="agn-rn-btn agn-rn-active">${escapeHtml(fallbackDcml)}</button></div></div>`;
@@ -506,4 +506,12 @@
   }
 
   render();
+
+  // Auto-resize iframe to fit content (no scrollbar)
+  if (window.frameElement) {
+    new ResizeObserver(function () {
+      var h = document.body.scrollHeight + 24;
+      window.frameElement.style.height = h + "px";
+    }).observe(document.body);
+  }
 })();

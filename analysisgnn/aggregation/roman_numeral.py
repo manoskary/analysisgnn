@@ -219,6 +219,13 @@ def _build_candidate_ohr(
         return None
 
 
+def _flx_to_agnn(name: str) -> str:
+    """Convert FlexOHR pitch notation to AnalysisGNN (``b`` → ``-``)."""
+    if len(name) <= 1:
+        return name
+    return name[0] + name[1:].replace("b", "-")
+
+
 def _derive_validation_labels(ohr: OHR, global_key: str) -> Dict[str, str]:
     """Derive romanNumeral, root, bass, and tonkey labels from a resolved OHR.
 
@@ -237,26 +244,31 @@ def _derive_validation_labels(ohr: OHR, global_key: str) -> Dict[str, str]:
             resolved.components("b", depth=1, tone_function=ToneFunction.root), None
         )
         if root_comp is not None:
-            result["root"] = root_comp.value.name
+            result["root"] = _flx_to_agnn(root_comp.value.name)
 
         # bass
         bass_comp = next(
             resolved.components("b", depth=1, tone_function=ToneFunction.bass), None
         )
         if bass_comp is not None:
-            result["bass"] = bass_comp.value.name
+            result["bass"] = _flx_to_agnn(bass_comp.value.name)
 
         # tonkey
         tonicized = find_scale_by_key_function(resolved, KeyFunction.tonicized)
         if tonicized is not None:
-            result["tonkey"] = tonicized.reference.value.name
+            result["tonkey"] = _flx_to_agnn(tonicized.reference.value.name)
         else:
             local = find_scale_by_key_function(resolved, KeyFunction.local)
             if local is not None:
-                result["tonkey"] = local.reference.value.name
+                result["tonkey"] = _flx_to_agnn(local.reference.value.name)
 
-        # romanNumeral — extract the chord portion of the DCML label
-        dcml = ohr.to_format("dcml")
+        # romanNumeral — root position DCML chord portion (vocab excludes
+        # inversion figures)
+        try:
+            root_pos = ohr.with_(inversion=0)
+            dcml = root_pos.to_format("dcml")
+        except Exception:
+            dcml = ohr.to_format("dcml")
         parts = dcml.split("/")
         if parts:
             result["romanNumeral"] = parts[0]
