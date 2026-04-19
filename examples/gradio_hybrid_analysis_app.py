@@ -958,6 +958,7 @@ def _build_graph_overlay_payload(
     edges_all: Dict[str, List[List[int]]],
     global_key: str = "",
     rn_candidates_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    agg_rn_candidates_maps: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None,
 ) -> Dict[str, Any]:
     """Build the Verovio overlay payload."""
     n = min(len(df), len(note_array))
@@ -1066,6 +1067,14 @@ def _build_graph_overlay_payload(
                     if rn_candidates_map and note_id
                     else []
                 ),
+                "rn_agg_candidates": (
+                    {
+                        agg_label: agg_map.get(str(note_id), [])
+                        for agg_label, agg_map in (agg_rn_candidates_maps or {}).items()
+                    }
+                    if agg_rn_candidates_maps and note_id
+                    else {}
+                ),
             }
         )
 
@@ -1123,6 +1132,7 @@ def _build_visual_payload(
     edges_all: Dict[str, List[List[int]]],
     global_key: str = "",
     rn_candidates_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    agg_rn_candidates_maps: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None,
 ) -> Dict[str, Any]:
     note_array = _sorted_note_array(score)
     payload = _build_graph_overlay_payload(
@@ -1133,6 +1143,7 @@ def _build_visual_payload(
         edges_all=edges_all,
         global_key=global_key,
         rn_candidates_map=rn_candidates_map,
+        agg_rn_candidates_maps=agg_rn_candidates_maps,
     )
     payload["score_xml"] = _read_score_xml_text(score_path, score)
     payload["score_format"] = "musicxml"
@@ -1784,17 +1795,19 @@ def run_aggregation(
     global_key_text: str,
     tables_state_val: Any,
     log_text: str,
+    agg_rn_candidates_state_val: Any = None,
 ):
     """Apply an aggregation strategy.  Produces a group-level table and adds
     a label column to the notes table.
 
     Returns: (display_df, log_text, visual_payload, csv_path,
-              tables_state, table_selector_update)
+              tables_state, table_selector_update, agg_rn_candidates)
     """
     try:
         resolved_name = _resolve_strategy_name(group_name, strategy_name)
         tasks = tasks_state or []
         delta_dfs = delta_dfs_state or {}
+        agg_rn_cands = dict(agg_rn_candidates_state_val) if agg_rn_candidates_state_val else {}
         intermediates = intermediates_state or {}
         global_key = (global_key_text or "").strip()
         tables = dict(tables_state_val) if tables_state_val else {}
@@ -1829,6 +1842,7 @@ def run_aggregation(
             return (
                 notes_df, log_text, {}, csv_path, tables,
                 gr.update(choices=choices, value=DEFAULT_TABLE_LABEL),
+                agg_rn_cands,
             )
 
         # Run aggregation (with cache)
@@ -1882,36 +1896,45 @@ def run_aggregation(
         # Store group-level table
         tables[table_display_name] = group_df
 
-        # Build visual payload from aggregated note df
-        score_obj = intermediates.get("score")
-        note_array = intermediates.get("note_array")
-        score_path = score_path_state or intermediates.get("score_path", "")
-        edges_all = edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES}
-        visual_payload = {}
-        if score_obj is not None and note_array is not None and score_path:
-            visual_payload = _build_visual_payload(
-                score_path=score_path,
-                score=score_obj,
-                df=agg_note_df,
-                tasks=tasks,
-                edge_types=[],
-                edges_all=edges_all,
-                global_key=global_key,
-            )
+        # Enumerate group-level RN candidates for Verovio
+        if global_key and delta_dfs.get("probs_df") is not None:
+            try:
+                grp_cands_map = _enumerate_rn_candidates(
+                    display_df=notes_df,
+                    probs_df=delta_dfs["probs_df"],
+                    notes_df=delta_dfs["notes_df"],
+                    hyperedges_df=delta_dfs["hyperedges_df"],
+                    global_key=global_key,
+                    grouping=group_lower,
+                )
+                agg_rn_cands[table_display_name] = grp_cands_map
+                log_text = _log(
+                    log_text,
+                    f"Enumerated {table_display_name} RN candidates for "
+                    f"{len(grp_cands_map)} notes.",
+                )
+            except Exception as enum_exc:
+                log_text = _log(
+                    log_text,
+                    f"Group RN enumeration failed: {enum_exc}",
+                )
 
-        csv_path = _write_csv_to_temp(notes_df, score_path)
+        csv_path = _write_csv_to_temp(notes_df, score_path_state)
         choices = list(tables.keys())
         return (
-            notes_df, log_text, visual_payload, csv_path, tables,
+            notes_df, log_text, {}, csv_path, tables,
             gr.update(choices=choices, value=DEFAULT_TABLE_LABEL),
+            agg_rn_cands,
         )
     except Exception as exc:
         log_text = _log(log_text, f"Aggregation error: {exc}")
         tables = dict(tables_state_val) if tables_state_val else {}
+        agg_rn_cands = dict(agg_rn_candidates_state_val) if agg_rn_candidates_state_val else {}
         choices = list(tables.keys()) or [DEFAULT_TABLE_LABEL]
         return (
             pd.DataFrame(), log_text, {}, None, tables,
             gr.update(choices=choices),
+            agg_rn_cands,
         )
 
 
@@ -2209,6 +2232,8 @@ def refresh_visual_tab(
     edges_state: Any,
     log_text: str,
     delta_dfs_state: Any = None,
+    agg_rn_candidates: Any = None,
+    tables_state_val: Any = None,
 ):
     try:
         selected_edge_types = [
@@ -2235,7 +2260,14 @@ def refresh_visual_tab(
             note_array = intermediates.get("note_array")
             score_path = intermediates.get("score_path", "")
 
-        df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
+        # Prefer the canonical notes DataFrame from tables_state (keeps column
+        # names intact); fall back to the Gradio table component if absent.
+        tables_val = tables_state_val if isinstance(tables_state_val, dict) else {}
+        notes_from_state = tables_val.get(DEFAULT_TABLE_LABEL)
+        if isinstance(notes_from_state, pd.DataFrame) and not notes_from_state.empty:
+            df = notes_from_state.copy()
+        else:
+            df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
 
         if score_obj is not None and note_array is not None and len(df) > 0:
             # Check note-count mismatch between score and predictions
@@ -2247,29 +2279,35 @@ def refresh_visual_tab(
                     f"Warning: score has {n_score} notes but predictions table has {n_table} rows. "
                     f"Rendering min({n_score}, {n_table}) notes; overlay alignment may be approximate.",
                 )
-            # Enumerate RN candidates if Delta Lake data is available
+            # Enumerate note-wise RN candidates (always grouping="none")
             rn_cands_map = None
             delta_dfs = delta_dfs_state if isinstance(delta_dfs_state, dict) else {}
             if global_key and delta_dfs.get("probs_df") is not None:
                 try:
-                    rn_grouping = (aggregation_group or "none").strip().lower()
                     rn_cands_map = _enumerate_rn_candidates(
                         display_df=df,
                         probs_df=delta_dfs["probs_df"],
                         notes_df=delta_dfs["notes_df"],
                         hyperedges_df=delta_dfs["hyperedges_df"],
                         global_key=global_key,
-                        grouping=rn_grouping,
+                        grouping="none",
                     )
                     log_text = _log(
                         log_text,
-                        f"Enumerated RN candidates for {len(rn_cands_map)} notes.",
+                        f"Enumerated note-wise RN candidates for {len(rn_cands_map)} notes.",
                     )
                 except Exception as enum_exc:
                     log_text = _log(
                         log_text,
                         f"RN enumeration failed: {enum_exc}",
                     )
+
+            # Accumulated aggregation-level candidates from state
+            agg_cands = (
+                agg_rn_candidates
+                if isinstance(agg_rn_candidates, dict)
+                else {}
+            )
 
             payload = _build_visual_payload(
                 score_path=score_path,
@@ -2280,6 +2318,7 @@ def refresh_visual_tab(
                 edges_all=edges_all,
                 global_key=global_key,
                 rn_candidates_map=rn_cands_map,
+                agg_rn_candidates_maps=agg_cands,
             )
             # Apply NCT coloring
             if nct_color:
@@ -2403,6 +2442,7 @@ def build_demo() -> gr.Blocks:
         iterative_steps = gr.State(10)
         keep_percentile_per_step = gr.State(10.0)
         tables_state = gr.State({})  # display_name -> DataFrame
+        agg_rn_candidates_state = gr.State({})  # agg_label -> {note_id -> candidates}
 
         # ==================================================================
         # MODULE 1: DATA SOURCE
@@ -2697,10 +2737,12 @@ def build_demo() -> gr.Blocks:
                 global_key_field,
                 tables_state,
                 log_output,
+                agg_rn_candidates_state,
             ],
             outputs=[
                 table, log_output, visual_payload_state, csv_download,
                 tables_state, table_selector,
+                agg_rn_candidates_state,
             ],
         )
 
@@ -2753,6 +2795,8 @@ def build_demo() -> gr.Blocks:
                 edges_state,
                 log_output,
                 delta_dfs_state,
+                agg_rn_candidates_state,
+                tables_state,
             ],
             outputs=[visual_html, log_output, visual_payload_state],
         )

@@ -86,31 +86,67 @@
     return `<div class="agn-section"><div class="agn-section-title">${escapeHtml(title)}</div>${content}</div>`;
   }
 
-  // Track which RN candidate is active (for future multi-candidate support)
-  let activeRnIndex = 0;
+  // Track which RN candidate group and index are active for agreement coloring.
+  // activeRnGroup: "note" for note-wise, or an aggregation label (e.g., "Measures (Mean)")
+  // activeRnIndices: per-group index, e.g., {"note": 0, "Measures (Mean)": 1}
+  let activeRnGroup = "note";
+  let activeRnIndices = {};
 
-  function renderRnGroup(note) {
-    const candidates = note.rn_candidates || [];
-    const fallbackDcml = note.note_label || "";
-    // If no candidates list, show the single Complete RN
-    if (candidates.length === 0 && fallbackDcml) {
-      return `<div class="agn-section agn-section-rn"><div class="agn-rn-group"><button class="agn-rn-btn agn-rn-active">${escapeHtml(fallbackDcml)}</button></div></div>`;
-    }
+  function _getGroupCandidates(note, groupKey) {
+    if (groupKey === "note") return note.rn_candidates || [];
+    const agg = note.rn_agg_candidates || {};
+    return agg[groupKey] || [];
+  }
+
+  function _renderCandidateRow(groupKey, candidates, label) {
     if (candidates.length === 0) return "";
+    const idx = activeRnIndices[groupKey] || 0;
     let btns = "";
     for (let i = 0; i < candidates.length; i++) {
       const c = candidates[i];
-      const active = i === activeRnIndex ? " agn-rn-active" : "";
+      const active = (groupKey === activeRnGroup && i === idx) ? " agn-rn-active" : "";
       const scoreStr = c.score != null ? `<span class="agn-rn-score">${Number(c.score).toFixed(3)}</span>` : "";
-      btns += `<button class="agn-rn-btn${active}" data-rn-idx="${i}">${escapeHtml(c.dcml)}${scoreStr}</button>`;
+      btns += `<button class="agn-rn-btn${active}" data-rn-group="${escapeHtml(groupKey)}" data-rn-idx="${i}">${escapeHtml(c.dcml)}${scoreStr}</button>`;
     }
-    return `<div class="agn-section agn-section-rn"><div class="agn-rn-group">${btns}</div></div>`;
+    const header = label ? `<div class="agn-rn-row-label">${escapeHtml(label)}</div>` : "";
+    return `<div class="agn-rn-row">${header}<div class="agn-rn-group">${btns}</div></div>`;
+  }
+
+  function renderRnGroup(note) {
+    const noteCands = note.rn_candidates || [];
+    const aggCands = note.rn_agg_candidates || {};
+    const aggKeys = Object.keys(aggCands).filter(function (k) { return aggCands[k] && aggCands[k].length > 0; });
+    const fallbackDcml = note.note_label || "";
+
+    // No candidates at all — show fallback label
+    if (noteCands.length === 0 && aggKeys.length === 0) {
+      if (fallbackDcml) {
+        return `<div class="agn-section agn-section-rn"><div class="agn-rn-group"><button class="agn-rn-btn agn-rn-active">${escapeHtml(fallbackDcml)}</button></div></div>`;
+      }
+      return "";
+    }
+
+    let html = "";
+    // Note-wise candidates (always first)
+    const noteLabel = aggKeys.length > 0 ? "Note" : "";
+    html += _renderCandidateRow("note", noteCands, noteLabel);
+    // Aggregation candidates (one row per aggregation)
+    for (const aggKey of aggKeys) {
+      html += _renderCandidateRow(aggKey, aggCands[aggKey], aggKey);
+    }
+    return `<div class="agn-section agn-section-rn">${html}</div>`;
   }
 
   function getActiveExpected(note) {
-    const candidates = note.rn_candidates || [];
-    if (candidates.length > 0 && candidates[activeRnIndex]) {
-      return candidates[activeRnIndex].expected || {};
+    const candidates = _getGroupCandidates(note, activeRnGroup);
+    const idx = activeRnIndices[activeRnGroup] || 0;
+    if (candidates.length > 0 && candidates[idx]) {
+      return candidates[idx].expected || {};
+    }
+    // Fallback: try note-wise candidates
+    const noteCands = note.rn_candidates || [];
+    if (noteCands.length > 0 && noteCands[0]) {
+      return noteCands[0].expected || {};
     }
     return note.rn_expected || {};
   }
@@ -224,11 +260,13 @@
 
     // Attach click handlers for RN candidate buttons
     panelEl.currentNote = note;
-    for (const btn of panelEl.querySelectorAll(".agn-rn-btn[data-rn-idx]")) {
+    for (const btn of panelEl.querySelectorAll(".agn-rn-btn[data-rn-group]")) {
       btn.addEventListener("click", function () {
+        const group = this.dataset.rnGroup;
         const idx = Number(this.dataset.rnIdx);
-        if (idx !== activeRnIndex) {
-          activeRnIndex = idx;
+        if (group !== activeRnGroup || idx !== (activeRnIndices[group] || 0)) {
+          activeRnGroup = group;
+          activeRnIndices[group] = idx;
           renderPanel(panelEl.currentNote);
         }
       });
@@ -497,6 +535,9 @@
 
       for (const [noteIndex, item] of noteMap.entries()) {
         item.noteGroup.addEventListener("click", () => {
+          // Reset candidate selection to first candidate in "note" group
+          activeRnGroup = "note";
+          activeRnIndices = {"note": 0};
           setActiveNote(noteIndex);
           highlightIncident(noteIndex);
           renderPanel(item.note);

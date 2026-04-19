@@ -123,6 +123,23 @@
   padding-bottom: 8px;
 }
 
+.agn-rn-row {
+  margin-bottom: 6px;
+}
+
+.agn-rn-row:last-child {
+  margin-bottom: 0;
+}
+
+.agn-rn-row-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+
 .agn-rn-group {
   display: flex;
   gap: 0;
