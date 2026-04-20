@@ -184,21 +184,23 @@ def _build_candidate_ohr(
         if not _is_legal_inversion(quality, inv):
             return None
 
-        # Key context
-        lk_coll = infer_collection_type(localkey_label)
+        # Key context.  AnalysisGNN uses "-" for flat (e.g. "A-"); FlexOHR
+        # expects "b" (e.g. "Ab") — normalise before parsing.
+        lk_flx = localkey_label.replace("-", "b")
+        lk_coll = infer_collection_type(lk_flx)
         has_tonicization = degree2_label not in ("None", "")
 
         if has_tonicization:
             sd2 = SD.from_int(int(float(degree2_label)), collection_type=lk_coll)
             ref_ohr = build_key_context(
                 global_key,
-                localkey_label,
+                lk_flx,
                 tonicized_key=sd2,
                 tonicized_coll=_CT.major,
             )
             tonic_coll = _CT.major
         else:
-            ref_ohr = build_key_context(global_key, localkey_label)
+            ref_ohr = build_key_context(global_key, lk_flx)
             tonic_coll = lk_coll
 
         degree1_sd = SD.from_int(int(float(degree1_label)), collection_type=tonic_coll)
@@ -262,10 +264,15 @@ def _derive_validation_labels(ohr: OHR, global_key: str) -> Dict[str, str]:
             if local is not None:
                 result["tonkey"] = _flx_to_agnn(local.reference.value.name)
 
-        # romanNumeral — root position DCML chord portion (vocab excludes
-        # inversion figures)
+        # romanNumeral — root-position DCML chord portion (vocab excludes
+        # inversion figures).  Inversion is a property of the inner chord
+        # OHR (ohr.ohr()), so we must descend to the chord leaf before
+        # overriding it — ohr.with_(inversion=...) on the outer OHR is a
+        # no-op.
         try:
-            root_pos = ohr.with_(inversion=0)
+            from flexohr.harmony.harmony_enums import Inversion as _Inv
+            chord_inner = ohr.ohr()
+            root_pos = chord_inner.with_(inversion=_Inv.from_format("0", "analysisgnn"))
             dcml = root_pos.to_format("dcml")
         except Exception:
             dcml = ohr.to_format("dcml")

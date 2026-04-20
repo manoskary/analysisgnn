@@ -466,6 +466,46 @@ def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
     return out
 
 
+def _apply_localkey_mode_map_to_probs(
+    probs_df: pd.DataFrame,
+    mode_map: Dict[str, str],
+    tasks: Tuple[str, ...] = ("localkey", "tonkey"),
+) -> pd.DataFrame:
+    """Rewrite ``class_label`` in *probs_df* for the given *tasks* according
+    to *mode_map*, merging the resulting duplicate rows by summing
+    probabilities.
+
+    Used to transfer the model's probability mass from an under-confident
+    mode variant (e.g. ``"F"`` major) onto the mode-corrected label
+    (``"f"`` minor) so downstream scoring reflects the heuristic correction
+    applied to the display table.
+    """
+    subs = {k: v for k, v in (mode_map or {}).items() if k != v}
+    if not subs:
+        return probs_df
+
+    df = probs_df.copy()
+    task_mask = df["task"].isin(tasks)
+    df.loc[task_mask, "class_label"] = (
+        df.loc[task_mask, "class_label"].replace(subs)
+    )
+
+    # Merge duplicate (note_id, task, class_label) rows.  is_argmax / rank
+    # are not used downstream by the scorer's distribution_matrix pivot, so
+    # we only need the probability sum to be correct.
+    key_cols = ["note_id", "task", "class_label"]
+    dup_mask = df.duplicated(key_cols, keep=False)
+    if dup_mask.any():
+        agg: Dict[str, Any] = {"probability": "sum"}
+        for c in df.columns:
+            if c in key_cols or c == "probability":
+                continue
+            agg[c] = "first"
+        merged = df[dup_mask].groupby(key_cols, as_index=False, sort=False).agg(agg)
+        df = pd.concat([df[~dup_mask], merged], ignore_index=True)
+    return df
+
+
 def _enumerate_rn_candidates(
     display_df: pd.DataFrame,
     probs_df: pd.DataFrame,
@@ -490,7 +530,12 @@ def _enumerate_rn_candidates(
 
     gk = _agnn_to_flx_pitch(global_key)
 
-    # Build localkey mode map from display_df (which has correct case from _fix_key_mode)
+    # Build localkey mode map from display_df (which has correct case from
+    # _fix_key_mode).  Map keys and values use the AnalysisGNN format
+    # (e.g. "A-" for Ab) — matching the class_label column in probs_df so
+    # that the map can be applied directly to the probability table.
+    # _build_candidate_ohr handles the final "-" → "b" normalisation for
+    # FlexOHR.
     localkey_mode_map: Dict[str, str] = {}
     if "localkey" in display_df.columns:
         for lk in display_df["localkey"].dropna().unique():
@@ -498,17 +543,26 @@ def _enumerate_rn_candidates(
             if lk_str:
                 # Map uppercase key → mode-corrected key (e.g. "F" → "f")
                 lk_upper = lk_str.upper()
-                # FlexOHR uses "b" for flats; display uses "-"
-                lk_flx = lk_str.replace("-", "b")
-                lk_upper_flx = lk_upper.replace("-", "b")
-                localkey_mode_map[lk_upper_flx] = lk_flx
+                localkey_mode_map[lk_upper] = lk_str
+
+    # The model's key head is often under-confident about mode (outputs
+    # "F" with high probability when the piece is really "f" minor).  The
+    # _fix_key_mode heuristic gives us a per-piece correction ("F" → "f"),
+    # but applying it only to the candidate labels (not to the probabilities)
+    # makes the mode-corrected label score its own under-confident mass
+    # (e.g. P("f") ≈ 0.003) while a competing un-corrected major key like
+    # P("C") = 0.008 wins.  Reassign each mapped label's probability mass to
+    # the corrected label so scoring sees P("f") = P("F") + P("f").
+    probs_for_scoring = _apply_localkey_mode_map_to_probs(
+        probs_df, localkey_mode_map
+    )
 
     # Build full scoring context from Delta-style DataFrames
     edges_df = pd.DataFrame({"src": pd.Series(dtype=str), "dst": pd.Series(dtype=str), "edge_type": pd.Series(dtype=str)})
     ctx = ScoringContext(
         note_ids=list(notes_df["note_id"]),
         notes=notes_df,
-        probabilities=probs_df,
+        probabilities=probs_for_scoring,
         edges=edges_df,
     )
 
@@ -1056,11 +1110,6 @@ def _build_graph_overlay_payload(
                 "note_label": str(rn_full.iloc[idx])
                 if idx < len(rn_full)
                 else "",
-                "agg_labels": {
-                    col: str(_value_or_none(row.get(col)) or "")
-                    for col in data.columns
-                    if col.endswith("_label") and col != "note_label"
-                },
                 "rn_expected": expected_labels[idx] if idx < len(expected_labels) else {},
                 "rn_candidates": (
                     rn_candidates_map.get(str(note_id), [])
