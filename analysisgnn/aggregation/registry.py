@@ -41,7 +41,7 @@ def list_strategies() -> List[str]:
 
 
 def _register_builtins() -> None:
-    from analysisgnn.aggregation.mean import MeanAggregation
+    from analysisgnn.aggregation.mean import GroupedMeanAggregation, MeanAggregation
 
     # Import here to avoid circular imports; the NoneAggregation is defined
     # inline to keep things simple.
@@ -54,6 +54,23 @@ def _register_builtins() -> None:
 
     register("none", NoneAggregation)
     register("mean", MeanAggregation)
+
+    # Single-level grouped mean strategies
+    class OnsetMeanAggregation(GroupedMeanAggregation):
+        def __init__(self):
+            super().__init__(level="onset")
+
+    class BeatMeanAggregation(GroupedMeanAggregation):
+        def __init__(self):
+            super().__init__(level="beat")
+
+    class MeasureMeanAggregation(GroupedMeanAggregation):
+        def __init__(self):
+            super().__init__(level="measure")
+
+    register("onset_mean", OnsetMeanAggregation)
+    register("beat_mean", BeatMeanAggregation)
+    register("measure_mean", MeasureMeanAggregation)
 
 
 def _argmax_summary_from_probs(

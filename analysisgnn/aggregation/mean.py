@@ -362,3 +362,51 @@ def _to_argmax_summary(
             result = result.merge(label_df, on="note_id", how="left")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Single-level grouped mean aggregation
+# ---------------------------------------------------------------------------
+
+
+class GroupedMeanAggregation(AggregationStrategy):
+    """Mean aggregation at a single hyperedge grouping level.
+
+    Unlike :class:`MeanAggregation` which runs the full onset → beat →
+    measure pipeline, this strategy applies mean aggregation at exactly one
+    grouping level (e.g., only onset, only beat, only measure) for **all**
+    requested tasks, with chord-tone filtering.
+
+    Parameters
+    ----------
+    level : str
+        Hyperedge type to group by (``"onset"``, ``"beat"``, ``"measure"``).
+    """
+
+    def __init__(self, level: str) -> None:
+        self.level = level
+
+    def aggregate(
+        self,
+        probabilities: pd.DataFrame,
+        notes: pd.DataFrame,
+        hyperedges: pd.DataFrame,
+        metadata: dict,
+        tasks: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        all_tasks = probabilities["task"].unique().tolist()
+        if tasks is not None:
+            all_tasks = [t for t in tasks if t in all_tasks]
+
+        prob_wide = _build_prob_matrices(probabilities, all_tasks)
+        chord_tone_mask = _get_chord_tone_mask(prob_wide)
+        groups = _get_group_membership(hyperedges, self.level)
+        note_ids = notes["note_id"].tolist()
+
+        for task in all_tasks:
+            if task in prob_wide:
+                prob_wide[task] = _groupwise_mean_broadcast(
+                    prob_wide[task], groups, chord_tone_mask, note_ids,
+                )
+
+        return _to_argmax_summary(prob_wide, notes, all_tasks, probabilities)

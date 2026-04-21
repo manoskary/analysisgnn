@@ -95,6 +95,14 @@ EDGE_LABELS = {
     "during": "During",
     "rest": "Rest",
 }
+# Group naming for multi-table aggregation UI
+GROUP_NAMES: Dict[str, Tuple[str, str]] = {
+    "none": ("note", "Notes"),
+    "onset": ("onset", "Onsets"),
+    "beat": ("beat", "Beats"),
+    "measure": ("measure", "Measures"),
+}
+DEFAULT_TABLE_LABEL = "Notes (None)"
 
 
 # ---------------------------------------------------------------------------
@@ -219,30 +227,103 @@ def _prepare_prediction_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
         if numeric.notna().any():
             out[col] = numeric.round(3)
 
-    if "romanNumeral_full" in out.columns:
-        cols = [col for col in out.columns if col != "romanNumeral_full"]
-        if "pitch_midi" in cols:
-            insert_at = cols.index("pitch_midi") + 1
-        elif "cadence" in cols:
-            insert_at = cols.index("cadence")
+    # Collect all label columns: note_label first, then any *_label columns
+    label_cols = []
+    if "note_label" in out.columns:
+        label_cols.append("note_label")
+    label_cols.extend(
+        c for c in out.columns if c.endswith("_label") and c != "note_label"
+    )
+    if label_cols:
+        other_cols = [c for c in out.columns if c not in label_cols]
+        if "pitch_midi" in other_cols:
+            insert_at = other_cols.index("pitch_midi") + 1
+        elif "cadence" in other_cols:
+            insert_at = other_cols.index("cadence")
         else:
-            insert_at = len(cols)
-        cols.insert(insert_at, "romanNumeral_full")
-        out = out[cols]
+            insert_at = len(other_cols)
+        for i, lc in enumerate(label_cols):
+            other_cols.insert(insert_at + i, lc)
+        out = out[other_cols]
 
     return out
 
+_GLOBAL_KEY_K = 5
 
-def _derive_global_key(df: pd.DataFrame) -> str:
-    """Derive the global key from tonic chords (``romanNumeral`` is ``"I"``
-    or ``"i"``).
+_KEY_TASKS = ("localkey", "tonkey")
 
-    Finds the most frequent localkey pitch class (case-insensitive) among
-    tonic chords, then infers major/minor mode from the ``"I"`` vs ``"i"``
-    counts via :func:`_infer_key_mode`.
 
-    Returns an SPC-compatible string — uppercase for major (e.g. ``"G"``),
-    lowercase for minor (e.g. ``"c"``).
+def _fix_key_mode(df: pd.DataFrame) -> pd.DataFrame:
+    """Correct the case of ``localkey`` and ``tonkey`` predictions in-place.
+
+    The model's 50-class key vocabulary encodes mode via case (uppercase =
+    major, lowercase = minor), but the softmax argmax does not reliably
+    land on the correct case variant.  This function infers the true mode
+    from the ``romanNumeral`` column: within each key pitch-class group,
+    if the count of minor-tonic chords (``"i"``) is not lower than the
+    count of major-tonic chords (``"I"``), all occurrences of that key are
+    lowercased (= minor).
+
+    The correction is applied to every key-task column present in *df*
+    (``localkey``, ``tonkey``).
+
+    Returns *df* (modified in-place) for chaining convenience.
+
+    .. note::
+        This is a workaround for a model deficiency — the localkey/tonkey
+        softmax does not reliably separate major from minor classes for the
+        same pitch class.  Remove this function once the model outputs have
+        been fixed (e.g. by retraining with a loss that penalises mode
+        confusion, or by collapsing major/minor into a single pitch-class
+        prediction and inferring mode from a separate head).
+    """
+    if df is None or len(df) == 0:
+        return df
+    if "romanNumeral" not in df.columns:
+        return df
+
+    key_cols = [c for c in _KEY_TASKS if c in df.columns]
+    if not key_cols:
+        return df
+
+    tonic_mask = df["romanNumeral"].isin(["I", "i"])
+    if not tonic_mask.any():
+        return df
+
+    for col in key_cols:
+        tonic_rows = df.loc[tonic_mask, [col, "romanNumeral"]].copy()
+        tonic_rows["_pc"] = tonic_rows[col].astype(str).str.upper()
+        minor_mode: dict[str, bool] = {}
+        for pc, grp in tonic_rows.groupby("_pc"):
+            n_minor = int((grp["romanNumeral"] == "i").sum())
+            n_major = int((grp["romanNumeral"] == "I").sum())
+            minor_mode[str(pc)] = not (n_minor < n_major)
+
+        vals = df[col].astype(str).values.copy()
+        for i, v in enumerate(vals):
+            if not v or v == "None":
+                continue
+            pc = v.upper()
+            if pc in minor_mode and minor_mode[pc]:
+                vals[i] = v[0].lower() + v[1:]
+        df[col] = vals
+
+    return df
+
+
+def _derive_global_key(df: pd.DataFrame, k: int = _GLOBAL_KEY_K) -> str:
+    """Derive the global key from the first *k* tonic chords.
+
+    Takes the first *k* rows (in score order) where ``romanNumeral`` is
+    ``"I"`` or ``"i"`` and lets their ``localkey`` values vote.  Grouping
+    is case-insensitive (so ``"C"`` and ``"c"`` count toward the same
+    pitch class); among the winning pitch class the most frequent cased
+    variant determines the mode.
+
+    Using only the first *k* tonics avoids bias from extended middle
+    sections whose key may outnumber the main key's tonic chords.
+
+    Returns the raw ``localkey`` string (e.g. ``"G"``, ``"c"``, ``"A-"``).
 
     Raises
     ------
@@ -258,25 +339,32 @@ def _derive_global_key(df: pd.DataFrame) -> str:
             "and/or 'localkey' columns."
         )
     mask = df["romanNumeral"].isin(["I", "i"])
-    candidates = df.loc[mask, ["romanNumeral", "localkey"]].copy()
+    candidates = df.loc[mask, "localkey"].astype(str).head(k)
     if len(candidates) == 0:
         raise ValueError(
             "Cannot derive global key: no rows with romanNumeral 'I' or 'i'."
         )
-    # Find the most frequent localkey pitch class (case-insensitive)
-    candidates["_lk_upper"] = candidates["localkey"].astype(str).str.upper()
-    lk_counts = candidates["_lk_upper"].value_counts()
-    best_lk_upper = str(lk_counts.index[0])
+    # Group by pitch class (case-insensitive) to find the winning tonic
+    lk_upper = candidates.str.upper()
+    best_pc = str(lk_upper.value_counts().index[0])
+    # Among those, take the most frequent cased variant for mode.
+    pc_mask = lk_upper == best_pc
+    return str(candidates[pc_mask].value_counts().index[0])
 
-    # Infer mode from all tonic chords in this key
-    best_mask = candidates["_lk_upper"] == best_lk_upper
-    mode = _infer_key_mode(candidates.loc[best_mask, "romanNumeral"])
-    if mode is None:
-        mode = "major"
 
-    best_lk_raw = str(candidates.loc[best_mask, "localkey"].iloc[0])
-    lk = _agnn_to_flx_pitch(best_lk_raw)
-    return _apply_key_mode(lk, mode)
+def _format_dcml_with_global_key(dcml: str, global_key: str) -> str:
+    """Reformat a FlexOHR DCML string to show the global key as a prefix.
+
+    FlexOHR's ``OHR.to_format('dcml')`` produces ``V7/I/G`` (global key
+    last).  This function reformats to ``G: V7/I`` (global key first,
+    separated by colon + space).
+    """
+    parts = dcml.split("/")
+    if len(parts) < 2:
+        return f"{global_key}: {dcml}"
+    # The last segment is the global key — drop it and use the explicit
+    # global_key parameter (which preserves the user's chosen mode/case).
+    return f"{global_key}: {'/'.join(parts[:-1])}"
 
 
 def _agnn_to_flx_pitch(name: str) -> str:
@@ -288,151 +376,317 @@ def _agnn_to_flx_pitch(name: str) -> str:
     return name.replace("-", "b")
 
 
-def _infer_key_mode(roman_numerals: pd.Series) -> Optional[str]:
-    """Infer major/minor key mode from tonic Roman numeral counts.
+def _prepare_df_for_flexohr(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare a prediction DataFrame for FlexOHR consumption.
 
-    Counts ``"I"`` (major tonic) vs ``"i"`` (minor tonic) in the given
-    series.  Returns ``"major"`` or ``"minor"`` based on which is more
-    frequent, or ``None`` if neither is found.
+    Normalises string ``"None"`` to NaN in ``degree2`` and converts numeric
+    task columns (``degree1``, ``degree2``, ``inversion``) from strings to
+    floats, as ``build_ohrs_from_dataframe`` expects.  Also normalises
+    pitch-class strings (``localkey``, ``tonkey``) from ``-`` to ``b``.
     """
-    if roman_numerals is None or len(roman_numerals) == 0:
-        return None
-    n_major = int((roman_numerals == "I").sum())
-    n_minor = int((roman_numerals == "i").sum())
-    if n_major == 0 and n_minor == 0:
-        return None
-    return "minor" if n_minor > n_major else "major"
+    work = df.copy()
+    # degree2: string "None" -> NaN
+    if "degree2" in work.columns:
+        work["degree2"] = work["degree2"].replace({"None": np.nan, "": np.nan})
+        work["degree2"] = pd.to_numeric(work["degree2"], errors="coerce")
+    # degree1, inversion: ensure numeric
+    for col in ("degree1", "inversion"):
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+    # Normalise pitch-class columns
+    for col in ("localkey", "tonkey"):
+        if col in work.columns:
+            work[col] = work[col].astype(str).str.replace("-", "b", regex=False)
+    return work
 
 
-def _apply_key_mode(key_str: str, mode: str) -> str:
-    """Adjust the case of a key string to encode the given mode.
+def _build_ohrs_check(df: pd.DataFrame, global_key: str) -> None:
+    """Validate preconditions for OHR construction.
 
-    ``"major"`` -> uppercase first character, ``"minor"`` -> lowercase
-    first character.  Accidentals (``#``, ``b``) are left unchanged.
+    Raises
+    ------
+    ValueError
+        If *global_key* is empty, *df* is empty, or required columns are
+        missing.
     """
-    if not key_str:
-        return key_str
-    if mode == "minor":
-        return key_str[0].lower() + key_str[1:]
-    return key_str[0].upper() + key_str[1:]
-
-
-def _build_localkey_mode_map(df: pd.DataFrame) -> Dict[str, str]:
-    """Build a mapping from localkey pitch class to inferred mode.
-
-    Groups rows by localkey pitch class (case-insensitive) and counts
-    ``"I"`` vs ``"i"`` in the ``romanNumeral`` column to determine
-    whether each local key is major or minor.
-
-    Returns
-    -------
-    Dict[str, str]
-        Keys are uppercased localkey strings (e.g. ``"G"``, ``"C#"``,
-        ``"A-"``); values are ``"major"`` or ``"minor"``.
-    """
+    if not global_key:
+        raise ValueError("Cannot build OHRs: global_key is required.")
     if df is None or len(df) == 0:
-        return {}
-    if "localkey" not in df.columns or "romanNumeral" not in df.columns:
-        return {}
-    result: Dict[str, str] = {}
-    work = df[["localkey", "romanNumeral"]].copy()
-    work["_lk_upper"] = work["localkey"].astype(str).str.upper()
-    for lk_upper, group in work.groupby("_lk_upper"):
-        mode = _infer_key_mode(group["romanNumeral"])
-        if mode is None:
-            # TODO: FlexOHR will be able to infer the mode from the scale
-            # degree and global-key mode in this case in the future.
-            mode = "major"
-        result[str(lk_upper)] = mode
-    return result
+        raise ValueError("Cannot build OHRs: DataFrame is empty.")
+    required = ["degree1", "degree2", "inversion", "quality", "localkey"]
+    missing = [k for k in required if k not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Cannot build OHRs: missing columns {missing}."
+        )
+
+
+def _build_ohrs(df: pd.DataFrame, global_key: str) -> list:
+    """Build OHRs from a prediction DataFrame using FlexOHR's bulk builder.
+
+    Returns a list of OHRs (one per row).  Validates preconditions first,
+    then delegates to ``build_ohrs_from_dataframe``.
+    """
+    _build_ohrs_check(df, global_key)
+    gk = _agnn_to_flx_pitch(global_key)
+    work = _prepare_df_for_flexohr(df)
+    return flx.codecs.analysisgnn.build_ohrs_from_dataframe(work, gk)
 
 
 def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
     """Build the Complete RN column using FlexOHR OHR objects.
 
-    Each row's five principal task predictions (degree1, degree2, inversion,
+    Each row's principal task predictions (degree1, degree2, inversion,
     quality, localkey) are used to construct a FlexOHR OHR, which is then
     rendered via ``.to_format('dcml')``.
 
-    The mode (major/minor) of each local key is **not** taken from the
-    case of the ``localkey`` prediction directly.  Instead, it is inferred
-    from the ``romanNumeral`` predictions: within all rows that share the
-    same localkey pitch class, the counts of ``"I"`` (major tonic) vs
-    ``"i"`` (minor tonic) determine the mode.  This is the same principle
-    used by :func:`_derive_global_key` for the global key.
+    Structural failures (empty global key, missing columns) raise.
+    Per-row failures (e.g. NaN degree values for individual notes) produce
+    empty strings — these are data-quality issues, not programming errors.
     """
     if df is None or len(df) == 0:
         return pd.Series(dtype=object)
-    required = ["degree1", "degree2", "inversion", "quality", "localkey"]
-    missing = [k for k in required if k not in df.columns]
-    if missing:
-        return pd.Series([""] * len(df), index=df.index, dtype=object)
+    # Validate structural preconditions (raises on failure)
+    _build_ohrs_check(df, global_key)
+
+    gk = _agnn_to_flx_pitch(global_key)
+    work = _prepare_df_for_flexohr(df)
+
+    # Identify rows with valid numeric core columns (NaN = no label)
+    core_numeric = ["degree1", "inversion"]
+    valid_mask = work[core_numeric].notna().all(axis=1)
+
+    out = pd.Series("", index=df.index, dtype=object)
+    valid_df = work.loc[valid_mask]
+    if len(valid_df) > 0:
+        ohrs = flx.codecs.analysisgnn.build_ohrs_from_dataframe(valid_df, gk)
+        for ohr, idx in zip(ohrs, valid_df.index):
+            dcml = ohr.to_format("dcml")
+            out.at[idx] = _format_dcml_with_global_key(dcml, global_key)
+    return out
+
+
+def _apply_localkey_mode_map_to_probs(
+    probs_df: pd.DataFrame,
+    mode_map: Dict[str, str],
+    tasks: Tuple[str, ...] = ("localkey", "tonkey"),
+) -> pd.DataFrame:
+    """Rewrite ``class_label`` in *probs_df* for the given *tasks* according
+    to *mode_map*, merging the resulting duplicate rows by summing
+    probabilities.
+
+    Used to transfer the model's probability mass from an under-confident
+    mode variant (e.g. ``"F"`` major) onto the mode-corrected label
+    (``"f"`` minor) so downstream scoring reflects the heuristic correction
+    applied to the display table.
+    """
+    subs = {k: v for k, v in (mode_map or {}).items() if k != v}
+    if not subs:
+        return probs_df
+
+    df = probs_df.copy()
+    task_mask = df["task"].isin(tasks)
+    df.loc[task_mask, "class_label"] = (
+        df.loc[task_mask, "class_label"].replace(subs)
+    )
+
+    # Merge duplicate (note_id, task, class_label) rows.  is_argmax / rank
+    # are not used downstream by the scorer's distribution_matrix pivot, so
+    # we only need the probability sum to be correct.
+    key_cols = ["note_id", "task", "class_label"]
+    dup_mask = df.duplicated(key_cols, keep=False)
+    if dup_mask.any():
+        agg: Dict[str, Any] = {"probability": "sum"}
+        for c in df.columns:
+            if c in key_cols or c == "probability":
+                continue
+            agg[c] = "first"
+        merged = df[dup_mask].groupby(key_cols, as_index=False, sort=False).agg(agg)
+        df = pd.concat([df[~dup_mask], merged], ignore_index=True)
+    return df
+
+
+def _enumerate_rn_candidates(
+    display_df: pd.DataFrame,
+    probs_df: pd.DataFrame,
+    notes_df: pd.DataFrame,
+    hyperedges_df: pd.DataFrame,
+    global_key: str,
+    k: int = 3,
+    top_n: int = 3,
+    grouping: str = "beat",
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Enumerate top-N Roman-numeral candidates per note group.
+
+    Returns a dict mapping ``note_id`` to a list of candidate dicts, each
+    containing ``dcml``, ``score``, and ``expected`` (task→value mapping
+    for agreement coloring).
+    """
+    from analysisgnn.aggregation.roman_numeral import (
+        _derive_validation_labels,
+        enumerate_roman_numerals,
+    )
+    from analysisgnn.aggregation.scoring import GeometricMeanScorer, ScoringContext
 
     gk = _agnn_to_flx_pitch(global_key)
 
-    # Infer localkey modes from romanNumeral tonic counts (I vs i)
-    localkey_modes = _build_localkey_mode_map(df)
+    # Build localkey mode map from display_df (which has correct case from
+    # _fix_key_mode).  Map keys and values use the AnalysisGNN format
+    # (e.g. "A-" for Ab) — matching the class_label column in probs_df so
+    # that the map can be applied directly to the probability table.
+    # _build_candidate_ohr handles the final "-" → "b" normalisation for
+    # FlexOHR.
+    localkey_mode_map: Dict[str, str] = {}
+    if "localkey" in display_df.columns:
+        for lk in display_df["localkey"].dropna().unique():
+            lk_str = str(lk).strip()
+            if lk_str:
+                # Map uppercase key → mode-corrected key (e.g. "F" → "f")
+                lk_upper = lk_str.upper()
+                localkey_mode_map[lk_upper] = lk_str
 
-    out: List[str] = []
-    for _, row in df.iterrows():
+    # The model's key head is often under-confident about mode (outputs
+    # "F" with high probability when the piece is really "f" minor).  The
+    # _fix_key_mode heuristic gives us a per-piece correction ("F" → "f"),
+    # but applying it only to the candidate labels (not to the probabilities)
+    # makes the mode-corrected label score its own under-confident mass
+    # (e.g. P("f") ≈ 0.003) while a competing un-corrected major key like
+    # P("C") = 0.008 wins.  Reassign each mapped label's probability mass to
+    # the corrected label so scoring sees P("f") = P("F") + P("f").
+    probs_for_scoring = _apply_localkey_mode_map_to_probs(
+        probs_df, localkey_mode_map
+    )
+
+    # Build full scoring context from Delta-style DataFrames
+    edges_df = pd.DataFrame({"src": pd.Series(dtype=str), "dst": pd.Series(dtype=str), "edge_type": pd.Series(dtype=str)})
+    ctx = ScoringContext(
+        note_ids=list(notes_df["note_id"]),
+        notes=notes_df,
+        probabilities=probs_for_scoring,
+        edges=edges_df,
+    )
+
+    # Build group_note_map based on grouping parameter
+    if grouping == "none":
+        # Per-note: each note is its own group
+        all_nids = list(notes_df["note_id"])
+        group_note_map = {f"note_{nid}": [nid] for nid in all_nids}
+    else:
+        grp_df = hyperedges_df[hyperedges_df["edge_type"] == grouping]
+        if grp_df.empty and grouping != "beat":
+            grp_df = hyperedges_df[hyperedges_df["edge_type"] == "beat"]
+        if grp_df.empty:
+            grp_df = hyperedges_df[hyperedges_df["edge_type"] == "onset"]
+        if grp_df.empty:
+            return {}
+        group_note_map = grp_df.groupby("group_id")["note_id"].apply(list).to_dict()
+
+    # note_id -> pitch_spelling (for tpc_in_label / note_degree derivation)
+    note_pitch: Dict[str, str] = {}
+    if "pitch_spelling" in notes_df.columns:
+        note_pitch = dict(zip(notes_df["note_id"], notes_df["pitch_spelling"]))
+
+    # note_id -> localkey from display_df (for note_degree)
+    note_localkey: Dict[str, str] = {}
+    if "note_id" in display_df.columns and "localkey" in display_df.columns:
+        note_localkey = dict(zip(display_df["note_id"], display_df["localkey"]))
+
+    scorer = GeometricMeanScorer()
+    result: Dict[str, List[Dict[str, Any]]] = {}
+
+    for gid, gnotes in group_note_map.items():
+        # Filter to notes that exist in the scoring context
+        valid_notes = [nid for nid in gnotes if nid in ctx.note_id_set]
+        if not valid_notes:
+            continue
         try:
-            quality = flx.harmony.harmony_enums.ChordQuality.from_format(
-                str(row["quality"]),
-                "analysisgnn",
+            sub = ctx.subcontext(valid_notes)
+            candidates, _trace = enumerate_roman_numerals(
+                sub, gk, k=k, top_n=top_n, scorer=scorer,
+                localkey_mode_map=localkey_mode_map,
             )
-            inv = flx.harmony.harmony_enums.Inversion.from_format(
-                str(int(row["inversion"])),
-                "analysisgnn",
-            )
-            # Apply inferred mode to the localkey string so that FlexOHR's
-            # infer_collection_type() picks up the correct major/minor.
-            lk_raw = str(row["localkey"])
-            lk_mode = localkey_modes.get(lk_raw.upper(), "major")
-            lk_str = _apply_key_mode(_agnn_to_flx_pitch(lk_raw), lk_mode)
-            lk_coll = flx.paradigms.pitchspace.scale.infer_collection_type(lk_str)
-
-            degree2_val = row.get("degree2")
-            if pd.notna(degree2_val) and str(degree2_val).strip() not in ("", "None"):
-                sd2 = flx.paradigms.pitchspace.scale_degrees.SD.from_string(
-                    str(degree2_val),
-                    collection_type=lk_coll,
-                )
-                # TODO: The tonicized key mode cannot be inferred from the
-                # AnalysisGNN output alone (degree2 is a bare integer with
-                # no case encoding).  FlexOHR will be able to infer the
-                # mode from the scale degree and key context in the future.
-                # Defaulting to major for now.
-                ref_ohr = flx.paradigms.pitchspace.scale.build_key_context(
-                    gk,
-                    lk_str,
-                    tonicized_key=sd2,
-                    tonicized_coll=flx.harmony.harmony_enums.CollectionType.major,
-                )
-                tonic_coll = flx.harmony.harmony_enums.CollectionType.major
-            else:
-                # Normalise the row's localkey for FlexOHR before delegating
-                norm_row = dict(row)
-                norm_row["localkey"] = lk_str
-                ref_ohr = flx.codecs.analysisgnn.build_key_context_from_row(
-                    norm_row,
-                    gk,
-                )
-                tonic_coll = lk_coll
-
-            degree1_sd = flx.paradigms.pitchspace.scale_degrees.SD.from_string(
-                str(row["degree1"]),
-                collection_type=tonic_coll,
-            )
-            ohr = flx.OHR.from_(
-                quality,
-                degree1_sd,
-                inversion=inv,
-                reference_ohr=ref_ohr,
-            )
-            out.append(ohr.to_format("dcml"))
         except Exception:
-            out.append("")
-    return pd.Series(out, index=df.index, dtype=object)
+            continue
+
+        # Build per-candidate expected labels (core from candidate + validation from OHR)
+        group_candidates: List[Dict[str, Any]] = []
+        for cand in candidates:
+            base_expected = dict(cand.candidate)  # core tasks
+            try:
+                val_labels = _derive_validation_labels(cand.ohr, gk)
+                base_expected.update(val_labels)
+            except Exception:
+                pass
+            # Fallback: tonkey = localkey when no tonicization
+            if "tonkey" not in base_expected:
+                d2 = base_expected.get("degree2", "None")
+                if d2 in ("None", "", None):
+                    base_expected["tonkey"] = base_expected.get("localkey", "")
+            group_candidates.append({
+                "dcml": _format_dcml_with_global_key(cand.dcml, global_key),
+                "score": round(cand.result.core.score, 4),
+                "base_expected": base_expected,
+                "_raw_dcml": cand.dcml,
+            })
+
+        # Per-note candidates: add note-level expected (tpc_in_label, note_degree)
+        for nid in valid_notes:
+            note_cands: List[Dict[str, Any]] = []
+            for gc in group_candidates:
+                expected = dict(gc["base_expected"])
+                # Derive note-level expected from candidate OHR + note pitch
+                pitch = note_pitch.get(nid, "")
+                if pitch:
+                    import re as _re
+
+                    m = _re.match(r"^([A-Ga-g][#b]*)(\d+)?$", pitch)
+                    if m:
+                        pc = m.group(1)
+                        # tpc_in_label: check if pitch is in chord components
+                        try:
+                            cand_obj = [c for c in candidates if c.dcml == gc["_raw_dcml"]][0]
+                            resolved = cand_obj.ohr.resolve()
+                            chord_names = set()
+                            for comp in resolved.components("b", depth=1):
+                                if hasattr(comp, "value") and hasattr(comp.value, "name"):
+                                    chord_names.add(comp.value.name)
+                            expected["tpc_in_label"] = "True" if pc in chord_names else "False"
+                        except Exception:
+                            pass
+                        # note_degree from localkey + pitch
+                        lk = note_localkey.get(nid, "")
+                        if lk and lk not in ("", "None", "nan"):
+                            try:
+                                from flexohr.paradigms.pitchspace.pitch import (
+                                    SpecificPitchClass as SPC,
+                                )
+                                from flexohr.paradigms.pitchspace.scale import (
+                                    get_scale,
+                                    infer_collection_type,
+                                )
+
+                                lk_str = lk.replace("-", "b")
+                                lk_coll = infer_collection_type(lk_str)
+                                lk_root = SPC(lk_str[0].upper() + lk_str[1:])
+                                lk_scale = get_scale(lk_coll, lk_root)
+                                note_spc = SPC(pc)
+                                sic = note_spc - lk_root
+                                sd = lk_scale.make_scale_degree(sic)
+                                expected["note_degree"] = sd.to_format("analysisgnn")
+                            except Exception:
+                                pass
+
+                # Copy tpc_in_label -> pitch_spelling for Pitch tile coloring
+                if "tpc_in_label" in expected:
+                    expected["pitch_spelling"] = expected["tpc_in_label"]
+                note_cands.append({
+                    "dcml": gc["dcml"],
+                    "score": gc["score"],
+                    "expected": expected,
+                })
+            result[nid] = note_cands
+
+    return result
 
 
 def _inject_note_ids(xml_text: str, score: pt.score.Score) -> str:
@@ -518,8 +772,8 @@ def _build_complete_rn_spans(
         return []
 
     work = df.copy()
-    if "romanNumeral_full" not in work.columns:
-        work["romanNumeral_full"] = _build_complete_rn_column(work, global_key)
+    if "note_label" not in work.columns:
+        work["note_label"] = _build_complete_rn_column(work, global_key)
     if "duration_div" not in work.columns:
         return []
 
@@ -527,8 +781,8 @@ def _build_complete_rn_spans(
     work["duration_div"] = pd.to_numeric(work["duration_div"], errors="coerce").fillna(
         0
     )
-    work["romanNumeral_full"] = (
-        work["romanNumeral_full"].fillna("").astype(str).str.strip()
+    work["note_label"] = (
+        work["note_label"].fillna("").astype(str).str.strip()
     )
     work = work.dropna(subset=["onset_div"])
     if len(work) == 0:
@@ -541,7 +795,7 @@ def _build_complete_rn_spans(
     onset_rn: List[str] = []
     for onset, group in by_onset:
         onset_i = int(onset)
-        candidates = [v for v in group["romanNumeral_full"].tolist() if v]
+        candidates = [v for v in group["note_label"].tolist() if v]
         rn_value = candidates[0] if candidates else ""
         onset_points.append(onset_i)
         onset_rn.append(rn_value)
@@ -568,6 +822,117 @@ def _build_complete_rn_spans(
         final_end = max(current_start + 1, score_end)
         spans.append((current_start, final_end, current_rn))
     return spans
+
+
+# ---------------------------------------------------------------------------
+# Multi-table helpers: group-level table + label mapping
+# ---------------------------------------------------------------------------
+
+
+def _build_group_table(
+    agg_note_df: pd.DataFrame,
+    hyperedges_df: pd.DataFrame,
+    level: str,
+    tasks: List[str],
+    global_key: str,
+    label_col: str,
+) -> pd.DataFrame:
+    """Build a group-level table from aggregated per-note predictions.
+
+    For each hyperedge group at *level*, picks the first note as
+    representative (all chord-tone notes share the same aggregated
+    predictions after mean-broadcast) and extracts its task columns.
+    """
+    groups = hyperedges_df[hyperedges_df["edge_type"] == level]
+    if groups.empty:
+        return pd.DataFrame()
+
+    group_members = groups.groupby("group_id")["note_id"].apply(list).to_dict()
+    note_id_col = "note_id" if "note_id" in agg_note_df.columns else None
+
+    # Determine which task columns exist
+    task_cols: List[str] = []
+    for t in tasks:
+        if t in agg_note_df.columns:
+            task_cols.append(t)
+        conf_col = f"{t}_confidence"
+        if conf_col in agg_note_df.columns:
+            task_cols.append(conf_col)
+
+    rows: List[Dict[str, Any]] = []
+    for group_id, member_nids in group_members.items():
+        # Find all member rows and pick the first as representative
+        member_str_ids = [str(nid) for nid in member_nids]
+        if note_id_col:
+            member_rows = agg_note_df[
+                agg_note_df[note_id_col].isin(member_str_ids)
+            ]
+        else:
+            member_rows = pd.DataFrame()
+        if member_rows.empty:
+            continue
+        rep_row = member_rows.iloc[0]
+        row: Dict[str, Any] = {
+            "group_id": group_id,
+            "note_count": len(member_nids),
+        }
+        # Use minimum onset_beat / measure across all group members
+        if "measure" in member_rows.columns:
+            row["measure"] = int(
+                pd.to_numeric(member_rows["measure"], errors="coerce").min()
+            )
+        if "onset_beat" in member_rows.columns:
+            row["onset_beat"] = float(
+                pd.to_numeric(member_rows["onset_beat"], errors="coerce").min()
+            )
+        for col in task_cols:
+            row[col] = rep_row.get(col)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    group_df = pd.DataFrame(rows)
+    # Sort by numeric suffix of group_id
+    sort_key = group_df["group_id"].str.extract(r"(\d+)$", expand=False)
+    sort_key = pd.to_numeric(sort_key, errors="coerce")
+    group_df = group_df.iloc[sort_key.argsort()].reset_index(drop=True)
+
+    # Build label column via FlexOHR
+    if global_key:
+        try:
+            group_df[label_col] = _build_complete_rn_column(group_df, global_key)
+        except Exception:
+            group_df[label_col] = ""
+    else:
+        group_df[label_col] = ""
+
+    group_df = _prepare_prediction_table_for_display(group_df)
+    return group_df
+
+
+def _map_group_labels_to_notes(
+    notes_df: pd.DataFrame,
+    group_df: pd.DataFrame,
+    hyperedges_df: pd.DataFrame,
+    level: str,
+    label_col: str,
+) -> pd.DataFrame:
+    """Map group-level labels back to individual notes."""
+    out = notes_df.copy()
+    groups = hyperedges_df[hyperedges_df["edge_type"] == level]
+    if groups.empty or label_col not in group_df.columns:
+        out[label_col] = ""
+        return out
+
+    note_to_group = dict(zip(groups["note_id"].astype(str), groups["group_id"]))
+    group_to_label = dict(
+        zip(group_df["group_id"].astype(str), group_df[label_col].astype(str))
+    )
+    out[label_col] = out["note_id"].astype(str).map(
+        lambda nid: group_to_label.get(note_to_group.get(nid, ""), "")
+    )
+    return out
 
 
 def _sorted_note_array(score: pt.score.Score) -> np.ndarray:
@@ -646,23 +1011,54 @@ def _build_graph_overlay_payload(
     edge_types: List[str],
     edges_all: Dict[str, List[List[int]]],
     global_key: str = "",
+    rn_candidates_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    agg_rn_candidates_maps: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None,
 ) -> Dict[str, Any]:
     """Build the Verovio overlay payload."""
     n = min(len(df), len(note_array))
     data = df.iloc[:n].reset_index(drop=True).copy()
-    if "romanNumeral_full" in data.columns:
-        rn_full = data["romanNumeral_full"].fillna("").astype(str)
+
+    # Use top-1 enumerated candidate as the Complete RN when available
+    if rn_candidates_map and "note_id" in data.columns:
+        rn_vals = []
+        for idx in range(n):
+            nid = str(data.iloc[idx].get("note_id", ""))
+            cands = rn_candidates_map.get(nid, [])
+            rn_vals.append(cands[0]["dcml"] if cands else "")
+        rn_full = pd.Series(rn_vals, dtype=object)
+    elif "note_label" in data.columns:
+        rn_full = data["note_label"].fillna("").astype(str)
     elif global_key:
         rn_full = _build_complete_rn_column(data, global_key)
     else:
         rn_full = pd.Series([""] * n, dtype=object)
+
     spans_df = data.copy()
     if "onset_div" in note_array.dtype.names:
         spans_df["onset_div"] = note_array["onset_div"][:n]
     if "duration_div" in note_array.dtype.names:
         spans_df["duration_div"] = note_array["duration_div"][:n]
-    spans_df["romanNumeral_full"] = rn_full
+    spans_df["note_label"] = rn_full
     rn_spans = _build_complete_rn_spans(spans_df, global_key)
+
+    # Compute expected labels for agreement coloring (fallback when no candidates)
+    expected_labels: List[Dict[str, str]] = [{} for _ in range(n)]
+    if not rn_candidates_map and global_key:
+        prepared = _prepare_df_for_flexohr(data)
+        gk = _agnn_to_flx_pitch(global_key)
+        # Filter to rows with valid core numeric columns (NaN = no OHR)
+        core_numeric = ["degree1", "inversion"]
+        valid_mask = prepared[core_numeric].notna().all(axis=1)
+        valid_prepared = prepared.loc[valid_mask]
+        if len(valid_prepared) > 0:
+            ohrs = flx.codecs.analysisgnn.build_ohrs_from_dataframe(valid_prepared, gk)
+            valid_labels = flx.codecs.analysisgnn.derive_expected_labels(
+                valid_prepared, ohrs, gk
+            )
+            for rec, (orig_idx, _) in zip(valid_labels, valid_prepared.iterrows()):
+                if "tpc_in_label" in rec:
+                    rec["pitch_spelling"] = rec["tpc_in_label"]
+                expected_labels[orig_idx] = rec
 
     notes_payload: List[Dict[str, Any]] = []
     for idx in range(n):
@@ -711,9 +1107,23 @@ def _build_graph_overlay_payload(
                 "pitch_spelling": str(_value_or_none(row.get("pitch_spelling")) or ""),
                 "tasks": task_vals,
                 "confidence": conf,
-                "romanNumeral_full": str(rn_full.iloc[idx])
+                "note_label": str(rn_full.iloc[idx])
                 if idx < len(rn_full)
                 else "",
+                "rn_expected": expected_labels[idx] if idx < len(expected_labels) else {},
+                "rn_candidates": (
+                    rn_candidates_map.get(str(note_id), [])
+                    if rn_candidates_map and note_id
+                    else []
+                ),
+                "rn_agg_candidates": (
+                    {
+                        agg_label: agg_map.get(str(note_id), [])
+                        for agg_label, agg_map in (agg_rn_candidates_maps or {}).items()
+                    }
+                    if agg_rn_candidates_maps and note_id
+                    else {}
+                ),
             }
         )
 
@@ -725,6 +1135,7 @@ def _build_graph_overlay_payload(
             "selected_tasks": list(tasks),
             "visible_edge_types": visible,
             "edge_warning": "",
+            "global_key": global_key,
             "roman_spans": [
                 {
                     "start_onset_div": int(s),
@@ -756,7 +1167,7 @@ def _build_verovio_html(payload: Dict[str, Any]) -> str:
     srcdoc = html_lib.escape(doc, quote=True)
     return (
         "<iframe "
-        "style='width:100%;height:980px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
+        "style='width:100%;min-height:980px;border:1px solid #d1d5db;border-radius:10px;background:white;' "
         f'srcdoc="{srcdoc}"></iframe>'
     )
 
@@ -769,6 +1180,8 @@ def _build_visual_payload(
     edge_types: List[str],
     edges_all: Dict[str, List[List[int]]],
     global_key: str = "",
+    rn_candidates_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    agg_rn_candidates_maps: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None,
 ) -> Dict[str, Any]:
     note_array = _sorted_note_array(score)
     payload = _build_graph_overlay_payload(
@@ -778,6 +1191,8 @@ def _build_visual_payload(
         edge_types=edge_types,
         edges_all=edges_all,
         global_key=global_key,
+        rn_candidates_map=rn_candidates_map,
+        agg_rn_candidates_maps=agg_rn_candidates_maps,
     )
     payload["score_xml"] = _read_score_xml_text(score_path, score)
     payload["score_format"] = "musicxml"
@@ -895,7 +1310,7 @@ def _beat_payload_to_dataframe(
             "measure": row.get("measure"),
             "onset_beat": row.get("onset_beat"),
             "note_count": row.get("note_count"),
-            "romanNumeral_full": row.get("romanNumeral_full", ""),
+            "note_label": row.get("note_label", ""),
         }
         task_map = row.get("tasks", {}) if isinstance(row, dict) else {}
         for task in tasks:
@@ -914,7 +1329,7 @@ def _beat_payload_to_dataframe(
         "measure",
         "onset_beat",
         "note_count",
-        "romanNumeral_full",
+        "note_label",
         "chordSymbol_abs",
         "chordSymbol_context",
         "chordSymbol_supported",
@@ -1162,6 +1577,7 @@ def run_full_inference(
         )
         full_df = _apply_timing_from_predictions(full_df, predictions)
         display_df = format_table_output(full_df, tasks)
+        _fix_key_mode(display_df)
 
         # Extract edges from intermediates
         num_notes = len(note_array)
@@ -1181,18 +1597,13 @@ def run_full_inference(
         # Precompute DataFrames for aggregation (cached)
         delta_dfs = _precompute_delta_dfs(predictions, intermediates_state)
 
-        # Derive global key from predictions
-        try:
-            global_key = _derive_global_key(display_df)
-        except ValueError as gk_exc:
-            global_key = ""
-            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+        # Derive global key from predictions — must always succeed
+        global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        if global_key:
-            display_df["romanNumeral_full"] = _build_complete_rn_column(
-                display_df, global_key
-            )
+        display_df["note_label"] = _build_complete_rn_column(
+            display_df, global_key
+        )
         display_df = _prepare_prediction_table_for_display(display_df)
 
         # Build visual payload
@@ -1240,6 +1651,8 @@ def run_full_inference(
 
         csv_path = _write_csv_to_temp(display_df, score_path)
 
+        tables_init = {DEFAULT_TABLE_LABEL: display_df}
+
         return (
             display_df,
             log_text,
@@ -1253,6 +1666,8 @@ def run_full_inference(
             edges_all,
             True,  # model_available
             global_key,
+            tables_init,
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error: {exc}")
@@ -1269,6 +1684,8 @@ def run_full_inference(
             {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
             "",
+            {},
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
 
 
@@ -1318,6 +1735,7 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             probs_df, notes_df, hyperedges_df, metadata, tasks=tasks
         )
         display_df = format_table_output(display_df, tasks)
+        _fix_key_mode(display_df)
 
         log_text = _log(
             log_text,
@@ -1340,21 +1758,18 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             "metadata": metadata,
         }
 
-        # Derive global key from predictions
-        try:
-            global_key = _derive_global_key(display_df)
-        except ValueError as gk_exc:
-            global_key = ""
-            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+        # Derive global key from predictions — must always succeed
+        global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        if global_key:
-            display_df["romanNumeral_full"] = _build_complete_rn_column(
-                display_df, global_key
-            )
+        display_df["note_label"] = _build_complete_rn_column(
+            display_df, global_key
+        )
         display_df = _prepare_prediction_table_for_display(display_df)
 
         csv_path = _write_csv_to_temp(display_df, score_path)
+
+        tables_init = {DEFAULT_TABLE_LABEL: display_df}
 
         return (
             display_df,
@@ -1369,6 +1784,8 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             edges_all,
             False,  # model NOT available
             global_key,
+            tables_init,
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error loading Delta Lake: {exc}")
@@ -1385,6 +1802,8 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
             {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
             "",
+            {},
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
 
 
@@ -1392,15 +1811,30 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
 # Module 2: Post-hoc Aggregation (with caching)
 # ---------------------------------------------------------------------------
 
-# Cache: maps strategy name -> display_df so repeat clicks are instant.
-_aggregation_cache: Dict[str, pd.DataFrame] = {}
+# Cache: maps strategy name -> (agg_note_df, group_df) so repeat clicks are instant.
+_aggregation_cache: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
 
 
 def _clear_aggregation_cache() -> None:
     _aggregation_cache.clear()
 
 
+def _resolve_strategy_name(group: str, strategy: str) -> str:
+    """Compose a strategy registry name from the two dropdown values.
+
+    Mapping:
+    - group=None → "none" (passthrough, ignores strategy dropdown)
+    - group=Onset/Beat/Measure + strategy=Mean → "onset_mean" / "beat_mean" / "measure_mean"
+    """
+    group = (group or "None").strip().lower()
+    strategy = (strategy or "Mean").strip().lower()
+    if group == "none":
+        return "none"
+    return f"{group}_{strategy}"
+
+
 def run_aggregation(
+    group_name: str,
     strategy_name: str,
     delta_dfs_state: Any,
     tasks_state: Any,
@@ -1408,77 +1842,149 @@ def run_aggregation(
     edges_state: Any,
     intermediates_state: Any,
     global_key_text: str,
+    tables_state_val: Any,
     log_text: str,
+    agg_rn_candidates_state_val: Any = None,
 ):
-    """Apply an aggregation strategy.  Uses a cache so that toggling back and
-    forth between strategies is instant.
+    """Apply an aggregation strategy.  Produces a group-level table and adds
+    a label column to the notes table.
 
-    Returns: (display_df, log_text, visual_payload, csv_path)
+    Returns: (display_df, log_text, visual_payload, csv_path,
+              tables_state, table_selector_update, agg_rn_candidates)
     """
     try:
-        strategy_name = (strategy_name or "none").strip().lower()
+        resolved_name = _resolve_strategy_name(group_name, strategy_name)
         tasks = tasks_state or []
         delta_dfs = delta_dfs_state or {}
+        agg_rn_cands = dict(agg_rn_candidates_state_val) if agg_rn_candidates_state_val else {}
         intermediates = intermediates_state or {}
         global_key = (global_key_text or "").strip()
+        tables = dict(tables_state_val) if tables_state_val else {}
 
         if not delta_dfs or "probs_df" not in delta_dfs:
             raise ValueError(
                 "No data available. Run inference or load Delta Lake first."
             )
+        if not global_key:
+            raise ValueError(
+                "Global key is required for aggregation. "
+                "Set it in the Global Key field."
+            )
 
-        # Check cache
-        if strategy_name in _aggregation_cache:
-            display_df = _aggregation_cache[strategy_name]
+        # Group/strategy naming
+        group_lower = (group_name or "None").strip().lower()
+        strategy_lower = (strategy_name or "Mean").strip().lower()
+        group_singular, group_plural = GROUP_NAMES.get(
+            group_lower, (group_lower, group_lower.title() + "s")
+        )
+        strategy_title = (strategy_name or "Mean").strip()
+        label_col = f"{group_singular}_{strategy_lower}_label"
+        table_display_name = f"{group_plural} ({strategy_title})"
+
+        # Handle "None" group: no new aggregation, just show notes table
+        if group_lower == "none":
+            notes_df = tables.get(DEFAULT_TABLE_LABEL, pd.DataFrame())
+            if notes_df.empty:
+                raise ValueError("Notes table not available.")
+            csv_path = _write_csv_to_temp(notes_df, score_path_state)
+            choices = list(tables.keys())
+            return (
+                notes_df, log_text, {}, csv_path, tables,
+                gr.update(choices=choices, value=DEFAULT_TABLE_LABEL),
+                agg_rn_cands,
+            )
+
+        # Run aggregation (with cache)
+        if resolved_name in _aggregation_cache:
+            agg_note_df, group_df = _aggregation_cache[resolved_name]
             log_text = _log(
                 log_text,
-                f"Aggregation '{strategy_name}' (cached). Rows={len(display_df)}.",
+                f"Aggregation '{resolved_name}' (cached). "
+                f"Notes={len(agg_note_df)}, Groups={len(group_df)}.",
             )
         else:
             probs_df = delta_dfs["probs_df"]
-            notes_df = delta_dfs["notes_df"]
+            notes_df_raw = delta_dfs["notes_df"]
             hyperedges_df = delta_dfs["hyperedges_df"]
             metadata = delta_dfs.get("metadata", {})
 
-            strategy = get_strategy(strategy_name)
+            strategy = get_strategy(resolved_name)
             result_df = strategy.aggregate(
-                probs_df, notes_df, hyperedges_df, metadata, tasks=tasks
+                probs_df, notes_df_raw, hyperedges_df, metadata, tasks=tasks
             )
-            display_df = format_table_output(result_df, tasks)
-            # Add Complete RN column
-            if global_key:
-                display_df["romanNumeral_full"] = _build_complete_rn_column(
-                    display_df, global_key
-                )
-            display_df = _prepare_prediction_table_for_display(display_df)
-            _aggregation_cache[strategy_name] = display_df
+            agg_note_df = format_table_output(result_df, tasks)
+            _fix_key_mode(agg_note_df)
+            agg_note_df["note_label"] = _build_complete_rn_column(
+                agg_note_df, global_key
+            )
+            agg_note_df = _prepare_prediction_table_for_display(agg_note_df)
+
+            # Build group-level table
+            group_df = _build_group_table(
+                agg_note_df, hyperedges_df, group_lower,
+                tasks, global_key, label_col,
+            )
+
+            _aggregation_cache[resolved_name] = (agg_note_df, group_df)
             log_text = _log(
                 log_text,
-                f"Aggregation '{strategy_name}' applied. Rows={len(display_df)}.",
+                f"Aggregation '{resolved_name}' applied. "
+                f"Notes={len(agg_note_df)}, Groups={len(group_df)}.",
             )
 
-        # Build visual payload if score is available
-        score_obj = intermediates.get("score")
-        note_array = intermediates.get("note_array")
-        score_path = score_path_state or intermediates.get("score_path", "")
-        edges_all = edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES}
-        visual_payload = {}
-        if score_obj is not None and note_array is not None and score_path:
-            visual_payload = _build_visual_payload(
-                score_path=score_path,
-                score=score_obj,
-                df=display_df,
-                tasks=tasks,
-                edge_types=[],
-                edges_all=edges_all,
-                global_key=global_key,
+        # Update notes table with aggregation label column
+        notes_df = tables.get(DEFAULT_TABLE_LABEL, pd.DataFrame())
+        if not notes_df.empty and not group_df.empty:
+            hyperedges_df = delta_dfs.get("hyperedges_df", pd.DataFrame())
+            notes_df = _map_group_labels_to_notes(
+                notes_df, group_df, hyperedges_df, group_lower, label_col,
             )
+            notes_df = _prepare_prediction_table_for_display(notes_df)
+            tables[DEFAULT_TABLE_LABEL] = notes_df
 
-        csv_path = _write_csv_to_temp(display_df, score_path)
-        return display_df, log_text, visual_payload, csv_path
+        # Store group-level table
+        tables[table_display_name] = group_df
+
+        # Enumerate group-level RN candidates for Verovio
+        if global_key and delta_dfs.get("probs_df") is not None:
+            try:
+                grp_cands_map = _enumerate_rn_candidates(
+                    display_df=notes_df,
+                    probs_df=delta_dfs["probs_df"],
+                    notes_df=delta_dfs["notes_df"],
+                    hyperedges_df=delta_dfs["hyperedges_df"],
+                    global_key=global_key,
+                    grouping=group_lower,
+                )
+                agg_rn_cands[table_display_name] = grp_cands_map
+                log_text = _log(
+                    log_text,
+                    f"Enumerated {table_display_name} RN candidates for "
+                    f"{len(grp_cands_map)} notes.",
+                )
+            except Exception as enum_exc:
+                log_text = _log(
+                    log_text,
+                    f"Group RN enumeration failed: {enum_exc}",
+                )
+
+        csv_path = _write_csv_to_temp(notes_df, score_path_state)
+        choices = list(tables.keys())
+        return (
+            notes_df, log_text, {}, csv_path, tables,
+            gr.update(choices=choices, value=DEFAULT_TABLE_LABEL),
+            agg_rn_cands,
+        )
     except Exception as exc:
         log_text = _log(log_text, f"Aggregation error: {exc}")
-        return pd.DataFrame(), log_text, {}, None
+        tables = dict(tables_state_val) if tables_state_val else {}
+        agg_rn_cands = dict(agg_rn_candidates_state_val) if agg_rn_candidates_state_val else {}
+        choices = list(tables.keys()) or [DEFAULT_TABLE_LABEL]
+        return (
+            pd.DataFrame(), log_text, {}, None, tables,
+            gr.update(choices=choices),
+            agg_rn_cands,
+        )
 
 
 def save_delta_lake(
@@ -1631,6 +2137,7 @@ def run_edit_conditioned(
         )
         out_df = _apply_timing_from_predictions(out_df, predictions)
         display_df = format_table_output(out_df, tasks)
+        _fix_key_mode(display_df)
 
         num_notes = len(note_array)
         if pyg_data is not None:
@@ -1649,18 +2156,13 @@ def run_edit_conditioned(
         delta_dfs = _precompute_delta_dfs(predictions, new_intermediates)
         _clear_aggregation_cache()
 
-        # Derive global key from predictions
-        try:
-            global_key = _derive_global_key(display_df)
-        except ValueError as gk_exc:
-            global_key = ""
-            log_text = _log(log_text, f"Global key derivation failed: {gk_exc}")
+        # Derive global key from predictions — must always succeed
+        global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        if global_key:
-            display_df["romanNumeral_full"] = _build_complete_rn_column(
-                display_df, global_key
-            )
+        display_df["note_label"] = _build_complete_rn_column(
+            display_df, global_key
+        )
         display_df = _prepare_prediction_table_for_display(display_df)
 
         visual_payload = _build_visual_payload(
@@ -1684,6 +2186,8 @@ def run_edit_conditioned(
 
         csv_path = _write_csv_to_temp(display_df, score_path)
 
+        tables_init = {DEFAULT_TABLE_LABEL: display_df}
+
         return (
             display_df,
             log_text,
@@ -1697,6 +2201,8 @@ def run_edit_conditioned(
             edges_all,
             True,
             global_key,
+            tables_init,
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
     except Exception as exc:
         log_text = _log(log_text, f"Error: {exc}")
@@ -1713,6 +2219,8 @@ def run_edit_conditioned(
             edges_state or {k: [[], []] for k in DEFAULT_EDGE_TYPES},
             False,
             "",
+            {},
+            gr.update(choices=[DEFAULT_TABLE_LABEL], value=DEFAULT_TABLE_LABEL),
         )
 
 
@@ -1767,10 +2275,14 @@ def refresh_visual_tab(
     edge_type_labels: List[str],
     nct_color_labels: List[str],
     global_key_text: str,
+    aggregation_group: str,
     visual_state: Dict[str, Any],
     intermediates_state: Any,
     edges_state: Any,
     log_text: str,
+    delta_dfs_state: Any = None,
+    agg_rn_candidates: Any = None,
+    tables_state_val: Any = None,
 ):
     try:
         selected_edge_types = [
@@ -1797,7 +2309,14 @@ def refresh_visual_tab(
             note_array = intermediates.get("note_array")
             score_path = intermediates.get("score_path", "")
 
-        df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
+        # Prefer the canonical notes DataFrame from tables_state (keeps column
+        # names intact); fall back to the Gradio table component if absent.
+        tables_val = tables_state_val if isinstance(tables_state_val, dict) else {}
+        notes_from_state = tables_val.get(DEFAULT_TABLE_LABEL)
+        if isinstance(notes_from_state, pd.DataFrame) and not notes_from_state.empty:
+            df = notes_from_state.copy()
+        else:
+            df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
 
         if score_obj is not None and note_array is not None and len(df) > 0:
             # Check note-count mismatch between score and predictions
@@ -1809,6 +2328,36 @@ def refresh_visual_tab(
                     f"Warning: score has {n_score} notes but predictions table has {n_table} rows. "
                     f"Rendering min({n_score}, {n_table}) notes; overlay alignment may be approximate.",
                 )
+            # Enumerate note-wise RN candidates (always grouping="none")
+            rn_cands_map = None
+            delta_dfs = delta_dfs_state if isinstance(delta_dfs_state, dict) else {}
+            if global_key and delta_dfs.get("probs_df") is not None:
+                try:
+                    rn_cands_map = _enumerate_rn_candidates(
+                        display_df=df,
+                        probs_df=delta_dfs["probs_df"],
+                        notes_df=delta_dfs["notes_df"],
+                        hyperedges_df=delta_dfs["hyperedges_df"],
+                        global_key=global_key,
+                        grouping="none",
+                    )
+                    log_text = _log(
+                        log_text,
+                        f"Enumerated note-wise RN candidates for {len(rn_cands_map)} notes.",
+                    )
+                except Exception as enum_exc:
+                    log_text = _log(
+                        log_text,
+                        f"RN enumeration failed: {enum_exc}",
+                    )
+
+            # Accumulated aggregation-level candidates from state
+            agg_cands = (
+                agg_rn_candidates
+                if isinstance(agg_rn_candidates, dict)
+                else {}
+            )
+
             payload = _build_visual_payload(
                 score_path=score_path,
                 score=score_obj,
@@ -1817,6 +2366,8 @@ def refresh_visual_tab(
                 edge_types=selected_edge_types,
                 edges_all=edges_all,
                 global_key=global_key,
+                rn_candidates_map=rn_cands_map,
+                agg_rn_candidates_maps=agg_cands,
             )
             # Apply NCT coloring
             if nct_color:
@@ -1857,6 +2408,62 @@ def refresh_visual_tab(
 
 
 # ---------------------------------------------------------------------------
+# Global Key Change → Regenerate note_label
+# ---------------------------------------------------------------------------
+
+
+def regenerate_rn_column(
+    global_key_text: str,
+    table_data: Any,
+    tasks_state: Any,
+    score_path_state: str,
+    tables_state_val: Any,
+    log_text: str,
+):
+    """Regenerate the note_label column after a global key change.
+
+    Called on global_key_field blur.  Updates the table and CSV download.
+    """
+    try:
+        global_key = (global_key_text or "").strip()
+        if not global_key:
+            raise ValueError("Global key must not be empty.")
+        df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
+        if len(df) == 0:
+            return df, log_text, None, tables_state_val
+        tasks = tasks_state or []
+        df["note_label"] = _build_complete_rn_column(df, global_key)
+        df = _prepare_prediction_table_for_display(df)
+        csv_path = _write_csv_to_temp(df, score_path_state)
+        # Update tables_state
+        tables = dict(tables_state_val) if tables_state_val else {}
+        tables[DEFAULT_TABLE_LABEL] = df
+        log_text = _log(log_text, f"Regenerated RN column with global key '{global_key}'.")
+        return df, log_text, csv_path, tables
+    except Exception as exc:
+        log_text = _log(log_text, f"RN regeneration error: {exc}")
+        df = pd.DataFrame(table_data) if table_data is not None else pd.DataFrame()
+        return df, log_text, None, tables_state_val
+
+
+# ---------------------------------------------------------------------------
+# Table switching
+# ---------------------------------------------------------------------------
+
+
+def _switch_table(
+    selected: str,
+    tables_state_val: Any,
+    score_path_state: str,
+) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Switch the displayed table based on the Radio selection."""
+    tables = tables_state_val if isinstance(tables_state_val, dict) else {}
+    df = tables.get(selected, pd.DataFrame())
+    csv_path = _write_csv_to_temp(df, score_path_state) if len(df) > 0 else None
+    return df, csv_path
+
+
+# ---------------------------------------------------------------------------
 # UI Builder
 # ---------------------------------------------------------------------------
 
@@ -1883,6 +2490,8 @@ def build_demo() -> gr.Blocks:
         enable_iterative = gr.State(False)
         iterative_steps = gr.State(10)
         keep_percentile_per_step = gr.State(10.0)
+        tables_state = gr.State({})  # display_name -> DataFrame
+        agg_rn_candidates_state = gr.State({})  # agg_label -> {note_id -> candidates}
 
         # ==================================================================
         # MODULE 1: DATA SOURCE
@@ -1951,11 +2560,17 @@ def build_demo() -> gr.Blocks:
                 max_lines=1,
                 scale=0,
             )
-            aggregation_dropdown = gr.Dropdown(
-                label="Aggregation Strategy",
-                choices=[s.capitalize() for s in list_strategies()],
+            aggregation_groups_dropdown = gr.Dropdown(
+                label="Aggregation Groups",
+                choices=["None", "Onset", "Beat", "Measure"],
                 value="None",
-                info="Select an aggregation strategy and click 'Aggregate!' to apply.",
+                info="Grouping level for combining probability distributions.",
+            )
+            aggregation_strategy_dropdown = gr.Dropdown(
+                label="Aggregation Strategy",
+                choices=["Mean"],
+                value="Mean",
+                info="How distributions are combined within each group.",
             )
             aggregate_btn = gr.Button("Aggregate!", variant="secondary")
             save_delta_btn = gr.Button("Save Delta Lake", variant="secondary")
@@ -1964,6 +2579,12 @@ def build_demo() -> gr.Blocks:
         with gr.Tabs():
             # ------ Tab: Analysis Results ------
             with gr.Tab("Analysis Results"):
+                table_selector = gr.Radio(
+                    choices=[DEFAULT_TABLE_LABEL],
+                    value=DEFAULT_TABLE_LABEL,
+                    label="Table View",
+                    info="Switch between note-level and aggregated tables.",
+                )
                 table = gr.Dataframe(
                     label="Predictions (editable)",
                     interactive=True,
@@ -2073,6 +2694,24 @@ def build_demo() -> gr.Blocks:
         def _on_new_data(*args):
             _clear_aggregation_cache()
 
+        # Common output list for inference / load / edit-conditioned
+        _data_source_outputs = [
+            table,
+            log_output,
+            visual_payload_state,
+            csv_download,
+            raw_predictions_state,
+            intermediates_state,
+            delta_dfs_state,
+            tasks_state,
+            score_path_state,
+            edges_state,
+            model_available_state,
+            global_key_field,
+            tables_state,
+            table_selector,
+        ]
+
         # ---- Module 1a: Run Inference ----
         run_inference_btn.click(
             fn=_on_new_data,
@@ -2093,20 +2732,7 @@ def build_demo() -> gr.Blocks:
                 show_trace,
                 log_output,
             ],
-            outputs=[
-                table,
-                log_output,
-                visual_payload_state,
-                csv_download,
-                raw_predictions_state,
-                intermediates_state,
-                delta_dfs_state,
-                tasks_state,
-                score_path_state,
-                edges_state,
-                model_available_state,
-                global_key_field,
-            ],
+            outputs=_data_source_outputs,
         ).then(
             fn=_update_module3_interactivity,
             inputs=[model_available_state],
@@ -2133,20 +2759,7 @@ def build_demo() -> gr.Blocks:
         ).then(
             fn=load_from_delta_lake,
             inputs=[delta_lake_explorer, log_output],
-            outputs=[
-                table,
-                log_output,
-                visual_payload_state,
-                csv_download,
-                raw_predictions_state,
-                intermediates_state,
-                delta_dfs_state,
-                tasks_state,
-                score_path_state,
-                edges_state,
-                model_available_state,
-                global_key_field,
-            ],
+            outputs=_data_source_outputs,
         ).then(
             fn=_update_module3_interactivity,
             inputs=[model_available_state],
@@ -2163,16 +2776,23 @@ def build_demo() -> gr.Blocks:
         aggregate_btn.click(
             fn=run_aggregation,
             inputs=[
-                aggregation_dropdown,
+                aggregation_groups_dropdown,
+                aggregation_strategy_dropdown,
                 delta_dfs_state,
                 tasks_state,
                 score_path_state,
                 edges_state,
                 intermediates_state,
                 global_key_field,
+                tables_state,
                 log_output,
+                agg_rn_candidates_state,
             ],
-            outputs=[table, log_output, visual_payload_state, csv_download],
+            outputs=[
+                table, log_output, visual_payload_state, csv_download,
+                tables_state, table_selector,
+                agg_rn_candidates_state,
+            ],
         )
 
         # ---- Module 2: Save Delta Lake ----
@@ -2186,6 +2806,27 @@ def build_demo() -> gr.Blocks:
             outputs=[log_output],
         )
 
+        # ---- Module 2: Global Key Change → Regenerate RN column ----
+        global_key_field.blur(
+            fn=regenerate_rn_column,
+            inputs=[
+                global_key_field,
+                table,
+                tasks_state,
+                score_path_state,
+                tables_state,
+                log_output,
+            ],
+            outputs=[table, log_output, csv_download, tables_state],
+        )
+
+        # ---- Module 2: Table switching ----
+        table_selector.change(
+            fn=_switch_table,
+            inputs=[table_selector, tables_state, score_path_state],
+            outputs=[table, csv_download],
+        )
+
         # ---- Module 2: Refresh Visual ----
         refresh_visual_btn.click(
             fn=refresh_visual_tab,
@@ -2197,10 +2838,14 @@ def build_demo() -> gr.Blocks:
                 visual_edge_types,
                 nct_color_group,
                 global_key_field,
+                aggregation_groups_dropdown,
                 visual_payload_state,
                 intermediates_state,
                 edges_state,
                 log_output,
+                delta_dfs_state,
+                agg_rn_candidates_state,
+                tables_state,
             ],
             outputs=[visual_html, log_output, visual_payload_state],
         )
@@ -2231,20 +2876,7 @@ def build_demo() -> gr.Blocks:
                 edges_state,
                 log_output,
             ],
-            outputs=[
-                table,
-                log_output,
-                visual_payload_state,
-                csv_download,
-                raw_predictions_state,
-                intermediates_state,
-                delta_dfs_state,
-                tasks_state,
-                score_path_state,
-                edges_state,
-                model_available_state,
-                global_key_field,
-            ],
+            outputs=_data_source_outputs,
         )
 
     return demo

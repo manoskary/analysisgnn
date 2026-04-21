@@ -19,14 +19,14 @@ def test_prediction_table_rounds_confidence_and_places_complete_rn_before_cadenc
             "cadence_confidence": [0.98765],
             "localkey": ["C"],
             "localkey_confidence": [0.12345],
-            "romanNumeral_full": ["I"],
+            "note_label": ["I"],
         }
     )
 
     out = _prepare_prediction_table_for_display(df)
 
-    assert out.columns.get_loc("romanNumeral_full") == out.columns.get_loc("pitch_midi") + 1
-    assert out.columns.get_loc("romanNumeral_full") < out.columns.get_loc("cadence")
+    assert out.columns.get_loc("note_label") == out.columns.get_loc("pitch_midi") + 1
+    assert out.columns.get_loc("note_label") < out.columns.get_loc("cadence")
     assert out.loc[0, "cadence_confidence"] == 0.988
     assert out.loc[0, "localkey_confidence"] == 0.123
 
