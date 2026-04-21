@@ -29,7 +29,7 @@ Computer Music Multidisciplinary Research 2025 (CMMR).
 This repository is under construction, despite the many features some things might not yet work properly.
 
 #### TODOs
-- Add resolve function for Roman Numerals
+
 - Add onset and beat prediction aggregation in predict
 - Support all training modes
 - Simplify requirements
