@@ -262,20 +262,40 @@
     }
   }
 
-  function findNoteElementById(noteId) {
+  function buildNoteElementLookup(noteEls) {
+    const exact = new Map();
+    const embedded = new Map();
+    for (const noteEl of noteEls) {
+      const nid = String(noteEl.id || "");
+      if (!nid) continue;
+      exact.set(nid, noteEl);
+      const matches = nid.match(/[A-Za-z]*\d+n\d+/g) || [];
+      for (const match of matches) {
+        if (!embedded.has(match)) embedded.set(match, noteEl);
+      }
+    }
+    return { exact, embedded, fuzzy: new Map(), noteEls };
+  }
+
+  function findNoteElementById(noteId, lookup) {
     if (!noteId) return null;
     const raw = String(noteId);
     const direct = document.getElementById(raw);
     if (direct) return direct;
-    const noteEls = iterNoteElements(pagesEl);
-    for (const noteEl of noteEls) {
+    if (lookup.exact.has(raw)) return lookup.exact.get(raw);
+    if (lookup.embedded.has(raw)) return lookup.embedded.get(raw);
+    if (lookup.fuzzy.has(raw)) return lookup.fuzzy.get(raw);
+    let found = null;
+    for (const noteEl of lookup.noteEls) {
       const nid = String(noteEl.id || "");
       if (!nid) continue;
-      if (nid === raw || nid.endsWith(raw) || nid.includes(raw)) {
-        return noteEl;
+      if (nid.endsWith(raw) || nid.includes(raw)) {
+        found = noteEl;
+        break;
       }
     }
-    return null;
+    lookup.fuzzy.set(raw, found);
+    return found;
   }
 
   function ensureVerovioReady() {
@@ -343,6 +363,7 @@
         return;
       }
       const tk = await ensureVerovioReady();
+      const notes = Array.isArray(payload.notes) ? payload.notes : [];
       tk.setOptions({
         breaks: "none",
         footer: "none",
@@ -356,7 +377,6 @@
       const pageCount = Math.max(1, Number(tk.getPageCount() || 1));
       pagesEl.innerHTML = "";
       const noteMap = new Map();
-      const notes = Array.isArray(payload.notes) ? payload.notes : [];
 
       for (let page = 1; page <= pageCount; page += 1) {
         const svgString = tk.renderToSVG(page, {});
@@ -369,14 +389,28 @@
       }
 
       const allRenderedNotes = iterNoteElements(pagesEl);
+      const noteLookup = buildNoteElementLookup(allRenderedNotes);
       const mappedIdx = new Set();
+
+      function ensureXY(item) {
+        if (!item || !item.noteGroup) return null;
+        if (Number.isFinite(item.x) && Number.isFinite(item.y)) {
+          return { x: item.x, y: item.y };
+        }
+        const xy = glyphXY(item.noteGroup);
+        if (!xy) return null;
+        item.x = xy.x;
+        item.y = xy.y;
+        return xy;
+      }
+
       // First pass: map by note id.
       for (let i = 0; i < notes.length; i += 1) {
         const note = notes[i];
         const noteIndex = Number(note && note.index != null ? note.index : i);
         const noteId = note && note.note_id ? String(note.note_id) : "";
         if (!noteId) continue;
-        const element = findNoteElementById(noteId);
+        const element = findNoteElementById(noteId, noteLookup);
         if (!element) continue;
         const noteGroup = element.classList && element.classList.contains("note")
           ? element
@@ -384,14 +418,12 @@
         if (!noteGroup) continue;
         const pageMargin = noteGroup.closest(".page-margin");
         if (!pageMargin) continue;
-        const xy = glyphXY(noteGroup);
-        if (!xy) continue;
         noteMap.set(noteIndex, {
           note,
           noteGroup,
           pageMargin,
-          x: xy.x,
-          y: xy.y,
+          x: null,
+          y: null,
         });
         mappedIdx.add(noteIndex);
       }
@@ -406,14 +438,12 @@
         renderIdx += 1;
         const pageMargin = noteGroup.closest(".page-margin");
         if (!pageMargin) continue;
-        const xy = glyphXY(noteGroup);
-        if (!xy) continue;
         noteMap.set(noteIndex, {
           note,
           noteGroup,
           pageMargin,
-          x: xy.x,
-          y: xy.y,
+          x: null,
+          y: null,
         });
       }
 
@@ -432,6 +462,7 @@
       const edges = payload.edges || {};
       const edgeTypes = Object.keys(edgeColor);
       for (const edgeType of edgeTypes) {
+        if (!visibleTypes.has(edgeType)) continue;
         const pair = edges[edgeType];
         if (!Array.isArray(pair) || pair.length < 2) continue;
         const src = pair[0] || [];
@@ -444,15 +475,18 @@
           const b = noteMap.get(d);
           if (!a || !b) continue;
           if (a.pageMargin !== b.pageMargin) continue;
+          const aXY = ensureXY(a);
+          const bXY = ensureXY(b);
+          if (!aXY || !bXY) continue;
           const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-          path.setAttribute("d", `M ${a.x} ${a.y} L ${b.x} ${b.y}`);
+          path.setAttribute("d", `M ${aXY.x} ${aXY.y} L ${bXY.x} ${bXY.y}`);
           path.setAttribute("class", `agn-edge agn-edge-${edgeType} agn-src-${s} agn-dst-${d}`);
           path.setAttribute("stroke", edgeColor[edgeType]);
           path.setAttribute("stroke-width", "16");
           path.dataset.edgeType = edgeType;
           path.dataset.src = String(s);
           path.dataset.dst = String(d);
-          path.style.display = visibleTypes.has(edgeType) ? "block" : "none";
+          path.style.display = "block";
           a.pageMargin.appendChild(path);
           edgeEls.push(path);
         }
@@ -465,8 +499,7 @@
         for (const item of noteMap.values()) {
           const onset = Number(item.note && item.note.onset_div);
           if (!Number.isFinite(onset)) continue;
-          const prev = onsetAnchors.get(onset);
-          if (!prev || item.x < prev.x) {
+          if (!onsetAnchors.has(onset)) {
             onsetAnchors.set(onset, item);
           }
         }
@@ -478,18 +511,20 @@
           if (!Number.isFinite(onset) || !label) continue;
           const anchor = onsetAnchors.get(onset);
           if (!anchor) continue;
+          const xy = ensureXY(anchor);
+          if (!xy) continue;
           let y = pageLabelY.get(anchor.pageMargin);
           if (y == null) {
             try {
               const box = anchor.pageMargin.getBBox();
               y = Number(box.y + box.height + 22);
             } catch (_err) {
-              y = Number(anchor.y + 28);
+              y = Number(xy.y + 28);
             }
             pageLabelY.set(anchor.pageMargin, y);
           }
           const textEl = document.createElementNS("http://www.w3.org/2000/svg", "text");
-          textEl.setAttribute("x", String(anchor.x));
+          textEl.setAttribute("x", String(xy.x));
           textEl.setAttribute("y", String(y));
           textEl.setAttribute("class", "agn-rn-label");
           textEl.textContent = label;

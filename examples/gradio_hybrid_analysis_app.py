@@ -21,6 +21,7 @@ import json
 import html as html_lib
 import re
 import tempfile
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,6 +44,7 @@ from analysisgnn.utils.chord_representations import format_table_output
 
 import flexohr as flx
 import flexohr.codecs.analysisgnn  # noqa: F401 — activate codec
+import flexohr.core.ohr  # noqa: F401
 import flexohr.harmony.harmony_enums  # noqa: F401
 import flexohr.paradigms.pitchspace.scale  # noqa: F401
 import flexohr.paradigms.pitchspace.scale_degrees  # noqa: F401
@@ -56,7 +58,6 @@ from analysisgnn.storage.delta_reader import (
     load_hyperedges,
     load_metadata,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FULL_CKPT = os.environ.get(
@@ -95,6 +96,7 @@ EDGE_LABELS = {
     "during": "During",
     "rest": "Rest",
 }
+VISUAL_RN_CANDIDATE_GROUPING = "onset"
 # Group naming for multi-table aggregation UI
 GROUP_NAMES: Dict[str, Tuple[str, str]] = {
     "none": ("note", "Notes"),
@@ -247,6 +249,7 @@ def _prepare_prediction_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
         out = out[other_cols]
 
     return out
+
 
 _GLOBAL_KEY_K = 5
 
@@ -416,9 +419,7 @@ def _build_ohrs_check(df: pd.DataFrame, global_key: str) -> None:
     required = ["degree1", "degree2", "inversion", "quality", "localkey"]
     missing = [k for k in required if k not in df.columns]
     if missing:
-        raise ValueError(
-            f"Cannot build OHRs: missing columns {missing}."
-        )
+        raise ValueError(f"Cannot build OHRs: missing columns {missing}.")
 
 
 def _build_ohrs(df: pd.DataFrame, global_key: str) -> list:
@@ -431,6 +432,198 @@ def _build_ohrs(df: pd.DataFrame, global_key: str) -> list:
     gk = _agnn_to_flx_pitch(global_key)
     work = _prepare_df_for_flexohr(df)
     return flx.codecs.analysisgnn.build_ohrs_from_dataframe(work, gk)
+
+
+_RN_CACHE_NA = "<NA>"
+_RN_CACHE_COLUMNS = ("degree1", "degree2", "inversion", "quality", "localkey")
+
+
+def _rn_cache_token(value: Any) -> str:
+    """Return a stable, hashable token for FlexOHR cache keys."""
+    value = _value_or_none(value)
+    if value is None:
+        return _RN_CACHE_NA
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        if np.isnan(value):
+            return _RN_CACHE_NA
+        if value.is_integer():
+            return str(int(value))
+    return str(value).strip()
+
+
+def _rn_token_to_number(token: str) -> Any:
+    if token == _RN_CACHE_NA:
+        return np.nan
+    try:
+        value = float(token)
+    except Exception:
+        return token
+    if value.is_integer():
+        return int(value)
+    return value
+
+
+def _rn_tokens_from_prepared_df(work: pd.DataFrame) -> pd.DataFrame:
+    key_df = work.loc[:, list(_RN_CACHE_COLUMNS)].copy()
+    for col in _RN_CACHE_COLUMNS:
+        key_df[col] = key_df[col].map(_rn_cache_token)
+    return key_df
+
+
+@lru_cache(maxsize=128)
+def _cached_chord_quality(quality: str) -> Any:
+    return flx.harmony.harmony_enums.ChordQuality.from_format(quality, "analysisgnn")
+
+
+@lru_cache(maxsize=16)
+def _cached_inversion(inversion: str) -> Any:
+    return flx.harmony.harmony_enums.Inversion.from_format(inversion, "analysisgnn")
+
+
+@lru_cache(maxsize=256)
+def _cached_collection_type(key: str) -> Any:
+    return flx.paradigms.pitchspace.scale.infer_collection_type(key)
+
+
+@lru_cache(maxsize=32768)
+def _cached_ohr_from_tokens(
+    global_key_flx: str,
+    degree1: str,
+    degree2: str,
+    inversion: str,
+    quality: str,
+    localkey: str,
+) -> Any:
+    """Build one FlexOHR object from cached component tokens.
+
+    FlexOHR's dataframe builder loops row-by-row internally.  App tables often
+    have many notes sharing the same harmonic state, so caching at this tuple
+    level removes most repeated OHR construction while preserving the same
+    codec path.
+    """
+    if (
+        degree1 == _RN_CACHE_NA
+        or inversion == _RN_CACHE_NA
+        or quality == _RN_CACHE_NA
+        or localkey == _RN_CACHE_NA
+    ):
+        return None
+    try:
+        quality_obj = _cached_chord_quality(quality)
+        inversion_obj = _cached_inversion(inversion)
+        localkey_coll = _cached_collection_type(localkey)
+        degree1_value = _rn_token_to_number(degree1)
+        degree2_value = _rn_token_to_number(degree2)
+
+        if degree2 == _RN_CACHE_NA:
+            ref_ohr = flx.paradigms.pitchspace.scale.build_key_context(
+                global_key_flx, localkey
+            )
+            tonic_coll = localkey_coll
+        else:
+            sd2 = flx.paradigms.pitchspace.scale_degrees.SD.from_int(
+                degree2_value, collection_type=localkey_coll
+            )
+            ref_ohr = flx.paradigms.pitchspace.scale.build_key_context(
+                global_key_flx,
+                localkey,
+                tonicized_key=sd2,
+                tonicized_coll=flx.harmony.harmony_enums.CollectionType.major,
+            )
+            tonic_coll = flx.harmony.harmony_enums.CollectionType.major
+
+        degree1_sd = flx.paradigms.pitchspace.scale_degrees.SD.from_int(
+            degree1_value, collection_type=tonic_coll
+        )
+        return flx.core.ohr.OHR.from_(
+            quality_obj, degree1_sd, inversion=inversion_obj, reference_ohr=ref_ohr
+        )
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=32768)
+def _cached_complete_rn_from_tokens(
+    global_key_display: str,
+    global_key_flx: str,
+    degree1: str,
+    degree2: str,
+    inversion: str,
+    quality: str,
+    localkey: str,
+) -> str:
+    ohr = _cached_ohr_from_tokens(
+        global_key_flx, degree1, degree2, inversion, quality, localkey
+    )
+    if ohr is None:
+        return ""
+    try:
+        return _format_dcml_with_global_key(ohr.to_format("dcml"), global_key_display)
+    except Exception:
+        return ""
+
+
+@lru_cache(maxsize=65536)
+def _cached_expected_labels_from_tokens(
+    global_key_flx: str,
+    degree1: str,
+    degree2: str,
+    inversion: str,
+    quality: str,
+    localkey: str,
+    pitch_spelling: str,
+) -> Tuple[Tuple[str, str], ...]:
+    ohr = _cached_ohr_from_tokens(
+        global_key_flx, degree1, degree2, inversion, quality, localkey
+    )
+    if ohr is None:
+        return tuple()
+    row = {
+        "degree1": [_rn_token_to_number(degree1)],
+        "degree2": [_rn_token_to_number(degree2)],
+        "inversion": [_rn_token_to_number(inversion)],
+        "quality": [quality],
+        "localkey": [localkey],
+        "pitch_spelling": ["" if pitch_spelling == _RN_CACHE_NA else pitch_spelling],
+    }
+    try:
+        labels = flx.codecs.analysisgnn.derive_expected_labels(
+            pd.DataFrame(row), [ohr], global_key_flx
+        )
+    except Exception:
+        return tuple()
+    if not labels:
+        return tuple()
+    return tuple(sorted((str(k), str(v)) for k, v in labels[0].items()))
+
+
+def _cached_ohrs_for_prepared_df(
+    prepared: pd.DataFrame,
+    global_key_flx: str,
+) -> Tuple[List[Any], List[Any]]:
+    """Return row indices and cached OHRs for valid prepared rows."""
+    if prepared is None or len(prepared) == 0:
+        return [], []
+    core_numeric = ["degree1", "inversion"]
+    valid_mask = prepared[core_numeric].notna().all(axis=1)
+    valid_prepared = prepared.loc[valid_mask]
+    if len(valid_prepared) == 0:
+        return [], []
+
+    key_df = _rn_tokens_from_prepared_df(valid_prepared)
+    positions: List[Any] = []
+    ohrs: List[Any] = []
+    for pos, tokens in zip(
+        valid_prepared.index, key_df.itertuples(index=False, name=None)
+    ):
+        ohr = _cached_ohr_from_tokens(global_key_flx, *tokens)
+        if ohr is None:
+            continue
+        positions.append(pos)
+        ohrs.append(ohr)
+    return positions, ohrs
 
 
 def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
@@ -459,10 +652,14 @@ def _build_complete_rn_column(df: pd.DataFrame, global_key: str) -> pd.Series:
     out = pd.Series("", index=df.index, dtype=object)
     valid_df = work.loc[valid_mask]
     if len(valid_df) > 0:
-        ohrs = flx.codecs.analysisgnn.build_ohrs_from_dataframe(valid_df, gk)
-        for ohr, idx in zip(ohrs, valid_df.index):
-            dcml = ohr.to_format("dcml")
-            out.at[idx] = _format_dcml_with_global_key(dcml, global_key)
+        key_df = _rn_tokens_from_prepared_df(valid_df)
+        tokens = list(key_df.itertuples(index=False, name=None))
+        unique_tokens = dict.fromkeys(tokens)
+        label_by_token = {
+            token: _cached_complete_rn_from_tokens(global_key, gk, *token)
+            for token in unique_tokens
+        }
+        out.loc[valid_df.index] = [label_by_token.get(token, "") for token in tokens]
     return out
 
 
@@ -486,9 +683,7 @@ def _apply_localkey_mode_map_to_probs(
 
     df = probs_df.copy()
     task_mask = df["task"].isin(tasks)
-    df.loc[task_mask, "class_label"] = (
-        df.loc[task_mask, "class_label"].replace(subs)
-    )
+    df.loc[task_mask, "class_label"] = df.loc[task_mask, "class_label"].replace(subs)
 
     # Merge duplicate (note_id, task, class_label) rows.  is_argmax / rank
     # are not used downstream by the scorer's distribution_matrix pivot, so
@@ -553,12 +748,16 @@ def _enumerate_rn_candidates(
     # (e.g. P("f") ≈ 0.003) while a competing un-corrected major key like
     # P("C") = 0.008 wins.  Reassign each mapped label's probability mass to
     # the corrected label so scoring sees P("f") = P("F") + P("f").
-    probs_for_scoring = _apply_localkey_mode_map_to_probs(
-        probs_df, localkey_mode_map
-    )
+    probs_for_scoring = _apply_localkey_mode_map_to_probs(probs_df, localkey_mode_map)
 
     # Build full scoring context from Delta-style DataFrames
-    edges_df = pd.DataFrame({"src": pd.Series(dtype=str), "dst": pd.Series(dtype=str), "edge_type": pd.Series(dtype=str)})
+    edges_df = pd.DataFrame(
+        {
+            "src": pd.Series(dtype=str),
+            "dst": pd.Series(dtype=str),
+            "edge_type": pd.Series(dtype=str),
+        }
+    )
     ctx = ScoringContext(
         note_ids=list(notes_df["note_id"]),
         notes=notes_df,
@@ -584,12 +783,16 @@ def _enumerate_rn_candidates(
     # note_id -> pitch_spelling (for tpc_in_label / note_degree derivation)
     note_pitch: Dict[str, str] = {}
     if "pitch_spelling" in notes_df.columns:
-        note_pitch = dict(zip(notes_df["note_id"], notes_df["pitch_spelling"]))
+        note_pitch = dict(
+            zip(notes_df["note_id"].astype(str), notes_df["pitch_spelling"])
+        )
 
     # note_id -> localkey from display_df (for note_degree)
     note_localkey: Dict[str, str] = {}
     if "note_id" in display_df.columns and "localkey" in display_df.columns:
-        note_localkey = dict(zip(display_df["note_id"], display_df["localkey"]))
+        note_localkey = dict(
+            zip(display_df["note_id"].astype(str), display_df["localkey"])
+        )
 
     scorer = GeometricMeanScorer()
     result: Dict[str, List[Dict[str, Any]]] = {}
@@ -602,7 +805,11 @@ def _enumerate_rn_candidates(
         try:
             sub = ctx.subcontext(valid_notes)
             candidates, _trace = enumerate_roman_numerals(
-                sub, gk, k=k, top_n=top_n, scorer=scorer,
+                sub,
+                gk,
+                k=k,
+                top_n=top_n,
+                scorer=scorer,
                 localkey_mode_map=localkey_mode_map,
             )
         except Exception:
@@ -622,14 +829,19 @@ def _enumerate_rn_candidates(
                 d2 = base_expected.get("degree2", "None")
                 if d2 in ("None", "", None):
                     base_expected["tonkey"] = base_expected.get("localkey", "")
-            group_candidates.append({
-                "dcml": _format_dcml_with_global_key(cand.dcml, global_key),
-                "score": round(cand.result.core.score, 4),
-                "base_expected": base_expected,
-                "_raw_dcml": cand.dcml,
-            })
+            group_candidates.append(
+                {
+                    "dcml": _format_dcml_with_global_key(cand.dcml, global_key),
+                    "score": round(cand.result.core.score, 4),
+                    "base_expected": base_expected,
+                    "_raw_dcml": cand.dcml,
+                }
+            )
 
         # Per-note candidates: add note-level expected (tpc_in_label, note_degree)
+        cand_by_raw = {cand.dcml: cand for cand in candidates}
+        chord_names_by_raw: Dict[str, set[str]] = {}
+        scale_cache: Dict[str, Tuple[Any, Any]] = {}
         for nid in valid_notes:
             note_cands: List[Dict[str, Any]] = []
             for gc in group_candidates:
@@ -644,13 +856,21 @@ def _enumerate_rn_candidates(
                         pc = m.group(1)
                         # tpc_in_label: check if pitch is in chord components
                         try:
-                            cand_obj = [c for c in candidates if c.dcml == gc["_raw_dcml"]][0]
-                            resolved = cand_obj.ohr.resolve()
-                            chord_names = set()
-                            for comp in resolved.components("b", depth=1):
-                                if hasattr(comp, "value") and hasattr(comp.value, "name"):
-                                    chord_names.add(comp.value.name)
-                            expected["tpc_in_label"] = "True" if pc in chord_names else "False"
+                            raw_dcml = gc["_raw_dcml"]
+                            chord_names = chord_names_by_raw.get(raw_dcml)
+                            if chord_names is None:
+                                cand_obj = cand_by_raw[raw_dcml]
+                                resolved = cand_obj.ohr.resolve()
+                                chord_names = set()
+                                for comp in resolved.components("b", depth=1):
+                                    if hasattr(comp, "value") and hasattr(
+                                        comp.value, "name"
+                                    ):
+                                        chord_names.add(comp.value.name)
+                                chord_names_by_raw[raw_dcml] = chord_names
+                            expected["tpc_in_label"] = (
+                                "True" if pc in chord_names else "False"
+                            )
                         except Exception:
                             pass
                         # note_degree from localkey + pitch
@@ -666,9 +886,14 @@ def _enumerate_rn_candidates(
                                 )
 
                                 lk_str = lk.replace("-", "b")
-                                lk_coll = infer_collection_type(lk_str)
-                                lk_root = SPC(lk_str[0].upper() + lk_str[1:])
-                                lk_scale = get_scale(lk_coll, lk_root)
+                                scale_pair = scale_cache.get(lk_str)
+                                if scale_pair is None:
+                                    lk_coll = infer_collection_type(lk_str)
+                                    lk_root = SPC(lk_str[0].upper() + lk_str[1:])
+                                    lk_scale = get_scale(lk_coll, lk_root)
+                                    scale_pair = (lk_root, lk_scale)
+                                    scale_cache[lk_str] = scale_pair
+                                lk_root, lk_scale = scale_pair
                                 note_spc = SPC(pc)
                                 sic = note_spc - lk_root
                                 sd = lk_scale.make_scale_degree(sic)
@@ -679,11 +904,13 @@ def _enumerate_rn_candidates(
                 # Copy tpc_in_label -> pitch_spelling for Pitch tile coloring
                 if "tpc_in_label" in expected:
                     expected["pitch_spelling"] = expected["tpc_in_label"]
-                note_cands.append({
-                    "dcml": gc["dcml"],
-                    "score": gc["score"],
-                    "expected": expected,
-                })
+                note_cands.append(
+                    {
+                        "dcml": gc["dcml"],
+                        "score": gc["score"],
+                        "expected": expected,
+                    }
+                )
             result[nid] = note_cands
 
     return result
@@ -743,23 +970,114 @@ def _inject_note_ids(xml_text: str, score: pt.score.Score) -> str:
     return _note_re.sub(_replacer, xml_text)
 
 
+_SCORE_XML_TEXT_CACHE: Dict[Tuple[str, int, int], str] = {}
+_SCORE_XML_TEXT_CACHE_MAX = 8
+_RN_CANDIDATE_CACHE: Dict[Tuple[Any, ...], Dict[str, List[Dict[str, Any]]]] = {}
+_RN_CANDIDATE_CACHE_MAX = 4
+
+
+def _score_xml_cache_key(score_path: str) -> Tuple[str, int, int]:
+    path = Path(score_path)
+    try:
+        stat = path.stat()
+        return (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return (str(path), 0, 0)
+
+
+def _df_fingerprint(df: pd.DataFrame, cols: List[str]) -> Tuple[Any, ...]:
+    present = [col for col in cols if col in df.columns]
+    if not present:
+        return (len(df),)
+    values = df[present].fillna(_RN_CACHE_NA).astype(str)
+    hashes = pd.util.hash_pandas_object(values, index=False).to_numpy(dtype=np.uint64)
+    if len(hashes) == 0:
+        return (0, tuple(present), 0, 0)
+    return (
+        len(df),
+        tuple(present),
+        int(hashes.sum(dtype=np.uint64)),
+        int(np.bitwise_xor.reduce(hashes)),
+    )
+
+
+def _rn_candidate_cache_key(
+    display_df: pd.DataFrame,
+    probs_df: pd.DataFrame,
+    notes_df: pd.DataFrame,
+    hyperedges_df: pd.DataFrame,
+    global_key: str,
+    grouping: str,
+) -> Tuple[Any, ...]:
+    return (
+        global_key,
+        grouping,
+        id(probs_df),
+        len(probs_df),
+        id(notes_df),
+        len(notes_df),
+        id(hyperedges_df),
+        len(hyperedges_df),
+        _df_fingerprint(display_df, ["note_id", "localkey", "pitch_spelling"]),
+    )
+
+
+def _get_cached_rn_candidates(
+    display_df: pd.DataFrame,
+    probs_df: pd.DataFrame,
+    notes_df: pd.DataFrame,
+    hyperedges_df: pd.DataFrame,
+    global_key: str,
+    grouping: str,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], bool]:
+    cache_key = _rn_candidate_cache_key(
+        display_df, probs_df, notes_df, hyperedges_df, global_key, grouping
+    )
+    cached = _RN_CANDIDATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached, True
+    result = _enumerate_rn_candidates(
+        display_df=display_df,
+        probs_df=probs_df,
+        notes_df=notes_df,
+        hyperedges_df=hyperedges_df,
+        global_key=global_key,
+        grouping=grouping,
+    )
+    if len(_RN_CANDIDATE_CACHE) >= _RN_CANDIDATE_CACHE_MAX:
+        _RN_CANDIDATE_CACHE.pop(next(iter(_RN_CANDIDATE_CACHE)))
+    _RN_CANDIDATE_CACHE[cache_key] = result
+    return result, False
+
+
 def _read_score_xml_text(score_path: str, score: pt.score.Score) -> str:
+    cache_key = _score_xml_cache_key(score_path)
+    cached = _SCORE_XML_TEXT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     suffix = Path(score_path).suffix.lower()
     if suffix in {".xml", ".musicxml"}:
         with open(score_path, "r", encoding="utf-8", errors="ignore") as f:
             xml_text = f.read()
-        return _inject_note_ids(xml_text, score)
-    with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        pt.save_musicxml(score, tmp_path)
-        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
-    finally:
+        xml_text = _inject_note_ids(xml_text, score)
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False) as tmp:
+            tmp_path = tmp.name
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+            pt.save_musicxml(score, tmp_path)
+            with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+                xml_text = f.read()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    if len(_SCORE_XML_TEXT_CACHE) >= _SCORE_XML_TEXT_CACHE_MAX:
+        _SCORE_XML_TEXT_CACHE.pop(next(iter(_SCORE_XML_TEXT_CACHE)))
+    _SCORE_XML_TEXT_CACHE[cache_key] = xml_text
+    return xml_text
 
 
 def _build_complete_rn_spans(
@@ -781,24 +1099,22 @@ def _build_complete_rn_spans(
     work["duration_div"] = pd.to_numeric(work["duration_div"], errors="coerce").fillna(
         0
     )
-    work["note_label"] = (
-        work["note_label"].fillna("").astype(str).str.strip()
-    )
+    work["note_label"] = work["note_label"].fillna("").astype(str).str.strip()
     work = work.dropna(subset=["onset_div"])
     if len(work) == 0:
         return []
 
-    by_onset = work.sort_values(["onset_div", "duration_div"]).groupby(
-        "onset_div", sort=True
-    )
-    onset_points: List[int] = []
-    onset_rn: List[str] = []
-    for onset, group in by_onset:
-        onset_i = int(onset)
-        candidates = [v for v in group["note_label"].tolist() if v]
-        rn_value = candidates[0] if candidates else ""
-        onset_points.append(onset_i)
-        onset_rn.append(rn_value)
+    work = work.sort_values(["onset_div", "duration_div"])
+    onset_points = work["onset_div"].drop_duplicates().astype(int).tolist()
+    nonempty = work[work["note_label"].astype(bool)]
+    if len(nonempty) > 0:
+        first_labels = nonempty.drop_duplicates("onset_div", keep="first")
+        rn_by_onset = dict(
+            zip(first_labels["onset_div"].astype(int), first_labels["note_label"])
+        )
+    else:
+        rn_by_onset = {}
+    onset_rn = [rn_by_onset.get(onset, "") for onset in onset_points]
     if not onset_points:
         return []
 
@@ -849,6 +1165,11 @@ def _build_group_table(
 
     group_members = groups.groupby("group_id")["note_id"].apply(list).to_dict()
     note_id_col = "note_id" if "note_id" in agg_note_df.columns else None
+    note_lookup = None
+    if note_id_col:
+        lookup_df = agg_note_df.copy()
+        lookup_df[note_id_col] = lookup_df[note_id_col].astype(str)
+        note_lookup = lookup_df.set_index(note_id_col, drop=False)
 
     # Determine which task columns exist
     task_cols: List[str] = []
@@ -863,10 +1184,13 @@ def _build_group_table(
     for group_id, member_nids in group_members.items():
         # Find all member rows and pick the first as representative
         member_str_ids = [str(nid) for nid in member_nids]
-        if note_id_col:
-            member_rows = agg_note_df[
-                agg_note_df[note_id_col].isin(member_str_ids)
-            ]
+        if note_lookup is not None:
+            existing_ids = [nid for nid in member_str_ids if nid in note_lookup.index]
+            member_rows = (
+                note_lookup.loc[existing_ids] if existing_ids else pd.DataFrame()
+            )
+            if isinstance(member_rows, pd.Series):
+                member_rows = member_rows.to_frame().T
         else:
             member_rows = pd.DataFrame()
         if member_rows.empty:
@@ -929,8 +1253,10 @@ def _map_group_labels_to_notes(
     group_to_label = dict(
         zip(group_df["group_id"].astype(str), group_df[label_col].astype(str))
     )
-    out[label_col] = out["note_id"].astype(str).map(
-        lambda nid: group_to_label.get(note_to_group.get(nid, ""), "")
+    out[label_col] = (
+        out["note_id"]
+        .astype(str)
+        .map(lambda nid: group_to_label.get(note_to_group.get(nid, ""), ""))
     )
     return out
 
@@ -1021,8 +1347,7 @@ def _build_graph_overlay_payload(
     # Use top-1 enumerated candidate as the Complete RN when available
     if rn_candidates_map and "note_id" in data.columns:
         rn_vals = []
-        for idx in range(n):
-            nid = str(data.iloc[idx].get("note_id", ""))
+        for nid in data["note_id"].astype(str).tolist():
             cands = rn_candidates_map.get(nid, [])
             rn_vals.append(cands[0]["dcml"] if cands else "")
         rn_full = pd.Series(rn_vals, dtype=object)
@@ -1046,30 +1371,57 @@ def _build_graph_overlay_payload(
     if not rn_candidates_map and global_key:
         prepared = _prepare_df_for_flexohr(data)
         gk = _agnn_to_flx_pitch(global_key)
-        # Filter to rows with valid core numeric columns (NaN = no OHR)
         core_numeric = ["degree1", "inversion"]
         valid_mask = prepared[core_numeric].notna().all(axis=1)
         valid_prepared = prepared.loc[valid_mask]
         if len(valid_prepared) > 0:
-            ohrs = flx.codecs.analysisgnn.build_ohrs_from_dataframe(valid_prepared, gk)
-            valid_labels = flx.codecs.analysisgnn.derive_expected_labels(
-                valid_prepared, ohrs, gk
-            )
-            for rec, (orig_idx, _) in zip(valid_labels, valid_prepared.iterrows()):
+            key_df = _rn_tokens_from_prepared_df(valid_prepared)
+            if "pitch_spelling" in data.columns:
+                pitch_tokens = data.loc[valid_prepared.index, "pitch_spelling"].map(
+                    _rn_cache_token
+                )
+            else:
+                pitch_tokens = pd.Series(
+                    [_RN_CACHE_NA] * len(valid_prepared),
+                    index=valid_prepared.index,
+                    dtype=object,
+                )
+            for orig_idx, tokens, pitch_token in zip(
+                valid_prepared.index,
+                key_df.itertuples(index=False, name=None),
+                pitch_tokens.tolist(),
+            ):
+                rec = dict(
+                    _cached_expected_labels_from_tokens(gk, *tokens, pitch_token)
+                )
                 if "tpc_in_label" in rec:
                     rec["pitch_spelling"] = rec["tpc_in_label"]
-                expected_labels[orig_idx] = rec
+                expected_labels[int(orig_idx)] = rec
 
     notes_payload: List[Dict[str, Any]] = []
-    for idx in range(n):
-        row = data.iloc[idx]
+    records = data.to_dict("records")
+    note_dtype_names = set(note_array.dtype.names or ())
+    score_note_ids = (
+        [_value_or_none(v) for v in note_array["id"][:n]]
+        if "id" in note_dtype_names
+        else [None] * n
+    )
+    onset_divs = (
+        [int(v) for v in note_array["onset_div"][:n]]
+        if "onset_div" in note_dtype_names
+        else [None] * n
+    )
+    rn_full_values = rn_full.tolist()
+    agg_maps = agg_rn_candidates_maps or {}
+
+    for idx, row in enumerate(records):
         conf: Dict[str, float] = {}
         task_vals: Dict[str, Any] = {}
         for task in tasks:
-            if task in row.index:
+            if task in row:
                 task_vals[task] = _value_or_none(row.get(task))
             conf_col = f"{task}_confidence"
-            if conf_col in row.index:
+            if conf_col in row:
                 conf_val = _value_or_none(row.get(conf_col))
                 if conf_val is not None:
                     try:
@@ -1078,39 +1430,35 @@ def _build_graph_overlay_payload(
                         pass
 
         note_id = _value_or_none(row.get("note_id"))
-        score_note_id = (
-            _value_or_none(note_array["id"][idx])
-            if "id" in note_array.dtype.names
-            else None
-        )
+        score_note_id = score_note_ids[idx]
+        measure_value = _value_or_none(row.get("measure"))
+        pitch_midi_value = _value_or_none(row.get("pitch_midi"))
         notes_payload.append(
             {
                 "index": idx,
-                "row": int(
-                    _value_or_none(row.get("row")) if "row" in row.index else idx
+                "row": int(_value_or_none(row.get("row")) if "row" in row else idx),
+                "note_id": (
+                    str(score_note_id)
+                    if score_note_id is not None
+                    else (str(note_id) if note_id is not None else None)
                 ),
-                "note_id": str(score_note_id)
-                if score_note_id is not None
-                else (str(note_id) if note_id is not None else None),
                 "table_note_id": str(note_id) if note_id is not None else None,
-                "onset_div": int(note_array["onset_div"][idx])
-                if "onset_div" in note_array.dtype.names
-                else None,
+                "onset_div": onset_divs[idx],
                 "onset_beat": float(_value_or_none(row.get("onset_beat")) or 0.0),
-                "measure": int(_value_or_none(row.get("measure")))
-                if _value_or_none(row.get("measure")) is not None
-                else None,
+                "measure": int(measure_value) if measure_value is not None else None,
                 "duration_beat": float(_value_or_none(row.get("duration_beat")) or 0.0),
-                "pitch_midi": int(_value_or_none(row.get("pitch_midi")))
-                if _value_or_none(row.get("pitch_midi")) is not None
-                else None,
+                "pitch_midi": (
+                    int(pitch_midi_value) if pitch_midi_value is not None else None
+                ),
                 "pitch_spelling": str(_value_or_none(row.get("pitch_spelling")) or ""),
                 "tasks": task_vals,
                 "confidence": conf,
-                "note_label": str(rn_full.iloc[idx])
-                if idx < len(rn_full)
-                else "",
-                "rn_expected": expected_labels[idx] if idx < len(expected_labels) else {},
+                "note_label": (
+                    str(rn_full_values[idx]) if idx < len(rn_full_values) else ""
+                ),
+                "rn_expected": (
+                    expected_labels[idx] if idx < len(expected_labels) else {}
+                ),
                 "rn_candidates": (
                     rn_candidates_map.get(str(note_id), [])
                     if rn_candidates_map and note_id
@@ -1119,9 +1467,9 @@ def _build_graph_overlay_payload(
                 "rn_agg_candidates": (
                     {
                         agg_label: agg_map.get(str(note_id), [])
-                        for agg_label, agg_map in (agg_rn_candidates_maps or {}).items()
+                        for agg_label, agg_map in agg_maps.items()
                     }
-                    if agg_rn_candidates_maps and note_id
+                    if agg_maps and note_id
                     else {}
                 ),
             }
@@ -1182,8 +1530,10 @@ def _build_visual_payload(
     global_key: str = "",
     rn_candidates_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     agg_rn_candidates_maps: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None,
+    note_array: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    note_array = _sorted_note_array(score)
+    if note_array is None:
+        note_array = _sorted_note_array(score)
     payload = _build_graph_overlay_payload(
         df=df,
         note_array=note_array,
@@ -1601,9 +1951,7 @@ def run_full_inference(
         global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        display_df["note_label"] = _build_complete_rn_column(
-            display_df, global_key
-        )
+        display_df["note_label"] = _build_complete_rn_column(display_df, global_key)
         display_df = _prepare_prediction_table_for_display(display_df)
 
         # Build visual payload
@@ -1615,6 +1963,7 @@ def run_full_inference(
             edge_types=[],
             edges_all=edges_all,
             global_key=global_key,
+            note_array=note_array,
         )
 
         # Write Delta Lake
@@ -1762,9 +2111,7 @@ def load_from_delta_lake(delta_lake_path: Any, log_text: str) -> tuple:
         global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        display_df["note_label"] = _build_complete_rn_column(
-            display_df, global_key
-        )
+        display_df["note_label"] = _build_complete_rn_column(display_df, global_key)
         display_df = _prepare_prediction_table_for_display(display_df)
 
         csv_path = _write_csv_to_temp(display_df, score_path)
@@ -1817,6 +2164,7 @@ _aggregation_cache: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
 
 def _clear_aggregation_cache() -> None:
     _aggregation_cache.clear()
+    _RN_CANDIDATE_CACHE.clear()
 
 
 def _resolve_strategy_name(group: str, strategy: str) -> str:
@@ -1856,7 +2204,9 @@ def run_aggregation(
         resolved_name = _resolve_strategy_name(group_name, strategy_name)
         tasks = tasks_state or []
         delta_dfs = delta_dfs_state or {}
-        agg_rn_cands = dict(agg_rn_candidates_state_val) if agg_rn_candidates_state_val else {}
+        agg_rn_cands = (
+            dict(agg_rn_candidates_state_val) if agg_rn_candidates_state_val else {}
+        )
         intermediates = intermediates_state or {}
         global_key = (global_key_text or "").strip()
         tables = dict(tables_state_val) if tables_state_val else {}
@@ -1889,7 +2239,11 @@ def run_aggregation(
             csv_path = _write_csv_to_temp(notes_df, score_path_state)
             choices = list(tables.keys())
             return (
-                notes_df, log_text, {}, csv_path, tables,
+                notes_df,
+                log_text,
+                {},
+                csv_path,
+                tables,
                 gr.update(choices=choices, value=DEFAULT_TABLE_LABEL),
                 agg_rn_cands,
             )
@@ -1921,8 +2275,12 @@ def run_aggregation(
 
             # Build group-level table
             group_df = _build_group_table(
-                agg_note_df, hyperedges_df, group_lower,
-                tasks, global_key, label_col,
+                agg_note_df,
+                hyperedges_df,
+                group_lower,
+                tasks,
+                global_key,
+                label_col,
             )
 
             _aggregation_cache[resolved_name] = (agg_note_df, group_df)
@@ -1937,7 +2295,11 @@ def run_aggregation(
         if not notes_df.empty and not group_df.empty:
             hyperedges_df = delta_dfs.get("hyperedges_df", pd.DataFrame())
             notes_df = _map_group_labels_to_notes(
-                notes_df, group_df, hyperedges_df, group_lower, label_col,
+                notes_df,
+                group_df,
+                hyperedges_df,
+                group_lower,
+                label_col,
             )
             notes_df = _prepare_prediction_table_for_display(notes_df)
             tables[DEFAULT_TABLE_LABEL] = notes_df
@@ -1971,17 +2333,27 @@ def run_aggregation(
         csv_path = _write_csv_to_temp(notes_df, score_path_state)
         choices = list(tables.keys())
         return (
-            notes_df, log_text, {}, csv_path, tables,
+            notes_df,
+            log_text,
+            {},
+            csv_path,
+            tables,
             gr.update(choices=choices, value=DEFAULT_TABLE_LABEL),
             agg_rn_cands,
         )
     except Exception as exc:
         log_text = _log(log_text, f"Aggregation error: {exc}")
         tables = dict(tables_state_val) if tables_state_val else {}
-        agg_rn_cands = dict(agg_rn_candidates_state_val) if agg_rn_candidates_state_val else {}
+        agg_rn_cands = (
+            dict(agg_rn_candidates_state_val) if agg_rn_candidates_state_val else {}
+        )
         choices = list(tables.keys()) or [DEFAULT_TABLE_LABEL]
         return (
-            pd.DataFrame(), log_text, {}, None, tables,
+            pd.DataFrame(),
+            log_text,
+            {},
+            None,
+            tables,
             gr.update(choices=choices),
             agg_rn_cands,
         )
@@ -2160,9 +2532,7 @@ def run_edit_conditioned(
         global_key = _derive_global_key(display_df)
 
         # Add Complete RN column
-        display_df["note_label"] = _build_complete_rn_column(
-            display_df, global_key
-        )
+        display_df["note_label"] = _build_complete_rn_column(display_df, global_key)
         display_df = _prepare_prediction_table_for_display(display_df)
 
         visual_payload = _build_visual_payload(
@@ -2173,6 +2543,7 @@ def run_edit_conditioned(
             edge_types=[],
             edges_all=edges_all,
             global_key=global_key,
+            note_array=note_array,
         )
 
         log_text = _log(
@@ -2283,8 +2654,13 @@ def refresh_visual_tab(
     delta_dfs_state: Any = None,
     agg_rn_candidates: Any = None,
     tables_state_val: Any = None,
+    enable_rn_candidates: bool = False,
 ):
     try:
+        t_refresh = time.perf_counter()
+        enum_seconds = 0.0
+        payload_seconds = 0.0
+        html_seconds = 0.0
         selected_edge_types = [
             k for k, label in EDGE_LABELS.items() if label in (edge_type_labels or [])
         ]
@@ -2331,33 +2707,44 @@ def refresh_visual_tab(
             # Enumerate note-wise RN candidates (always grouping="none")
             rn_cands_map = None
             delta_dfs = delta_dfs_state if isinstance(delta_dfs_state, dict) else {}
-            if global_key and delta_dfs.get("probs_df") is not None:
+            if (
+                enable_rn_candidates
+                and global_key
+                and delta_dfs.get("probs_df") is not None
+            ):
                 try:
-                    rn_cands_map = _enumerate_rn_candidates(
-                        display_df=df,
-                        probs_df=delta_dfs["probs_df"],
-                        notes_df=delta_dfs["notes_df"],
-                        hyperedges_df=delta_dfs["hyperedges_df"],
-                        global_key=global_key,
-                        grouping="none",
+                    t_enum = time.perf_counter()
+                    rn_cands_map, rn_cands_cached = _get_cached_rn_candidates(
+                        df,
+                        delta_dfs["probs_df"],
+                        delta_dfs["notes_df"],
+                        delta_dfs["hyperedges_df"],
+                        global_key,
+                        VISUAL_RN_CANDIDATE_GROUPING,
                     )
+                    enum_seconds = time.perf_counter() - t_enum
                     log_text = _log(
                         log_text,
-                        f"Enumerated note-wise RN candidates for {len(rn_cands_map)} notes.",
+                        f"{'Reused cached' if rn_cands_cached else 'Enumerated'} "
+                        f"{VISUAL_RN_CANDIDATE_GROUPING}-group RN candidates for "
+                        f"{len(rn_cands_map)} notes.",
                     )
                 except Exception as enum_exc:
                     log_text = _log(
                         log_text,
                         f"RN enumeration failed: {enum_exc}",
                     )
+            elif not enable_rn_candidates:
+                log_text = _log(
+                    log_text,
+                    "RN alternatives skipped for fast visual refresh. "
+                    "Complete RN labels and agreement coloring still shown.",
+                )
 
             # Accumulated aggregation-level candidates from state
-            agg_cands = (
-                agg_rn_candidates
-                if isinstance(agg_rn_candidates, dict)
-                else {}
-            )
+            agg_cands = agg_rn_candidates if isinstance(agg_rn_candidates, dict) else {}
 
+            t_payload = time.perf_counter()
             payload = _build_visual_payload(
                 score_path=score_path,
                 score=score_obj,
@@ -2368,7 +2755,9 @@ def refresh_visual_tab(
                 global_key=global_key,
                 rn_candidates_map=rn_cands_map,
                 agg_rn_candidates_maps=agg_cands,
+                note_array=note_array,
             )
+            payload_seconds = time.perf_counter() - t_payload
             # Apply NCT coloring
             if nct_color:
                 n = min(len(note_array), len(df))
@@ -2384,13 +2773,18 @@ def refresh_visual_tab(
                 "(or run inference in Module 1a) and ensure predictions are loaded."
             )
 
+        t_html = time.perf_counter()
         html_frame = _build_verovio_html(payload)
+        html_seconds = time.perf_counter() - t_html
         note_count = len(payload.get("notes", []))
+        total_seconds = time.perf_counter() - t_refresh
         log_text = _log(
             log_text,
             f"Visual refreshed: notes={note_count}, "
             f"visible edges={','.join(selected_edge_types) if selected_edge_types else 'none'}"
-            f"{', NCT coloring ON' if nct_color else ''}.",
+            f"{', NCT coloring ON' if nct_color else ''}. "
+            f"Timing: enum={enum_seconds:.2f}s payload={payload_seconds:.2f}s "
+            f"html={html_seconds:.2f}s total={total_seconds:.2f}s.",
         )
         return html_frame, log_text, payload
     except Exception as exc:
@@ -2438,7 +2832,9 @@ def regenerate_rn_column(
         # Update tables_state
         tables = dict(tables_state_val) if tables_state_val else {}
         tables[DEFAULT_TABLE_LABEL] = df
-        log_text = _log(log_text, f"Regenerated RN column with global key '{global_key}'.")
+        log_text = _log(
+            log_text, f"Regenerated RN column with global key '{global_key}'."
+        )
         return df, log_text, csv_path, tables
     except Exception as exc:
         log_text = _log(log_text, f"RN regeneration error: {exc}")
@@ -2615,6 +3011,11 @@ def build_demo() -> gr.Blocks:
                     value=[],
                     info="Chord tones -> black, non-chord tones -> light grey, scaled by confidence.",
                 )
+                rn_candidate_checkbox = gr.Checkbox(
+                    label="Show RN alternatives (slower)",
+                    value=False,
+                    info="Off keeps large-score rendering fast. On computes N-best RN alternatives for the note panel.",
+                )
                 refresh_visual_btn = gr.Button("Refresh Visual", variant="secondary")
                 visual_html = gr.HTML(
                     value=(
@@ -2789,8 +3190,12 @@ def build_demo() -> gr.Blocks:
                 agg_rn_candidates_state,
             ],
             outputs=[
-                table, log_output, visual_payload_state, csv_download,
-                tables_state, table_selector,
+                table,
+                log_output,
+                visual_payload_state,
+                csv_download,
+                tables_state,
+                table_selector,
                 agg_rn_candidates_state,
             ],
         )
@@ -2846,6 +3251,7 @@ def build_demo() -> gr.Blocks:
                 delta_dfs_state,
                 agg_rn_candidates_state,
                 tables_state,
+                rn_candidate_checkbox,
             ],
             outputs=[visual_html, log_output, visual_payload_state],
         )
