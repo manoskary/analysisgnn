@@ -156,13 +156,12 @@ def get_input_irrelevant_features(part) -> Tuple[np.ndarray, List]:
         hv_1 = 1 if (chord_pitch.max() - chord_pitch.min()) % 12 == 0 and chord_pitch.max() != chord_pitch.min() else 0
         chord_has_2m = 1 if n["pitch"] - chord_pitch.min() in [1, -1] else 0
         chord_has_2M = 1 if n["pitch"] - chord_pitch.min() in [2, -2] else 0
-        octave = int(n["pitch"]/12)
         intervals = {"interval" + str(i): (1 if i in (n_cons["pitch"] - n["pitch"]) or -i in (
                 n_cons["pitch"] - n["pitch"]) else 0) for i in range(13)} if n_cons.size else {"interval" + str(i): 0
                                                                                                for i in range(13)}
         ca[i] = np.array(int_vec + list(intervals.values()) + list(chords_features.values()) +
                          [is_maj_triad, is_pmaj_triad, is_min_triad, ped_note, hv_7, hv_5, hv_3, hv_1, chord_has_2m,
-                          chord_has_2M, octave])
+                          chord_has_2M])
     pc, pc_names = get_pc_one_hot(part, note_array)
 
     dur_feats, dur_names = pt.musicanalysis.note_features.duration_feature(note_array, part)

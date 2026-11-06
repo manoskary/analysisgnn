@@ -39,6 +39,9 @@ dependencies:
     - torchmetrics>=0.11.0
     - wandb>=0.13.0
     - imbalanced-learn>=0.9.0
+    - transformers>=4.41.0
+    - peft>=0.10.0
+    - miditok>=3.0.0
     
     # Development tools (optional)
     - pytest>=7.0.0

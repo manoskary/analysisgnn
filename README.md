@@ -2,8 +2,61 @@
 
 AnalysisGNN is a comprehensive framework for multi-task music analysis using Graph Neural Networks (GNNs). It can perform various music analysis tasks including cadence detection, Phrase Detection, key analysis, harmonic analysis, and Roman numeral analysis on musical scores and detection of Non-Chord Notes.
 
-This work was published on the 17th International Symposium on
-Computer Music Multidisciplinary Research 2025 (CMMR).
+This repository includes the implementation of **[From Prediction to Collaboration:
+Interactive Symbolic Music Analysis](https://arxiv.org/abs/2607.13587)**,
+in the Proceedings of the 27th International Society for Music Information
+Retrieval Conference (**ISMIR 2026**), Abu Dhabi, UAE. It combines MusicBERT
+representations with AnalysisGNN for full-score Roman numeral analysis,
+masked completion, and interactive revision.
+
+The original AnalysisGNN work was published at the 17th International Symposium
+on Computer Music Multidisciplinary Research (**CMMR 2025**). Citations for both
+papers are provided below.
+
+## ISMIR 2026 Paper and Checkpoints
+
+The paper implementation was developed on the
+[`gradio` branch](https://github.com/manoskary/analysisgnn/tree/gradio).
+The [Hugging Face demo](https://huggingface.co/spaces/manoskary/analysisgnn)
+also installs this branch and uses the released
+[`manoskary/analysisgnn-hybrid` model bundle](https://huggingface.co/manoskary/analysisgnn-hybrid).
+The interactive interface is available at [analysisgnn.com](https://analysisgnn.com).
+
+The bundle's `bundle.json` manifest identifies these artifacts:
+
+| Artifact | Path in the Hugging Face repository | Purpose |
+| --- | --- | --- |
+| Full checkpoint | `checkpoints/full.ckpt` | Blind full-score inference |
+| Masked checkpoint | `checkpoints/masked.ckpt` | Completion and revision conditioned on known labels |
+| Note voter | `voters/note_voter.pt` | Post-hoc aggregation |
+| Beat voter | `voters/beat_voter.pt` | Beat-level aggregation |
+
+After installation, load the released checkpoints through the bundle resolver:
+
+```python
+import partitura as pt
+from analysisgnn.inference.hf_bundle import resolve_hybrid_bundle
+from analysisgnn.inference.hybrid_predictor import HybridAnalysisPredictor
+
+bundle = resolve_hybrid_bundle(
+    "manoskary/analysisgnn-hybrid",
+    revision="aa2b81c4453a586985ef6746076f8111af2653fe",
+)
+predictor = HybridAnalysisPredictor(
+    full_checkpoint_path=bundle.full_ckpt,
+    masked_checkpoint_path=bundle.masked_ckpt,
+    device="auto",
+)
+score = pt.load_score("my_score.musicxml")
+predictions = predictor.predict(score, force_route="full")
+```
+
+The revision pins the released bundle; omit it to use the latest version.
+The bundle excludes the MusicBERT backbone and tokenizer, which are downloaded
+separately from [`manoskary/musicbert-large`](https://huggingface.co/manoskary/musicbert-large)
+and [`manoskary/miditok-REMI`](https://huggingface.co/manoskary/miditok-REMI)
+when needed. The masked checkpoint is intended for partial-label completion;
+use the full checkpoint for blind inference.
 
 ## Features
 
@@ -12,6 +65,7 @@ Computer Music Multidisciplinary Research 2025 (CMMR).
 - **State-of-the-art Models**: Implements HybridGNN, HGT, and MetricalGNN architectures
 - **Continual Learning**: Support for sequential learning of different analysis tasks
 - **Flexible Training**: Supports both single-task and multi-task training strategies
+- **Semi-Supervised Node Masking**: Selective prediction with context labels for improved efficiency
 - **Easy Inference**: Simple prediction interface for new musical scores
 
 ## Supported Analysis Tasks
@@ -28,7 +82,7 @@ Computer Music Multidisciplinary Research 2025 (CMMR).
 This repository is under construction, despite the many features some things might not yet work properly.
 
 #### TODOs
-- Add resolve function for Roman Numerals
+
 - Add onset and beat prediction aggregation in predict
 - Support all training modes
 - Simplify requirements
@@ -82,6 +136,10 @@ pip install -e .
 - If you encounter issues with `graphmuse` installation, make sure you have installed `pyg-lib` for your specific PyTorch and CUDA versions first (see the pip installation section above).
 
 ## Quick Start
+
+For the ISMIR 2026 hybrid model, use the Hugging Face checkpoint example above.
+The CLI examples below use the original AnalysisGNN prediction workflow and its
+Weights & Biases checkpoint defaults.
 
 ### Easy Prediction (No Setup Required)
 
@@ -160,6 +218,38 @@ analysisgnn-predict --input_score score.musicxml --tasks cadence,localkey,romanN
 
 ## Advanced Usage
 
+### Semi-Supervised Node Masking
+
+AnalysisGNN supports selective prediction where only a subset of nodes need predictions while others provide context:
+
+```python
+from analysisgnn.utils.node_masking import create_node_mask
+
+# Create mask: T (target), C (context), U (unlabeled)
+mask = create_node_mask(
+    num_nodes=100,
+    target_indices=torch.arange(0, 40),    # Predict these
+    context_indices=torch.arange(40, 70),  # Use as context
+    context_weight=0.1                      # Context contributes 10% loss
+)
+
+# Add to your graph data
+graph["note"].node_mask = mask
+
+# Training automatically uses the mask
+# - Context nodes: labels fixed during training, guide predictions
+# - Target nodes: full loss, primary prediction focus
+# - Unlabeled nodes: ignored, no loss contribution
+```
+
+**Use cases:**
+- Phrase boundary analysis with harmonic context
+- Transfer learning with pseudo-labels as context
+- Interactive annotation assistance
+- Semi-supervised learning with limited annotations
+
+See `examples/semi_supervised_masking_example.py` for detailed usage.
+
 ### Custom Training Configuration
 
 Create a JSON configuration file:
@@ -221,7 +311,7 @@ And the model predicts on the note level:
 - Sections
 - Pedal Notes
 - Local Key
-- Tonalized Key
+- Tonicized Key
 - Chord Degree
 - Inversion
 - Quality
@@ -231,7 +321,21 @@ And the model predicts on the note level:
 
 ## Citation
 
-If you use AnalysisGNN in your research, please cite:
+For the hybrid model, masked completion, or interactive analysis framework,
+please cite the ISMIR 2026 paper:
+
+```bibtex
+@inproceedings{karystinaios2026prediction,
+    title={From Prediction to Collaboration: Interactive Symbolic Music Analysis},
+    author={Karystinaios, Emmanouil and Hentschel, Johannes and Neuwirth, Markus and Widmer, Gerhard},
+    booktitle={Proceedings of the 27th International Society for Music Information Retrieval Conference (ISMIR)},
+    year={2026},
+    address={Abu Dhabi, UAE},
+    url={https://arxiv.org/abs/2607.13587}
+}
+```
+
+For the original AnalysisGNN model, please also cite:
 
 ```bibtex
 @inproceedings{karystinaios2024analysisgnn,

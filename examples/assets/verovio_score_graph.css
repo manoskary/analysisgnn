@@ -1,0 +1,258 @@
+.agn-root {
+  font-family: "IBM Plex Sans", "Inter", system-ui, -apple-system, Segoe UI, sans-serif;
+  color: #0f172a;
+  background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
+  min-height: 100vh;
+  margin: 0;
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+.agn-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  background: #ffffff;
+  margin-bottom: 10px;
+}
+
+.agn-status {
+  font-size: 12px;
+  color: #334155;
+}
+
+.agn-legend {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.agn-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+}
+
+.agn-score-wrap {
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.agn-pages {
+  display: inline-flex;
+  gap: 0;
+  align-items: flex-start;
+}
+
+.agn-page {
+  position: relative;
+}
+
+.agn-note-panel {
+  margin-top: 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 12px;
+  min-height: 110px;
+}
+
+.agn-note-panel h3 {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+}
+
+.agn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+  font-size: 12px;
+}
+
+.agn-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: #f8fafc;
+}
+
+.agn-label {
+  color: #475569;
+}
+
+.agn-value {
+  color: #0f172a;
+  font-weight: 600;
+}
+
+/* ── Panel sections ── */
+.agn-section {
+  margin-bottom: 10px;
+}
+
+.agn-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+/* ── Complete RN button group ── */
+.agn-section-rn {
+  margin-bottom: 12px;
+  border-bottom: 1px solid #e2e8f0;
+  padding-bottom: 8px;
+}
+
+.agn-rn-row {
+  margin-bottom: 6px;
+}
+
+.agn-rn-row:last-child {
+  margin-bottom: 0;
+}
+
+.agn-rn-row-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+
+.agn-rn-group {
+  display: flex;
+  gap: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.agn-rn-btn {
+  flex: 0 1 auto;
+  padding: 6px 14px;
+  border: none;
+  border-right: 1px solid #cbd5e1;
+  background: #f8fafc;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 600;
+  color: #475569;
+  text-align: center;
+  transition: background 0.1s, color 0.1s;
+}
+
+.agn-rn-btn:last-child {
+  border-right: none;
+}
+
+.agn-rn-btn.agn-rn-active {
+  background: #1e293b;
+  color: #ffffff;
+  cursor: default;
+}
+
+.agn-rn-btn:not(.agn-rn-active):hover {
+  background: #e2e8f0;
+}
+
+.agn-rn-score {
+  font-size: 10px;
+  font-weight: 400;
+  color: #94a3b8;
+  display: block;
+}
+
+.agn-rn-btn.agn-rn-active .agn-rn-score {
+  color: #cbd5e1;
+}
+
+/* ── Harmony paired grid: core (left) + validation (right) ── */
+.agn-harmony-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 10px;
+  font-size: 12px;
+}
+
+.agn-harmony-pair {
+  display: contents;
+}
+
+/* Core tiles: bold label to distinguish from validation */
+.agn-card.agn-core .agn-label {
+  font-weight: 700;
+  color: #1e293b;
+}
+
+/* ── Agreement coloring ── */
+.agn-card.agn-agree {
+  border-left: 3px solid #22c55e;
+  background: #f0fdf4;
+}
+
+.agn-card.agn-disagree {
+  border-left: 3px solid #ef4444;
+  background: #fef2f2;
+}
+
+g.note.agn-colored use,
+g.note.agn-colored > use,
+g.note.agn-colored path,
+g.note.agn-colored > path,
+g.note.agn-colored ellipse,
+g.note.agn-colored > ellipse,
+g.note.agn-colored circle,
+g.note.agn-colored > circle {
+  fill: var(--agn-note-color, currentColor);
+  stroke: var(--agn-note-color, currentColor);
+}
+
+g.note.agn-active use,
+g.note.agn-active > use,
+g.note.agn-active path,
+g.note.agn-active > path,
+g.note.agn-active ellipse,
+g.note.agn-active > ellipse,
+g.note.agn-active circle,
+g.note.agn-active > circle {
+  fill: #2563eb !important;
+  stroke: #2563eb !important;
+  filter: drop-shadow(0 0 2px rgba(37, 99, 235, 0.85));
+}
+
+.agn-edge {
+  pointer-events: none;
+  fill: none;
+  stroke-opacity: 0.35;
+  stroke-linecap: round;
+}
+
+.agn-rn-label {
+  fill: #111827;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: "IBM Plex Sans", "Inter", system-ui, -apple-system, Segoe UI, sans-serif;
+  text-anchor: middle;
+  pointer-events: none;
+}

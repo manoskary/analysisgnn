@@ -14,12 +14,20 @@ numpy>=1.21.0
 pandas>=1.5.0
 scikit-learn>=1.1.0
 torchmetrics>=0.11.0
+transformers>=4.41.0
+peft>=0.10.0
+miditok>=3.0.0
 
 # Graph neural networks
 # graphmuse>=0.0.2  # Commented out due to dependency conflicts
 
 # Logging and experiment tracking
 wandb>=0.13.0
+huggingface_hub>=0.20.0
+
+# Storage (Delta Lake)
+deltalake>=0.22.0
+pyarrow>=14.0.0
 
 # Utilities
 tqdm>=4.64.0
@@ -33,3 +41,4 @@ imbalanced-learn>=0.9.0
 pytest>=7.0.0
 black>=22.0.0
 flake8>=5.0.0
+flexohr==0.1.0
