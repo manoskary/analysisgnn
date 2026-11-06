@@ -521,6 +521,11 @@ class ChordQuality15(OutputRepresentationTI):
     dfFeature = "a_quality"
 
 
+class Cadence4(OutputRepresentationTI):
+    classList = CADENCES
+    dfFeature = "a_cadence"
+    
+
 class PitchClassSet94(OutputRepresentation):
     classList = PCSETS
     dfFeature = "a_pcset"
@@ -539,6 +544,7 @@ available_representations = {
     "hrhythm": HarmonicRhythm2,
     "pcset": PitchClassSet94,
     "bass": Bass38,
+    "cadence": Cadence4,
 }
 
 

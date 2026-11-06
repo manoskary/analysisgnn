@@ -2108,6 +2108,12 @@ INTERVALCLASSES = [
     for specific in ["dd", "d", "P", "A", "AA"]
 ]
 
+CADENCES = [
+    "None",
+    "PAC",
+    "IAC",
+    "HC",
+]
 
 CHORD_QUALITIES = [
     "major triad",

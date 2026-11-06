@@ -18,7 +18,6 @@ setup(
     name="analysisgnn",
     version="1.0.0",
     author="Emmanouil Karystinaios",
-    author_email="manos.karyss@gmail.com",
     description="A Unified Music Analysis Model with Graph Neural Networks",
     long_description=long_description,
     long_description_content_type="text/markdown",
